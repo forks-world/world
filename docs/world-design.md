@@ -75,6 +75,7 @@ flowchart LR
 | Subscription | `organization_id`、套餐版本、周期、状态、支付服务订阅引用 |
 | Entitlement | `organization_id`、功能集合、额度、有效期、版本；服务端执行权益检查的依据 |
 | NetworkQuota | `organization_id`、`network_id`、指标、上限；受组织总额度约束 |
+| QuotaReservation | Operation、资源基准版本、各指标正增量、归属与状态；同一 Operation 的预留与结算只能生效一次 |
 | UsageEvent | `event_id`、归属、指标、数量、发生时间、来源；事件去重 |
 | Operation | `id`、归属、操作类型、目标版本、状态、错误信息、幂等键 |
 | AuditEvent | 操作者、组织、可选 Network、动作、目标、结果、请求标识、时间 |
@@ -134,11 +135,17 @@ flowchart LR
 
 1. Webhook 验证签名，以支付服务事件 ID 去重，持久化后再确认接收。浏览器跳转成功不能作为开通依据。
 2. 针对乱序事件，查询支付服务的当前订阅状态并串行更新同一订阅；后台定期对账修复漏事件和不同步状态。
-3. 资源创建在事务中预留组织与 Network 两级配额，同时写入资源、Operation 和 outbox 事件；并发请求不能突破上限。
-4. 异步创建成功后确认预留，失败后释放；结果未知时先向运行环境查询，不能直接释放额度后重复创建。
+3. 所有增长操作都须原子预留配额，包括创建、扩容、混合更新的增长部分、重新消耗额度的 restore，以及启用后会消耗受限指标的 pool 或执行。服务端基于受保护的资源版本计算各指标正增量，在同一事务中校验组织与 Network 的“已确认用量 + 未结算预留 + 本次预留”不超过各自上限，写入 QuotaReservation、期望变更、Operation 和 outbox。计数更新须使用行锁或条件更新，不能先读剩余额度再独立写入。
+4. 每个 Operation 的预留与结算幂等。操作成功后将预留转为已确认用量；失败或取消只有在执行端证明相应增长未发生或已补偿后才释放。部分成功按已确认的实际变化结算，未核实部分继续占用预留。结果未知时先向执行端查询，不能因超时、重试或预留到期自动释放。
 5. 用量事件只能来自受信任的采集端，依据稳定事件 ID 去重；保存原始事件与按周期汇总结果。迟到事件进入明确的周期调整流程。
 
 套餐价格、币种、计费指标、宽限期和数据保留时间作为发布前的产品配置确定，本设计不预设商业数值。
+
+正增量按指标分别计算，不能用存储缩减抵扣执行数量增长，也不能以尚未完成的缩容抵扣并行扩容。混合操作先保留已有计量占用，再预留执行期间需要的额外额度；若替换资源需要新旧并存，预留覆盖峰值，不能只按最终净增量计算。减少用量只在对应释放事实确认后入账，discard 不自动等于物理空间释放。
+
+同一资源尚有未完成增长操作时，首版拒绝另一个增长变更，避免从同一旧版本重复计算差额；不同资源、不同 Store 和节点的增长由 World 的组织/Network 配额事务统一仲裁。释放请求仍可受理，但由工作流先协调冲突任务和执行端状态，再确认减少量。额度下降不抹去已有预留；后续增长按新额度拒绝，原操作继续结算。
+
+预留只适用于已定义且能可靠计算或限制的指标；执行端不得超过授权预留量，需要追加时先完成 World 原子追加预留。首版无法准确计算或限制的物理存储指标继续展示为观测信息，不承诺由 API 预留实现硬配额。
 
 ## 6. CLI 与 API
 
@@ -196,7 +203,7 @@ world operation inspect op_123
 
 创建请求支持 `Idempotency-Key`，同一主体、操作和隔离上下文内重复请求返回原结果；相同键配不同请求体返回冲突。更新使用 `If-Match` 对应配置版本，拒绝覆盖并发变更。异步请求返回 `202` 与 Operation 引用。Network 创建和删除的 Operation 也位于对应 Network 下。
 
-错误结构统一为 `code`、`message`、`request_id` 和可选 `details`。列表采用游标分页。CLI 和 MCP 只依赖公开 API，以便后续增加 Web 管理界面。
+错误结构统一为 `code`、`message`、`request_id` 和可选 `details`。列表采用游标分页。CLI 和 MCP 的管理请求依赖公开 API，以便后续增加 Web 管理界面。本地 init 的数据源提交采用第 10 节限定的本机 RPC 流程，仍先经过同一应用服务授权与配额预留。
 
 ### 6.1 Skill + MCP 调用模型
 
@@ -257,12 +264,12 @@ Skill 的流程约定：
 
 Network 状态：`provisioning → active → deleting → deleted`；执行失败进入 `error`，通过关联 Operation 区分创建失败和删除失败，按原目标重试。
 
-创建资源的主流程：
+创建、扩容、restore 等增长操作的主流程：
 
 ```text
-认证与授权 → 检查 Network 状态与权益 → 事务内预留配额
-→ 保存期望配置、Operation、outbox → Worker 调用适配器
-→ 记录运行结果与 observed_version → 确认配额或补偿
+认证与授权 → 检查 Network 状态与权益
+→ 同一事务内保护基准版本、预留各指标正增量、保存期望变更/Operation/outbox
+→ Worker 调用适配器 → 按操作类型记录完成证据 → 幂等结算预留或补偿
 ```
 
 数据库与运行环境无法共享事务，因此采用 outbox 和幂等执行。Worker 按至少一次投递设计，适配器使用稳定操作 ID 去重，并能查询未知结果。旧版本任务不得覆盖新版本配置，删除标记阻止后续创建或更新任务重新激活资源。
@@ -404,6 +411,12 @@ Store 目录分开只是元信息和生命周期隔离。相同宿主用户仍�
 | `StartExecution` / `GetExecution` / `ReadExecutionOutput` / `CancelExecution` | 在指定 Workspace 执行、查询、按偏移读取输出、请求终止 |
 | `GetOperation` / `CancelOperation` | 查询持久化操作、对可取消操作请求取消 |
 
+首版 `InitSnapshot` 只接受同机调用方经认证本地 Unix socket 提交的目录引用，包括组织管理下的本机节点；远程 RPC 连接不开放此方法。CLI 与 MCP 的本地服务进程须验证目标节点身份确属本机，相对路径只相对于调用方显式工作目录解析，然后由 forkfs 再验证允许导入的根目录与路径。不能把客户端路径字符串发送到任意节点并在节点上重新解释，也不能仅凭 `localhost` 名称断定同机。
+
+World 的组织 API 可完成本地 init 的授权和额度预留，实际目录参数经本地 forkfs socket 提交；内容始终留在本机，Operation 再通过同一 RPC 结果同步到 World。授权限定本地节点、Store、方法与 Operation ID。本机 MCP 可走相同流程；远程托管 MCP 或选中异机节点时，`world_fs_init` 返回 `LOCAL_SOURCE_REQUIRED`，不隐式上传、不自动切换节点；同机条件检查在申请预留之前完成。节点不可达时报告连接错误，不能推断路径不存在。
+
+首版不实现目录上传、暂存或跨节点导入。远程节点若已有经其本机入口创建并登记的 Snapshot，World 可继续调用 fork、查询等已授权操作；没有基线时应明确提示先在该节点本机导入。未来的数据传输协议单独设计，不由当前的 init 参数暗含。
+
 请求公共字段包括 `protocol_version`、`request_id`、`organization_id`、`network_id`、`store_id`、可选资源引用及 deadline；写操作额外包含稳定的 `operation_id`，修改已有资源时提供服务端可验证的 `expected_revision`。World 元信息版本与 forkfs 资源 revision 分开记录；forkfs revision 管理控制操作，不表示用户每次文件写入的内容版本。
 
 响应包含请求标识、服务身份、实际资源归属、结果或稳定错误码。业务错误至少区分权限不足、版本冲突、资源忙碌、跨卷、不支持、源丢失、Store 不可达、回收已开始和结果待核实；底层错误可作为诊断字段。客户端不根据错误文本自动开启 force、copy 或跳过检查。
@@ -461,7 +474,7 @@ forkfs 服务持久化 `(调用主体, Store, operation_id)` 与请求摘要。�
 
 ### CLI、MCP 与 Skill
 
-World CLI 沿用已实现的领域动词，增加组织、Network 和节点上下文。下例中的 Network 参数为 World 待实现扩展：
+World CLI 沿用已实现的领域动词，增加组织、Network 和节点上下文。下例中的 Network 参数为 World 待实现扩展；init 一行要求当前选中的已认证节点与 CLI 同机，`./project` 是 CLI 工作目录下的本地源：
 
 ```sh
 world fs init ./project --network dev
@@ -486,6 +499,8 @@ World 的 Execution 在受理时分配全局 ID，并保存 forkfs Execution 的
 输出接口返回 stdout/stderr 流标识、下一游标、是否截断、是否已结束及保留期限；游标过期或日志已清理返回明确状态，不能用空输出冒充执行结束。所有查询、日志和取消操作重新检查组织与 Network 归属；viewer 可读取获授权的执行及输出，operator 才可启动或取消，取消不受欠费和额度不足阻断。CLI 对应提供 `world execution inspect`、`world execution logs` 和 `world execution cancel`，同样以 Execution 终态为准。
 
 执行闭环验收需覆盖：启动 Operation 成功但命令仍运行、非零退出、输出分页与日志过期、断线后继续查询、重复取消和自然退出竞争，以及跨 Network 猜测 Execution ID 被拒绝。并发验收需同时覆盖“先启动后 diff”和“先 diff 后启动”；付费验收需在到期或降级超额后成功释放资源，同时拒绝新增与增长。
+
+配额验收还需覆盖跨 Store 的并发扩容、并发 restore、混合增减与替换峰值、重复投递和重复结算、执行成功但通知丢失；断言组织及 Network 的已确认量加未结算预留不会因并发准入超过上限，未知结果不释放预留。init 验收覆盖同机组织模式、异机选择、远程 MCP、越界路径和节点不可达：本地前置检查拒绝时不在远程读取同名目录、不发生隐式传输，也不申请额度预留；若请求已提交但结果未知，仍按恢复规则保留预留，核实未执行后才释放。
 
 Skill 的编码流程改为：确定 Network、节点与 Store → 选择或初始化 Snapshot → fork 独立 Workspace → 在受管 Workspace 中执行编码/测试 → 检查 diff → 按用户目标 checkpoint 或保留 Workspace。discard、restore、gc 是不同操作，不能因任务完成自动清除用户成果。
 
