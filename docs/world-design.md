@@ -100,7 +100,7 @@ flowchart LR
 
 Network admin 可为本组织有效成员授予或撤销该 Network 的 operator/viewer，只有 owner 可授予或撤销 Network admin。赋予组织成员资格不自动授予 Network 访问权；Network 授权必须有有效 Membership。成员移除在同一事务中使其该组织全部 Network 授权失效，角色和授权变更使用版本前置条件，防止并发更新恢复已撤销权限。服务账号适用相同 principal 与成员规则，不能以账号类型绕过授权。
 
-成员与授权 PUT/DELETE 使用幂等键；新增采用不存在前置条件，修改和删除采用 If-Match。CLI 对应 --if-version，MCP 对应 expected_version；角色更新不能静默覆盖并发变更。CLI 另提供 `world network grants` 列表。权限变更事务推进授权版本并写入撤销 outbox，World 立即拒绝后续越权请求；已下发的任务按原主体重查权限。对于不再有执行权限的主体，内部撤销事件通过 forkfs `ApplyAuthorizationRevocation` RPC 幂等更新主体/范围的最低有效授权版本，拒绝旧凭证并取消排队任务、终止受管执行。节点未确认时显示撤销传播未完成，不声称既有进程已停止；节点离线期间旧授权仅在此前约定的短期窗口内有效。管理员可查询变更返回的传播 Operation，直到节点确认或报告阻塞。授权变更不能取消其他主体任务或提升执行权限。
+成员与授权 PUT/DELETE 使用幂等键；新增采用不存在前置条件，修改和删除采用 If-Match。CLI 对应 --if-version，MCP 对应 expected_version；角色更新不能静默覆盖并发变更。CLI 另提供 `world network grants` 列表。权限变更事务推进授权版本并写入撤销 outbox，World 立即拒绝后续越权请求；已下发但尚未开始的任务按原主体重查权限。对于不再有执行权限的主体，内部撤销事件通过 forkfs `ApplyAuthorizationRevocation` RPC 幂等更新主体/范围的最低有效授权版本，拒绝旧凭证并取消排队任务、终止受管 Execution。节点未确认时显示撤销传播未完成，不声称既有进程已停止；节点离线时新操作的启动授权有短期窗口，Execution 受运行租约限制，已经开始的有限范围存储变更则允许安全收尾，不承诺在该窗口内结束。管理员可查询变更返回的传播 Operation，直到节点确认或报告阻塞。授权变更不能取消其他主体任务或提升执行权限。
 
 所有操作均检查身份、权限、归属和对应的 Network 生命周期条件。创建、扩容及其他增加受限资源的操作另检查有效权益与可用配额；删除、discard、GC、pool drain、缩容和终止执行等释放操作不受欠费、套餐到期或当前超额阻断。只读查询与已有数据取回也不要求剩余配额。Network 处于 deleting 或因欠费受限时仍允许合法清理，但不得绕过资源依赖、执行占用和文件系统安全检查。查找不可见资源时返回统一的不存在响应，避免泄露其他 Network 的资源信息。
 
@@ -444,7 +444,11 @@ World 首版只提供组织管理路径：无论节点在本机还是远程，�
 
 登记使用独立 bootstrap 接口，不要求先存在 StoreBinding。组织 owner 或被授权的 Network admin 可通过拟议 `world node enroll --network dev`（或 `world_enrollment_create`）创建 Enrollment；普通 operator 不能接管 Store。Enrollment 固定组织、Network 和接入意图，使用幂等键防止重复创建；创建响应只包含 Enrollment ID、handoff 引用和状态，不包含一次性短期授权；实际凭证通过以下节点交付流程传递，不写入日志或 Skill。
 
-handoff 引用只是随机关联 ID，不是 bearer credential，持有它不能批准登记或领取授权。节点进程通过 `POST /v1/enrollment-handoffs/{handoff}/candidate` 提交公钥及服务挑战的持钥证明；管理员在单独认证的 World 管理页面核对组织、Network、节点公钥指纹和接入意图，通过 `/approve` 明确批准该候选。批准要求独立用户会话及重新认证，MCP/Agent 服务令牌不能调用 approve，链接或引用本身不构成批准。
+handoff 引用只是随机关联 ID，不是 bearer credential，持有它不能批准登记或领取授权。节点进程通过 `POST /v1/enrollment-handoffs/{handoff}/candidate` 提交公钥、RPC 端点、传输类型与服务挑战的持钥证明（签名覆盖端点和 Enrollment）；管理员在单独认证的 World 管理页面核对组织、Network、节点公钥指纹、RPC 端点和接入意图，通过 `/approve` 明确批准该候选。批准要求独立用户会话及重新认证，MCP/Agent 服务令牌不能调用 approve，链接或引用本身不构成批准。
+
+批准后的候选先保存为 Enrollment 的 provisional 节点路由，包含公钥/传输身份、端点、版本和有效期，不必等到 active Node/StoreBinding 创建。World 登记 Worker 在读取清单前，先按部署的接入网络白名单验证该地址，再完成受认证连接和服务挑战，验证响应方确实持有获批私钥；公网名称本身不作为身份。禁止重定向，DNS 解析结果和实际连接地址都须满足接入策略，重连时重新检查，避免借登记访问任意内网服务。Unix socket 只供与 Worker 同机的路由；远程节点必须提供该部署可达且已批准的加密端点，不能把目标机 socket 路径当远程地址。
+
+World 使用该临时路由调用 GetEnrollmentInventory 和 ActivateEnrollment；激活事务将已验证的路由提升为正式 Node，而不是首次获得地址。无法连通或身份不匹配时保持待接入/维护状态，不导入、不激活；管理员可继续诊断或中止。端点/密钥变化必须重新提交候选并经独立批准，prepared 之后首版不允许更换节点身份，原操作不能悄悄路由到新机器。验收覆盖全新远程节点在 active Node 创建前的清单读取、地址不可达、端点替换、错误私钥、DNS 地址变化和被接入策略拒绝的地址。
 
 节点随后通过 `/redeem` 证明持有获批私钥，取得仅对该节点密钥可解密的短期授权；领取协议绑定 handoff、候选和防重放挑战。凭证在任何 PrepareEnrollment 之前就绑定已批准节点，未获批的竞争候选不能替换该身份。重复领取只返回同一节点可解密的原交付结果，不延长有效期；过期则用原 Enrollment 发起新续期 handoff。候选提交、批准与领取都是独立身份校验端点，不开放为 MCP 工具；实际解密材料仅交给节点服务，不经过模型上下文、CLI stdout 或通用 MCP 结果序列化。
 
@@ -544,7 +548,7 @@ CLI 提供 `world node list --network dev`、`world store list --network dev`、
 | `GetOperation` / `CancelOperation` | 查询持久化操作、对可取消操作请求取消 |
 | `RefreshOperationAuthorization` | 为原 Operation 更新执行授权；不创建任务、不修改原请求和配额预留 |
 | `DecommissionStore` | 队列内停用空 Store，持久化绑定 generation tombstone 并返回可恢复的停用证明 |
-| `ApplyAuthorizationRevocation` | 仅 World 授权服务可签发，按事件 ID 幂等推进范围内授权版本并停止失权任务，返回传播状态 |
+| `ApplyAuthorizationRevocation` | 仅 World 授权服务可签发，按事件 ID 幂等推进范围内授权版本、取消未开始任务并终止失权 Execution；已开始存储变更按安全收尾规则处理 |
 | `OpenExport` / `GetExport` / `CloseExport` | 打开、查询和关闭绑定资源身份的只读流式导出，生命周期与数据读保护由 forkfs 管理 |
 
 首版 `InitSnapshot` 只接受同机调用方经认证本地 Unix socket 提交的目录引用，包括组织管理下的本机节点；远程 RPC 连接不开放此方法。CLI 与 MCP 的本地服务进程须验证目标节点身份确属本机，相对路径只相对于调用方显式工作目录解析，然后由 forkfs 再验证允许导入的根目录与路径。不能把客户端路径字符串发送到任意节点并在节点上重新解释，也不能仅凭 `localhost` 名称断定同机。
@@ -568,6 +572,10 @@ World 的组织 API 可完成本地 init 的授权和额度预留，实际目录
 刷新凭证绑定原主体、组织、Network、服务/Store、Operation ID、不可变请求摘要和 challenge。forkfs 验证后，仅在该任务实际开始时消费一次；若重新排队导致凭证或 challenge 过期，则生成新 challenge，继续等待刷新，不因旧入队凭证过期将任务判为失败。重试刷新不追加 outbox 任务或配额预留；请求摘要不包含可轮换的令牌内容，原始操作参数不能借刷新改变。
 
 等待授权时只保留持久化排队记录和额度预留，不持有 Store 写锁或 Workspace 占用，其他可运行任务可继续；收到新授权后进入写队列并再次校验状态与 revision。World 不可达时保持等待，不沿用过期凭证执行；权限已撤销时明确拒绝执行并按未执行流程结算。刷新、取消和开始执行原子竞争，终态任务不能被刷新重新激活。执行授权具有明确短期有效窗口；即时撤销须通知 forkfs 取消排队任务或终止已运行任务，不能只依赖令牌自然过期。已开始任务也不因入队凭证到期自动取消。
+
+普通存储变更采用“授权开始、有限范围安全收尾”语义：init、fork、checkpoint、discard、restore、修复 verify、单批 GC 和 pool 任务在消费启动授权后，可完成该次固定源/目标及有界批次的已批准工作，不因之后撤权或凭证到期而强行中断文件系统提交。节点收到撤销时标记审计并阻止新工作；若尚未产生副作用可取消，已产生副作用则在安全点停止或完成必要提交/补偿，不能把撤销处理成已完成副作用的回滚。其真实终态继续供 World 对账与配额结算，但已失权用户不能继续查询敏感结果。
+
+这一规则不授权无限制的持续任务：自动 pool 补充、GC 后继批次和工作流下一步均是新操作，必须重新取得当前有效授权；不能沿用原授权循环。已开始的单次文件系统操作可能因 I/O 阻塞长时间恢复，因此文档不承诺它在撤权窗口内停完。GetOperation 标明撤权后的收尾状态，撤销传播结果分别报告授权已失效、仍在安全收尾的操作和 Execution 是否退出，不能合并宣称“全部任务已停止”。节点离线时既有存储操作仍按该范围完成，Execution 的持续写进程和 Export 读取分别受其运行租约/传输期限约束。
 
 **Execution 另有持续生效的运行租约，区别于只消费一次的启动授权。** StartExecution 必须同时取得初始运行租约；租约绑定 Execution、原主体、组织/Network、Store generation、授权版本、单调递增序号和绝对到期时间。World Worker 在到期前重新检查当前权限与策略，通过 `RenewExecutionLease` 更新同一执行的租约，不重启命令、不追加执行数量预留。启动凭证或旧运行租约不能自行换取新租约，撤权后 World 不再签发续期。
 
