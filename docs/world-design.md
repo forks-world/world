@@ -509,6 +509,7 @@ CLI 提供 `world node list --network dev`、`world store list --network dev`、
 | `StartGC` / `GetGCStatus` | 受控保留期、后台回收及状态 |
 | `FillPool` / `GetPoolStatus` / `DrainPool` | 按 Store 和 Snapshot 管理预热资源 |
 | `StartExecution` / `GetExecution` / `ReadExecutionOutput` / `CancelExecution` | 在指定 Workspace 执行、查询、按偏移读取输出、请求终止 |
+| `RenewExecutionLease` | World Worker 为运行中的 Execution 续发有期限的运行授权；不是重新启动进程 |
 | `GetOperation` / `CancelOperation` | 查询持久化操作、对可取消操作请求取消 |
 | `RefreshOperationAuthorization` | 为原 Operation 更新执行授权；不创建任务、不修改原请求和配额预留 |
 | `DecommissionStore` | 队列内停用空 Store，持久化绑定 generation tombstone 并返回可恢复的停用证明 |
@@ -535,6 +536,16 @@ World 的组织 API 可完成本地 init 的授权和额度预留，实际目录
 刷新凭证绑定原主体、组织、Network、服务/Store、Operation ID、不可变请求摘要和 challenge。forkfs 验证后，仅在该任务实际开始时消费一次；若重新排队导致凭证或 challenge 过期，则生成新 challenge，继续等待刷新，不因旧入队凭证过期将任务判为失败。重试刷新不追加 outbox 任务或配额预留；请求摘要不包含可轮换的令牌内容，原始操作参数不能借刷新改变。
 
 等待授权时只保留持久化排队记录和额度预留，不持有 Store 写锁或 Workspace 占用，其他可运行任务可继续；收到新授权后进入写队列并再次校验状态与 revision。World 不可达时保持等待，不沿用过期凭证执行；权限已撤销时明确拒绝执行并按未执行流程结算。刷新、取消和开始执行原子竞争，终态任务不能被刷新重新激活。执行授权具有明确短期有效窗口；即时撤销须通知 forkfs 取消排队任务或终止已运行任务，不能只依赖令牌自然过期。已开始任务也不因入队凭证到期自动取消。
+
+**Execution 另有持续生效的运行租约，区别于只消费一次的启动授权。** StartExecution 必须同时取得初始运行租约；租约绑定 Execution、原主体、组织/Network、Store generation、授权版本、单调递增序号和绝对到期时间。World Worker 在到期前重新检查当前权限与策略，通过 `RenewExecutionLease` 更新同一执行的租约，不重启命令、不追加执行数量预留。启动凭证或旧运行租约不能自行换取新租约，撤权后 World 不再签发续期。
+
+运行环境规定有限的最大租约时长、可接受时钟误差和强制终止期限，缺少配置即拒绝受管执行。forkfs 使用不晚于签名到期时间的本地单调截止时间执行看门狗；节点重启后若无法可靠恢复剩余时间，立即停止受管进程并保留占用直到退出确认。重复或乱序续期不能延长最新截止时间，过期、旧授权版本、错误 generation 或已终止 Execution 的租约均拒绝；续期与撤销、到期处理原子竞争，终止决定一旦提交不可被续期复活。
+
+到期无法续期（包括网络断开）时，节点本地立即撤销该执行的网络通道并启动终止流程，在有限宽限期后强制结束整个受管进程组/容器。运行监督器必须独立于 RPC 连接存活；服务崩溃也不能留下无截止时间的写进程，依靠受管容器/进程监督和出口租约执行同一失效策略。底层环境无法提供这些能力时不开放受管 exec。Workspace 占用只有在全部受管进程确认退出后释放；异常无法杀死的进程使运行环境保持隔离和资源忙碌，并报告阻塞，不能对外宣称取消完成。
+
+Execution 记录 `lease_expires_at`、最后续期序号及 `authorization_expired` / `authorization_revoked` 等终止原因，通过现有 get API/MCP 展示；RPC 离线期间仍按本地期限处理。已有运行租约至多在规定短期窗口内有效，最终退出另受明确的终止期限约束；普通文件系统控制操作继续使用原来的安全停止/恢复规则，不因入队凭证到期中断提交。
+
+验收需在刚启动后撤权并阻断节点到 World 的通信，确认本地按期隔离并停止执行；同时覆盖正常长任务持续续期、乱序/重放续期、续期与到期竞争、RPC 服务崩溃、时钟回拨以及退出未确认时占用不释放。
 
 forkfs 服务持久化 `(调用主体, Store, operation_id)` 与请求摘要。同键同请求返回原任务，同键不同请求返回冲突。日志在执行副作用前落盘，记录源、目标、资源身份及结果；操作保留期和过期键行为需在协议中明确，避免日志过期后旧请求被当成新创建。World outbox 重投时始终沿用原 operation ID。
 
