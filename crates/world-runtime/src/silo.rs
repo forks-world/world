@@ -146,6 +146,12 @@ pub async fn exec(
         .context("build/install libworld_silo_bind.dylib beside world")?;
     let ack = tempfile::NamedTempFile::new()?;
     let mut cmd = Command::new(executable);
+    // Validate/execute the canonical binary while preserving alias-sensitive argv[0].
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.as_std_mut().arg0(&command[0]);
+    }
     cmd.args(&command[1..]).current_dir(&dir);
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();

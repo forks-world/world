@@ -451,6 +451,19 @@ class Silo(unittest.TestCase):
                 result = run(*command, env=dict(os.environ, PATH=path), cwd=caller)
                 self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
 
+    def test_main_alias_preserves_arg0(self):
+        work = pathlib.Path(self.worlds["A"]["workdir"])
+        with tempfile.TemporaryDirectory(dir=work) as bindir:
+            bindir = pathlib.Path(bindir)
+            alias = bindir / "python3"
+            alias.symlink_to(PROBE)
+            for requested in [str(alias), "python3", f"./{bindir.name}/python3"]:
+                command = self.command("A", "caller-argument")
+                command[-2] = requested
+                result = run(*command, env=dict(os.environ, PATH=str(bindir)))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), [requested, "caller-argument"])
+
     def test_udp_disconnect_uses_kernel_semantics(self):
         baseline = run(PROBE, "udp-disconnect", "127.0.0.1:12345")
         self.assertEqual(baseline.returncode, 0, baseline.stderr)
