@@ -1,10 +1,7 @@
 use crate::{policy::Policy, proxy::Proxy};
 use anyhow::{Context, Result, bail};
 #[cfg(unix)]
-use std::os::unix::{
-    fs::FileTypeExt,
-    process::{CommandExt, ExitStatusExt},
-};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -106,6 +103,20 @@ pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<i32> 
     result
 }
 
+#[cfg(unix)]
+fn stdin_is_socket() -> Result<bool> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat initializes the provided stat structure only on success.
+    if unsafe { libc::fstat(libc::STDIN_FILENO, stat.as_mut_ptr()) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EBADF) {
+            return Ok(false);
+        }
+        return Err(error.into());
+    }
+    Ok(unsafe { stat.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFSOCK)
+}
+
 pub(crate) async fn supervise(
     mut cmd: Command,
     deadline: Instant,
@@ -114,7 +125,7 @@ pub(crate) async fn supervise(
     ack: Option<&Path>,
 ) -> Result<i32> {
     #[cfg(unix)]
-    if std::fs::metadata("/dev/fd/0")?.file_type().is_socket() {
+    if stdin_is_socket()? {
         bail!("socket stdin is not allowed; use a pipe");
     }
     if cancel.is_cancelled() || Instant::now() >= deadline {

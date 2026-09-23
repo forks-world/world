@@ -185,6 +185,13 @@ pub async fn exec(
     .await
 }
 
+fn executable_file(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    path.is_file()
+        && std::ffi::CString::new(path.as_os_str().as_bytes())
+            .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 })
+}
+
 fn resolve_executable(name: &std::ffi::OsStr, workdir: &Path) -> Result<PathBuf> {
     let path = Path::new(name);
     let path = if path.components().count() > 1 || path.is_absolute() {
@@ -192,7 +199,7 @@ fn resolve_executable(name: &std::ffi::OsStr, workdir: &Path) -> Result<PathBuf>
     } else {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
             .map(|p| p.join(name))
-            .find(|p| p.is_file())
+            .find(|p| executable_file(p))
             .context("executable not found in PATH")?
     }
     .canonicalize()?;

@@ -53,6 +53,13 @@ pub unsafe fn address_allowed(
     allowed
 }
 
+fn executable_file(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    path.is_file()
+        && std::ffi::CString::new(path.as_os_str().as_bytes())
+            .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 })
+}
+
 /// The final exec target must be a native binary, never an unresolved script.
 /// Canonicalization also rejects PATH entries symlinked to a protected binary.
 pub unsafe fn native_target(path: *const libc::c_char) -> bool {
@@ -66,7 +73,7 @@ pub unsafe fn native_target(path: *const libc::c_char) -> bool {
         } else {
             let Some(path) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
                 .map(|p| p.join(name.as_ref()))
-                .find(|p| p.is_file())
+                .find(|p| executable_file(p))
             else {
                 return false;
             };
@@ -114,7 +121,7 @@ pub unsafe fn spawn_allowed(path: *const libc::c_char, envp: *const *const libc:
         } else {
             let Some(p) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
                 .map(|p| p.join(name.as_ref()))
-                .find(|p| p.is_file())
+                .find(|p| executable_file(p))
             else {
                 return false;
             };

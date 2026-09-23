@@ -97,6 +97,8 @@ class CLI(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
     def test_exit_timeout_and_open_stdin(self):
         self.assertEqual(self.network("/bin/sh", "-c", "exit 42").returncode, 42)
+        result = self.network("/bin/echo", "closed-stdin-ok", preexec_fn=lambda: os.close(0))
+        self.assertEqual((result.returncode, result.stdout), (0, "closed-stdin-ok\n"), result.stderr)
         self.assertEqual(self.network("/bin/sleep", "30", timeout="100ms").returncode, 124)
         r, w = os.pipe()
         try:
@@ -320,6 +322,21 @@ class Silo(unittest.TestCase):
                     a.wait(timeout=5)
                     result = run(*self.command("B", "get", f"{localhost}:{port}"))
                     self.assertEqual((result.returncode, result.stdout), (0, "B"), result.stderr)
+
+    def test_path_skips_non_executable_candidates(self):
+        with tempfile.TemporaryDirectory() as root:
+            first, second = pathlib.Path(root) / "first", pathlib.Path(root) / "second"
+            first.mkdir()
+            second.mkdir()
+            (first / "probe").write_text("not executable")
+            (second / "probe").symlink_to(PROBE)
+            env = dict(os.environ, PATH=f"{first}:{second}")
+            command = self.command("A", "fd", "999")
+            command[-3] = "probe"
+            result = run(*command, env=env)
+            self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+            result = run(*self.command("A", "launch", "probe", "fd", "999"), env=env)
+            self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
 
     def test_udp(self):
         with serving(self.command("A", "udp-serve", "127.0.0.1:0", "A")) as (_, port):
