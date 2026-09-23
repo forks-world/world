@@ -126,10 +126,9 @@ pub fn acknowledge() {
     // SAFETY: path is a NUL-terminated CString; the fixed byte string is valid
     // for the duration of write. O_NOFOLLOW avoids following a replaced link.
     unsafe {
-        let fd = libc::open(
-            path.as_ptr(),
-            libc::O_WRONLY | libc::O_TRUNC | libc::O_NOFOLLOW,
-        );
+        // Descendants share this acknowledgement file. Never truncate a valid
+        // acknowledgement while the supervisor or another constructor reads it.
+        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NOFOLLOW);
         if fd < 0 {
             libc::_exit(125);
         }
