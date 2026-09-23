@@ -221,6 +221,9 @@ world operation inspect op_123
 | `GET /v1/orgs/{org}/networks/{network}/operations/{operation}` | 查询异步操作 |
 | `POST /v1/orgs/{org}/networks/{network}/operations/{operation}/cancel` | 幂等请求取消可取消任务；最终取消结果从原 Operation 查询 |
 | `GET /v1/orgs/{org}/operations/{operation}` | 查询成员变更等组织级 Operation；仅有相应组织管理权限的主体可见 |
+| `POST /v1/orgs/{org}/networks/{network}/resources/{resource}/exports` | 创建只读导出会话，返回 Export 引用，不启动 Execution |
+| `GET /v1/orgs/{org}/networks/{network}/exports/{export}` | 查询导出状态、数据端点及非秘密领取引用 |
+| `DELETE /v1/orgs/{org}/networks/{network}/exports/{export}` | 幂等关闭导出会话，释放读保护 |
 | `POST /v1/orgs/{org}/networks/{network}/enrollments` | 管理员创建节点/Store 登记意图，只返回 Enrollment、状态与无授权能力的 handoff 引用 |
 | `GET /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}` | 查询登记阶段及需要的本机动作 |
 | `POST /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}/complete` | 提交节点证明，幂等完成激活与绑定发布 |
@@ -285,6 +288,7 @@ Skill 的流程约定：
 | `world_enrollment_create` / `world_enrollment_get` / `world_enrollment_complete` / `world_enrollment_abort` | 发起、查询、完成或中止未激活登记；不代替节点本机的管理员确认 |
 | `world_node_list` / `world_store_list` / `world_store_get` | 指定组织与 Network，发现节点和 StoreBinding；列表分页，Store 可按节点与状态筛选 |
 | `world_store_decommission` / `world_enrollment_renew` | 停用空 Store 或续发登记授权；Network admin/组织 owner 权限，幂等请求 |
+| `world_fs_export` / `world_export_get` / `world_export_close` | 创建、查询和关闭只读内容导出；只返回非秘密引用，实际下载使用受认证客户端 |
 
 上下文查询和组织列表不要求组织 ID；组织级工具要求 `organization_id`；所有已有 Network 的操作要求显式 `organization_id` 和 `network_id`。MCP 不提供修改全局默认 Network 的工具，避免多个 Agent 并发时相互影响。来自启动配置的建议上下文必须解析成每次调用的显式参数。
 
@@ -535,6 +539,7 @@ CLI 提供 `world node list --network dev`、`world store list --network dev`、
 | `RefreshOperationAuthorization` | 为原 Operation 更新执行授权；不创建任务、不修改原请求和配额预留 |
 | `DecommissionStore` | 队列内停用空 Store，持久化绑定 generation tombstone 并返回可恢复的停用证明 |
 | `ApplyAuthorizationRevocation` | 仅 World 授权服务可签发，按事件 ID 幂等推进范围内授权版本并停止失权任务，返回传播状态 |
+| `OpenExport` / `GetExport` / `CloseExport` | 打开、查询和关闭绑定资源身份的只读流式导出，生命周期与数据读保护由 forkfs 管理 |
 
 首版 `InitSnapshot` 只接受同机调用方经认证本地 Unix socket 提交的目录引用，包括组织管理下的本机节点；远程 RPC 连接不开放此方法。CLI 与 MCP 的本地服务进程须验证目标节点身份确属本机，相对路径只相对于调用方显式工作目录解析，然后由 forkfs 再验证允许导入的根目录与路径。不能把客户端路径字符串发送到任意节点并在节点上重新解释，也不能仅凭 `localhost` 名称断定同机。
 
@@ -621,7 +626,21 @@ forkfs 服务持久化 `(调用主体, Store, operation_id)` 与请求摘要。�
 
 授权验收需覆盖排队超过入队令牌有效期后仍能刷新并执行、刷新凭证再次过期、等待期间权限撤销、World 不可达、刷新重放、取消与刷新竞争；断言不重复预留、不绕过权限、不因正常排队时间单独判定操作失败。
 
-### CLI、MCP 与 Skill
+### 内容读取与欠费后导出
+
+Export 是元信息会话，不是 Snapshot 克隆或 Execution。具备资源读取权限的主体可通过上述 exports API、`world_fs_export` 或 `world fs export <resource> --output <local-file>` 导出 Snapshot 或 Workspace 的完整文件树；即使订阅到期、增长额度用尽，仍允许该操作。CLI 取得数据流后写入用户指定本地目标，默认拒绝覆盖已有文件。World 只保存会话身份、权限和状态，不中转或存储归档内容。
+
+World 创建 Export 时检查身份、归属和读权限，调用 forkfs OpenExport；节点在与 diff 相同的并发仲裁下取得源的读保护，活跃写进程存在时返回资源忙碌，不能静默导出变化中的树。Snapshot 通过 forkfs 的受控访问门读取，不解除原保护。读保护覆盖整个传输，期间 discard/GC/启动写执行等冲突操作等待或拒绝。导出不创建新的 Snapshot，也不占用并发执行数量或存储增长额度；节点可用独立、固定的传输并发上限和公平队列保护容量，但不能以欠费或无付费额度拒绝排队。
+
+forkfs 在经过认证的节点数据端点 `GET /exports/{export_id}/content` 流式生成版本化归档（首版 tar 加清单摘要），使用有界缓冲，不要求节点先存放完整归档。特殊文件、外部符号链接和超出安全范围的路径按明确格式规则拒绝或记录，不跟随链接读出源树之外内容。末尾完整性信息、文件数与校验结果供客户端下载后验证；连接中断时目标保留为不完整文件，不能报告成功。首版不承诺断点续传，重新导出须重新取得读保护。
+
+数据端点只接受限定 Export ID、源身份、节点、只读方法与有效期的传输授权，并逐次验证当前权限；CLI 在受保护凭证通道取得该授权，MCP 的 structuredContent/文本仅返回 Export ID 和非秘密下载入口。受认证用户可通过 CLI 或 World 下载页面调用 `POST /v1/orgs/{org}/networks/{network}/exports/{export}/download-authorization` 兑换仅供该会话的短期授权（不注册为 MCP 工具，受信客户端消费后不写入 stdout/日志），API 会话令牌不直接转发给任意节点地址。导出授权不能用于 forkfs 管理方法，且不向模型暴露 bearer URL。数据读取是内容传输通道，不扩大本地 init 的管理 RPC 例外。
+
+Export 保存独立的有限传输期限，断线超过空闲期限、取消、权限撤销或到期时节点关闭数据流并释放读保护，不依赖 World 在线才能清理。增长权益到期不撤销仍有读取权限的导出；权限撤销则按授权版本和短期传输授权上限生效。导出状态区分等待、传输中、完成、失败和关闭，只有节点完成流且客户端验证归档后才报告数据取回成功。CloseExport 幂等，节点故障时报告源暂不可达而非要求续费。
+
+验收覆盖过期且配额为零时导出完整 Snapshot/Workspace、无需启动 Execution、跨 Network 拒绝、运行中写入与导出互斥、慢客户端期限、断线及权限撤销后的读保护释放、源包含越界符号链接、归档截断检测和模型输出中无传输凭证。
+
+### 文件系统动作接口
 
 forkfs 生命周期使用下列公开 World API，统一前缀为 `/v1/orgs/{org}/networks/{network}`。表中的资源 ID 为 World 全局 ID，`{binding}` 为 StoreBinding ID；CLI 与 MCP 均经同一应用服务调用这些路由；唯一的本机 RPC 例外是下述 init 授权后的源提交，其他动作不自行直连管理 RPC。
 
