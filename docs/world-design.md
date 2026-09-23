@@ -480,7 +480,11 @@ bootstrap RPC 集合为 `PrepareEnrollment`、`GetEnrollmentStatus`、`GetEnroll
 
 登记验收覆盖空节点、新 Store、已有 Store、并发导入超额、反复登记去重、激活响应丢失时保留预留、存活写入者、重复认领、授权过期、prepare/activate 各阶段断线及激活响应丢失；断言绑定只在握手完成后可用、重试不重复初始化、未知状态下不开放独立写入。
 
-登记被额度或权益拒绝后，管理员可通过 abort API、`world_enrollment_abort` 或 `world enrollment abort <id>` 请求恢复独立使用。World 在事务中将原 Enrollment 置为 `aborting` 并停止发送新的激活消息，创建 purpose=abort、固定原节点公钥/Store/Enrollment 的 handoff。abort API/MCP/CLI 只返回引用与状态，实际中止授权经同一 handoff approve/redeem 交付；现有节点身份固定，禁止提交替代候选。节点管理员使用 `forkfs enroll abort` 经本机受限 socket 确认，forkfs 在同一登记锁下执行 `AbortEnrollment`，与 ActivateEnrollment 原子互斥。
+abort 先按是否已授予节点修改 Store 的能力分流。World 为每个 Enrollment 持久化 `prepare_authorization_issued`：redeem 在返回可用于 PrepareEnrollment 的凭证之前，先在同一事务内核验阶段、固定节点身份并置此标记。candidate/approve 本身不授予修改 Store 的能力。若标记从未设置，abort 可在控制面事务中直接标记 aborted、作废全部 handoff 并记录 tombstone，不需要节点、公钥或 Store 已存在；candidate、approve、redeem、renew 与该事务串行检查终态，迟到请求一律拒绝。此时没有节点副作用，Network 删除不再被该意图阻塞。
+
+若标记已设置，即使 World 未见 prepared 或 redeem 响应丢失，也不能推断节点未执行，必须走下面的节点握手。固定节点可以通过 Enrollment ID 接收 AbortEnrollment：本地从未准备时，先持久化该 Enrollment 的 abort tombstone，原子拒绝迟到 PrepareEnrollment，再返回“无 Store 副作用”的证明；已经准备时恢复对应 Store。此路径不要求预先有 store_id，若存在关联则必须与原记录一致。节点无法连接时保留 aborting 并报告待节点确认，不能控制面单独完成。验收覆盖创建后无人接入、批准前取消、redeem 与 abort 两种先后顺序、凭证响应丢失，以及 AbortEnrollment 先于 PrepareEnrollment 到达。
+
+登记被额度或权益拒绝后，管理员可通过 abort API、`world_enrollment_abort` 或 `world enrollment abort <id>` 请求恢复独立使用。World 在事务中将原 Enrollment 置为 `aborting` 并停止发送新的激活消息，创建 purpose=abort、固定原节点公钥/Enrollment 及已知 Store 关联（如有）的 handoff。abort API/MCP/CLI 只返回引用与状态，实际中止授权经同一 handoff approve/redeem 交付；现有节点身份固定，禁止提交替代候选。节点管理员使用 `forkfs enroll abort` 经本机受限 socket 确认，forkfs 在同一登记锁下执行 `AbortEnrollment`，与 ActivateEnrollment 原子互斥。
 
 forkfs 只有在本地持久化记录证明该 Enrollment 从未激活时才能中止；先持久化不可逆的 abort 决定，使所有在途或重放的旧激活消息都被拒绝，再恢复此次 prepare 修改的访问限制、释放 Store 所有权并记录 `aborted` 证明。访问限制的原值和恢复进度在 prepare/abort 日志中保存，崩溃后沿原步骤继续，不能覆盖其他管理员后来改变的权限；出现差异时保持维护状态并报告需要节点管理员处理。恢复完成前不返回中止成功。
 
