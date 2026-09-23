@@ -87,6 +87,70 @@ fn run() -> std::io::Result<()> {
                 .status()?;
             std::process::exit(status.code().unwrap_or(99));
         }
+        "raw-spawn" | "raw-exec" => {
+            use std::{ffi::CString, os::unix::ffi::OsStrExt};
+            let argv: Vec<_> = args[2..]
+                .iter()
+                .map(|s| CString::new(s.as_bytes()).unwrap())
+                .collect();
+            let env: Vec<_> = std::env::vars_os()
+                .map(|(k, v)| {
+                    let mut entry = k.as_bytes().to_vec();
+                    entry.push(b'=');
+                    entry.extend_from_slice(v.as_bytes());
+                    CString::new(entry).unwrap()
+                })
+                .collect();
+            let mut argp: Vec<_> = argv.iter().map(|s| s.as_ptr()).collect();
+            let mut envp: Vec<_> = env.iter().map(|s| s.as_ptr()).collect();
+            argp.push(std::ptr::null());
+            envp.push(std::ptr::null());
+            unsafe {
+                if args[1] == "raw-exec" {
+                    libc::execve(argv[0].as_ptr(), argp.as_ptr(), envp.as_ptr());
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut pid = 0;
+                let result = libc::posix_spawn(
+                    &mut pid,
+                    argv[0].as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    argp.as_ptr().cast(),
+                    envp.as_ptr().cast(),
+                );
+                if result != 0 {
+                    return Err(std::io::Error::from_raw_os_error(result));
+                }
+                let mut status = 0;
+                if libc::waitpid(pid, &mut status, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                std::process::exit(if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    99
+                });
+            }
+        }
+        "udp-disconnect" => {
+            use std::os::fd::AsRawFd;
+            let socket = UdpSocket::bind("127.0.0.1:0")?;
+            socket.connect(&args[2])?;
+            let mut addr: libc::sockaddr = unsafe { std::mem::zeroed() };
+            addr.sa_family = libc::AF_UNSPEC as _;
+            let result = unsafe {
+                libc::connect(socket.as_raw_fd(), &addr, std::mem::size_of_val(&addr) as _)
+            };
+            print!(
+                "{}",
+                if result == 0 {
+                    0
+                } else {
+                    std::io::Error::last_os_error().raw_os_error().unwrap()
+                }
+            );
+        }
         "tamper-child" => {
             // This single-threaded fixture deliberately changes its inherited
             // injection environment before trying intercepted child launches.

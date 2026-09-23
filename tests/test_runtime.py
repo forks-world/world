@@ -268,6 +268,28 @@ class CLI(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), [str(self.dir / "python3"), "-u", str(script), "caller-arg"])
 
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_non_path_launch_validates_current_directory(self):
+        ack = self.dir / "ack"
+        ack.touch()
+        cwd, path = self.dir / "cwd", self.dir / "path"
+        cwd.mkdir()
+        path.mkdir()
+        (cwd / "candidate").symlink_to("/bin/echo")
+        (path / "candidate").symlink_to(PROBE)
+        env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), PATH=str(path))
+        for mode in ["raw-spawn", "raw-exec"]:
+            result = run(PROBE, mode, "candidate", "fd", "999", env=env, cwd=cwd)
+            self.assertEqual(result.returncode, 77, result.stderr)
+        (cwd / "candidate").unlink()
+        (path / "candidate").unlink()
+        (cwd / "candidate").symlink_to(PROBE)
+        (path / "candidate").symlink_to("/bin/echo")
+        for mode in ["raw-spawn", "raw-exec"]:
+            result = run(PROBE, mode, "candidate", "fd", "999", env=env, cwd=cwd)
+            self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
     @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
     def test_slow_output_consumer_does_not_lose_tail(self):
         for destination in ["stdout", "stderr"]:
@@ -394,6 +416,12 @@ class Silo(unittest.TestCase):
             self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
             result = run(*self.command("A", "launch", "probe", "fd", "999"), env=env)
             self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+    def test_udp_disconnect_uses_kernel_semantics(self):
+        baseline = run(PROBE, "udp-disconnect", "127.0.0.1:12345")
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        result = run(*self.command("A", "udp-disconnect", "127.0.0.1:12345"))
+        self.assertEqual((result.returncode, result.stdout), (0, baseline.stdout), result.stderr)
 
     def test_udp(self):
         with serving(self.command("A", "udp-serve", "127.0.0.1:0", "A")) as (_, port):

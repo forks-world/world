@@ -45,6 +45,7 @@ pub unsafe fn address_allowed(
             }
         }
         libc::AF_UNIX => true,
+        libc::AF_UNSPEC if !binding => true,
         _ => false,
     };
     if !allowed {
@@ -88,18 +89,13 @@ pub unsafe fn native_target(path: *const libc::c_char) -> bool {
         if path.is_null() {
             return false;
         }
-        let name = unsafe { CStr::from_ptr(path) }.to_string_lossy();
-        let path = if name.contains('/') {
-            std::path::PathBuf::from(name.as_ref())
-        } else {
-            let Some(path) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                .map(|p| p.join(name.as_ref()))
-                .find(|p| executable_file(p))
-            else {
-                return false;
-            };
-            path
-        };
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(
+            unsafe { CStr::from_ptr(path) }.to_bytes(),
+        ));
+        if !executable_file(path) {
+            return false;
+        }
         let Ok(path) = path.canonicalize() else {
             return false;
         };
@@ -136,19 +132,11 @@ pub unsafe fn spawn_allowed(path: *const libc::c_char, envp: *const *const libc:
         if path.is_null() || envp.is_null() {
             return false;
         }
-        let name = unsafe { CStr::from_ptr(path) }.to_string_lossy();
-        let path = if name.contains('/') {
-            std::path::PathBuf::from(name.as_ref())
-        } else {
-            let Some(p) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                .map(|p| p.join(name.as_ref()))
-                .find(|p| executable_file(p))
-            else {
-                return false;
-            };
-            p
-        };
-        if !executable_file(&path) {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(
+            unsafe { CStr::from_ptr(path) }.to_bytes(),
+        ));
+        if !executable_file(path) {
             return false;
         }
         let Ok(path) = path.canonicalize() else {
