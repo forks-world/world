@@ -19,9 +19,7 @@ fn find_non_sip_in(name: &str, path_var: &str) -> Option<CString> {
     let names = [name];
     for try_name in names {
         for dir in path_var.split(':') {
-            if dir.is_empty() {
-                continue;
-            }
+            let dir = if dir.is_empty() { "." } else { dir };
             if dir.starts_with("/usr/bin/")
                 || dir == "/usr/bin"
                 || dir.starts_with("/bin/")

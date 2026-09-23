@@ -243,6 +243,22 @@ class CLI(unittest.TestCase):
             script.chmod(0o755)
 
     @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_env_shebang_empty_path_components_use_cwd(self):
+        ack = self.dir / "ack"
+        ack.touch()
+        (self.dir / "python3").symlink_to(PROBE)
+        script = self.dir / "script"
+        script.write_text("#!/usr/bin/env python3\n")
+        script.chmod(0o755)
+        env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack))
+        for path in ["", ":/nonexistent", "/nonexistent:", "/nonexistent::/nonexistent"]:
+            for mode in ["launch-envpath", "exec-envpath"]:
+                result = run(PROBE, mode, path, script, env=env, cwd=self.dir)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), ["./python3", str(script)])
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
     def test_child_injection_values_are_immutable(self):
         ack = self.dir / "ack"
         ack.touch()
