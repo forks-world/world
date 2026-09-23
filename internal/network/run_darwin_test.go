@@ -261,3 +261,30 @@ func TestDarwinClosesInheritedSocket(t *testing.T) {
 		t.Fatalf("inherited socket survived: %d %s", code, out)
 	}
 }
+
+func TestDarwinOpenStdinDoesNotDelayExit(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+	code, err := Run(context.Background(), RunOptions{Policy: Policy{NetworkID: "offline"}, Workdir: t.TempDir(), Command: []string{"/bin/echo", "done"}, Timeout: 3 * time.Second, Stdin: reader})
+	if code != 0 || err != nil {
+		t.Fatalf("open stdin prevented normal exit: %d %v", code, err)
+	}
+}
+
+func TestDarwinRejectsSocketStdin(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := os.NewFile(uintptr(fds[0]), "socket-input")
+	defer input.Close()
+	defer syscall.Close(fds[1])
+	code, err := Run(context.Background(), RunOptions{Policy: Policy{NetworkID: "offline"}, Workdir: t.TempDir(), Command: []string{"/bin/echo", "must-not-run"}, Timeout: time.Second, Stdin: input})
+	if code != 125 || err == nil || !strings.Contains(err.Error(), "socket stdin") {
+		t.Fatalf("socket stdin accepted: %d %v", code, err)
+	}
+}

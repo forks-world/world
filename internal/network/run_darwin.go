@@ -66,11 +66,23 @@ func run(ctx context.Context, options RunOptions) (int, error) {
 	cmd.Dir = workdir
 	cmd.Env = executionEnv(tmp, workdir, proxy)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	// Always use pipes: never pass inherited sockets (including stdio) to the
-	// workload. The descriptor guard closes all additional descriptors.
-	if options.Stdin != nil {
+	// Pass a checked stdin file directly so a live terminal/pipe cannot keep
+	// os/exec's input-copy goroutine blocked after the command has exited.
+	// A socket must not become an inherited capability, including on fd 0.
+	if input, ok := options.Stdin.(*os.File); ok {
+		info, err := input.Stat()
+		if err != nil {
+			return 125, fmt.Errorf("inspect stdin: %w", err)
+		}
+		if info.Mode()&os.ModeSocket != 0 {
+			return 125, fmt.Errorf("socket stdin is not allowed; use a pipe")
+		}
+		cmd.Stdin = input
+	} else if options.Stdin != nil {
 		cmd.Stdin = readerOnly{options.Stdin}
 	}
+	// Output is always copied through pipes, never inherited sockets. The
+	// descriptor guard closes all additional descriptors.
 	if options.Stdout != nil {
 		cmd.Stdout = writerOnly{options.Stdout}
 	}
