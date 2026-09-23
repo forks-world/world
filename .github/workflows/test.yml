@@ -3,6 +3,7 @@ name: test
 on:
   pull_request:
   push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -13,13 +14,20 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version-file: go.mod
-          cache: false
-      - run: go test -race -timeout 2m ./...
-      - run: go vet ./...
-      - run: go build -o bin/world ./cmd/world
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --workspace --locked && cargo build --workspace --examples --locked
+      - run: python3 -m unittest discover -s tests -v
+      - name: Native silo same-port acceptance (real macOS aliases)
+        if: runner.os == 'macOS'
+        env:
+          WORLD_SILO_INTEGRATION: "1"
+        run: python3 -m unittest discover -s tests -v

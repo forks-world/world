@@ -1,105 +1,96 @@
-# macOS 本地网络隔离
+# macOS 网络运行时
 
-`world network exec` 已实现 macOS 进程出站访问限制，尚未实现每个 World 独立的网络栈。代码使用 Go 标准库与系统 `/usr/bin/sandbox-exec`；不修改系统 PF 规则、不需要 root、不调用 forkfs C ABI。策略由可信调用方提供，不接受任务自行扩权。它是本地运行时入口，尚未接入 World 的组织授权或 forkfs RPC。
+World 使用 Rust。CLI 位于 `crates/world-cli`，运行时位于 `crates/world-runtime`，silo 的 socket 拦截库位于 `vendor/silo-bind`。forkfs RPC、控制面认证与计费未实现。
 
-## World 网络栈验收要求
+## 两种执行模式
 
-任务已确认必须在宿主 macOS 原生执行，并提供每个 World 独立的 `localhost`，应用无需修改。这是硬性验收条件；不同显式 IP、要求应用配置地址或代理均不满足要求。宿主原生机制的实测结果与当前实现阻塞见 [原生网络可行性核对](macos-native-network-feasibility.md)。
+| 模式 | 用途 | 本地监听 | 边界 |
+| --- | --- | --- | --- |
+| `world network exec` | 原有出站白名单模式的 Rust 迁移 | 禁止 | Seatbelt 拒绝直接 socket，独立认证 HTTP/CONNECT 代理放行目标 |
+| `world silo exec` | 多个 World 同端口原生开发服务 | 支持 | silo 在受支持程序内透明重写地址；没有内核 network namespace |
 
-World/Workspace 是独立端口空间的边界。W1 和 W2 必须能够同时监听相同的地址、协议和端口，例如各自的 `127.0.0.1:8080`；应用无需改地址、改端口或增加代理配置。同一个 World 的不同进程和不同 `exec` 共享该网络栈，客户端访问 `localhost:8080` 只能连接本 World 的服务。
+两种模式分别使用，当前不组合：silo 需要直接访问其 loopback 地址和动态库注入，不能简单套入禁止监听的 Seatbelt profile。silo 模式也不自动继承出站白名单限制。
 
-运行时身份须使用全局 Workspace Resource ID 和运行代际，不能只用 Store 内的 `W1` 简写或每次 Execution ID。Network 仍是授权与出站策略边界，不因两个 Workspace 属于同一个 Network 就合并它们的端口空间。
-
-必须验证：
-
-- W1 与 W2 同时监听相同 TCP 端口，分别返回不同标记；另一次 `exec` 在各自 World 内只能读到自己的标记。
-- IPv4、IPv6、UDP 和通配地址监听均保持独立；子进程加入所属 World 的网络栈。
-- 停止 W1 后，W2 的同端口服务继续工作；重建 W1 不串入旧运行代际的服务。
-- 宿主或另一 World 不会因端口号相同而访问到该服务；对外发布端口必须显式配置并单独处理宿主端口冲突。
-- 并发创建、进入与停止同一个 World 时，不得产生两个网络栈、连接到错误 World 或在停止后接受新任务。
-
-当前 Seatbelt/代理测试验证的是出站访问限制和禁止监听，不能作为以上验收的通过证据。独立网络栈后端完成这些测试前，不能宣称该功能已经实现。
-
-## 使用
-
-需要 Go 1.24+ 和支持当前 Seatbelt profile 的 macOS。先构建：
+## 构建与安装
 
 ```sh
-go build -o bin/world ./cmd/world
-workdir=$(mktemp -d)
+cargo build --workspace --locked
 ```
 
-断网执行：
+工具链由 `rust-toolchain.toml` 固定，依赖由 `Cargo.lock` 固定。`target/debug/world` 和 `target/debug/libworld_silo_bind.dylib` 必须放在同一目录。发布构建使用 `cargo build --workspace --release --locked`；仅 `cargo install` CLI 不会安装所需动态库。
+
+## 同端口 localhost
 
 ```sh
-./bin/world network exec \
-  --policy examples/network-offline.json \
-  --workdir "$workdir" -- /bin/sh -c 'echo offline; touch result'
+mkdir -p /tmp/world-a /tmp/world-b
+./target/debug/world silo create --world A --workdir /tmp/world-a
+./target/debug/world silo create --world B --workdir /tmp/world-b
+./target/debug/world silo setup --world A
+./target/debug/world silo setup --world B
 ```
 
-显式放行 `example.com:443`：
+`create` 只登记 World 与固定工作目录，输出 JSON 中的内部地址。`setup` 通过 `sudo /sbin/ifconfig lo0 alias ...` 添加该地址，需要管理员权限；不修改 sudoers、PF 或 `/etc/hosts`。执行前检查地址已经配置，缺失即拒绝启动，不回退到宿主 localhost。
+
+在两个终端分别运行：
 
 ```sh
-./bin/world network exec \
-  --policy examples/network-web.json \
-  --workdir "$workdir" --timeout 30s -- \
-  /usr/bin/curl --fail --show-error https://example.com/
+./target/debug/world silo exec --world A -- /opt/homebrew/bin/python3 -m http.server 8080 --bind 127.0.0.1
+./target/debug/world silo exec --world B -- /opt/homebrew/bin/python3 -m http.server 8080 --bind 127.0.0.1
 ```
 
-策略格式：
+客户端也必须由对应 World 启动，例如使用已安装的非 SIP 版本 curl：
 
-```json
-{
-  "network_id": "development",
-  "allow": [{"host": "example.com", "port": 443}]
-}
+```sh
+./target/debug/world silo exec --world A -- /opt/homebrew/opt/curl/bin/curl http://localhost:8080/
+./target/debug/world silo exec --world B -- /opt/homebrew/opt/curl/bin/curl http://localhost:8080/
 ```
 
-`allow: []` 表示断网。每条规则授权一个 TCP 目标，支持域名或 IP 字面量；不支持通配符、CIDR、任意端口或 UDP 放行。域名在启动任务前由可信代理解析并固定地址，后续请求不重新解析。解析得到回环、私网或链路本地地址时拒绝启动；需要这些服务时必须明确授权 IP 字面量。HTTP 重定向产生的新目标仍需独立授权。
+应用继续使用 localhost 和原端口，不需要配置隔离 IP。每个 World 的内部地址由 World 分配，silo 在 `bind/connect/sendto/sendmsg` 等调用处进行透明重写。同一 World 的不同进程及多次 `exec` 使用同一映射；支持 IPv4、通配绑定、双栈 socket 的 `::1`/`::` 和 UDP。显式 IPv6-only socket 不支持，返回失败而非使用宿主地址。
 
-默认期限 5 分钟，最大 24 小时。返回任务退出码；信号退出返回 `128 + signal`，取消/超时返回 124，本地参数或运行基础设施错误返回 125。Seatbelt 或目标程序自身的启动失败保留其非零退出码，始终不退回无沙箱执行。
+默认状态目录为 `~/.local/share/world/silo`，`--state-dir` 可指定一个受信任的独立运行时注册表。必须让需要相互协调的 World 使用同一注册表。跨进程文件锁串行分配地址，元信息以临时文件、fsync、原子替换提交；同 ID 重复创建幂等，换工作目录被拒绝。地址不会自动回收给另一个 World，避免仍存活的旧进程进入新 World。
 
-## 执行边界
+`world silo inspect --world A` 查看配置。World 本地 ID 是开发用稳定标识，尚未对接 forkfs 全局 Workspace Resource ID 或组织授权。`create` 成功只表示元信息登记，不表示已配置地址或通过隔离验收。重启后需要重新 `setup`。停止所有关联任务后可以按 inspect 返回的地址手工执行 `sudo ifconfig lo0 -alias IP` 清理别名；这不会删除工作目录或注册表。
 
-| 路径 | 行为 |
-| --- | --- |
-| IPv4/IPv6 TCP、UDP、Unix socket 直接连接 | 内核拒绝，包括宿主回环服务 |
-| 本地端口监听 | 内核拒绝 |
-| HTTP 代理与 HTTPS CONNECT | 仅允许本次执行的代理端口，代理再次检查目标白名单与执行凭证 |
-| 其他 Network 或其他执行的代理 | 端口被内核拒绝；不同执行的凭证也不可互换 |
-| 子进程 | 继承相同 Seatbelt 限制，修改代理环境变量不能恢复直接连接 |
-| 任务退出、超时或取消 | 关闭代理监听及所有已有隧道，停止任务进程组 |
-| 非 macOS 或沙箱启动失败 | 拒绝执行，无降级路径 |
+## silo 补丁与兼容边界
 
-代理 listener 由内核原子分配并一直持有，没有“检查空闲端口后再绑定”的竞争窗口。由于 Seatbelt 的 `localhost` 规则覆盖 IPv4 和 IPv6，启动任务前必须同时持有 `127.0.0.1` 与 `::1` 的同一端口；任一绑定失败即拒绝启动，避免另一地址族的同端口被其他服务占用。每次执行保存独立、不可变的规则与随机凭证，没有可被另一任务覆写的全局代理策略。关闭过程同步且幂等，关闭期间新连接也被拒绝；上下文取消会撤销已有隧道。旧执行凭证不能使用之后复用相同端口的 World 代理。
+上游为 [silo-rs/silo](https://github.com/silo-rs/silo)，固定提交 `8364a4298a0b85ffcecc281bfd5c6bb73963be8a`；来源、MIT 许可证和本地修改保存在 `vendor/silo-bind/`。
 
-启动器以参数数组传递命令和内存中的 profile，避免命令字符串拼接及临时策略文件被替换。一个固定的、单线程 shell 启动脚本先关闭标准输入输出之外的描述符，再用 `exec "$@"` 进入 Seatbelt；仅 `/dev/fd` 枚举得到并校验过的数字参与关闭操作，任务参数不插入脚本。这样也能关闭 Go `os/exec` 不会自动关闭的、由宿主传入的非 CLOEXEC socket。清理继承环境，设置私有 HOME/TMPDIR 与 HTTP(S) 代理，清空 NO_PROXY；不继承 DYLD 注入变量、宿主服务凭证。标准输出/错误通过管道转发；标准输入允许文件、管道和终端，拒绝 socket。
+- localhost 始终重写，不保留上游“没有监听者就访问宿主”的回退，也不依赖存在竞争窗口的监听探测。
+- 拦截到的其他 World loopback 地址访问被拒绝；IPv4-mapped localhost 也必须映射到当前 World。
+- SIP 系统程序直接拒绝；脚本需显式指定非 SIP 解释器。受拦截的子进程启动检查注入环境，不允许静默丢失。已有程序无需修改源码，但并不承诺所有 macOS 可执行文件都兼容。
+- 动态库加载后写入本次执行确认文件；未确认会终止任务并报错。确认检查不能替代代码签名策略或证明每个 socket 调用都经过了拦截。
+- 状态管理、代理和一般 CLI 使用安全 Rust；系统调用边界与继承描述符处理集中在运行时/动态库中。不得将语言的内存安全等同于无逻辑竞争。
 
-同时拒绝 Mach 服务查找/注册、跨进程信号与信息查询、POSIX/System V IPC，以及工作目录和本次临时目录之外的文件写入，减少借宿主服务代发请求的通道。允许查询进程自身信息，以兼容系统 curl。依赖 GUI、launchd 或其他 Mach 服务的命令可能失败；不能为兼容而直接开启全部 Mach 服务。
+**silo 模式是可信开发任务的兼容层，不是恶意代码安全边界。** 原始系统调用、未被拦截的 API 或有意绕过注入的程序可能访问宿主网络。宿主非受管程序也能访问内部 alias；socket 返回的地址信息可能显示内部映射。它不提供跨 World 文件保密、远程租约、配额、任意原生程序完整网络栈虚拟化。生产级受管节点不能仅据此标为完整隔离就绪。
 
-## 范围与限制
+## 出站白名单模式
 
-- 这是本机可信操作者启动开发任务的运行时原语，`network_id` 是策略标识，尚不是经过 World 身份认证的租户边界；调用方必须提供已授权策略和专用工作目录。不能把 CLI 的 `--policy` 直接暴露成不可信 Agent 的扩权入口。
-- 没有实现完整文件读取隔离、组织权限、forkfs 生命周期/RPC、远程执行租约或配额，因此不宣称完整的多租户受管执行已经可用。父进程同一用户下的非受管宿主进程也不在隔离范围内。
-- 放行的是 TCP 目标，不是 URL、HTTP 方法、TLS SNI 或仓库权限。CONNECT 不解密 TLS；显式授权转发代理或共享目标会授予该目标能提供的能力。不实现同 Network 任意端口互通或独立 IP 网络命名空间。
-- 应用需支持 HTTP(S) 代理或 CONNECT；直接联网的 SDK、SSH 与 UDP/QUIC 不会自动适配。系统信任服务被限制时，一些 HTTPS 客户端可能需要显式 CA 文件或独立证书库。
-- 进程组清理不等于完整的恶意守护进程回收。主动脱离进程组的后代仍继承沙箱，World 代理关闭后不能继续使用它；但 Seatbelt 的端口例外不会动态撤销，日后该端口被无认证的非 World 宿主服务复用仍有风险。需要对抗这类恶意任务的长期隔离应使用专用 VM/节点，不能将本入口标为该等级的运行环境。
-- Seatbelt profile 是平台相关能力；`sandbox-exec` 的本机手册标注 deprecated。当前实现不静默放宽策略，应在目标 macOS 版本上通过内核测试后再部署。
+```sh
+./target/debug/world network exec --policy examples/network-offline.json --workdir /tmp/world-a -- /bin/echo offline
+./target/debug/world network exec --policy examples/network-web.json --workdir /tmp/world-a --timeout 30s -- /usr/bin/curl -fsS https://example.com/
+```
+
+策略结构保持 `{ "network_id": "web", "allow": [{ "host": "example.com", "port": 443 }] }`。空 allow 为断网；支持明确的 TCP 域名/IP 和端口，拒绝未知字段、通配符和非法端口。域名启动时解析并固定地址，私网/回环解析需改为可信配置中的显式 IP 授权。
+
+每次执行有独立不可变路由和随机代理凭证，同时占住 IPv4/IPv6 的代理端口。HTTP 请求与 CONNECT 都检查目标和凭证；代理凭证不转发至目标。HTTP 响应重定向不会绕过下一次目标校验。
+
+Seatbelt 拒绝直接 TCP/UDP/Unix socket、监听、Mach 服务、跨进程信息与信号，以及工作目录和私有临时目录之外的写入。清理环境、通过管道转发输出、拒绝 socket 标准输入，并关闭额外继承描述符。失败不退回无沙箱执行。
+
+两种模式都默认 5 分钟期限、最大 24 小时。传递任务退出码；信号退出为 `128 + signal`，取消/超时为 124，参数或基础设施错误为 125。退出/取消关闭出站代理已有隧道并停止任务进程组。主动脱离进程组的恶意后代不在完整回收保证内。
 
 ## 验证
 
 ```sh
-go test -race -timeout 2m ./...
-go vet ./...
-go build -o bin/world ./cmd/world
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo build --workspace --locked
+cargo build --workspace --examples --locked
+python3 -m unittest discover -s tests -v
+# 有 sudo 权限的专用 macOS 测试机：
+WORLD_SILO_INTEGRATION=1 python3 -m unittest discover -s tests -v
 ```
 
-macOS 测试使用本机临时监听器，不依赖公网或需要 root 的配置。先验证宿主确实能连接，再断言沙箱返回 `EPERM/EACCES`，不把超时或拒绝连接冒充隔离。覆盖：
+原生测试使用没有 World 依赖的普通 Rust socket 程序。测试先确认宿主能连接，再验证 Seatbelt 权限拒绝，覆盖继承 fd、标准输入、子进程、HTTP/CONNECT/TLS、退出和超时。非特权测试也检查动态库实际注入及禁止宿主回退。
 
-- TCP IPv4/IPv6、UDP、Unix socket、监听端口及 shell 子进程拒绝。
-- HTTP 放行/403 拒绝、CONNECT 与真实 TLS 握手（显式测试 CA），放行目标的直连仍被拒绝。
-- 其他 Network 代理端口拒绝、执行凭证不可互换、凭证不转发给目标服务；同时持有并保护两个地址族的代理端口。
-- 多个 Network 并发运行、代理并发关闭、已有 CONNECT 隧道撤销、退出码与超时。
-- 宿主写入和 launchd 访问拒绝，非法策略拒绝；实际传入的非 CLOEXEC socket 在启动前被关闭。
-
-2026-09-23 在 macOS 27.0（26A428）、arm64、Go 1.27.1 上完成本机验证。仓库 CI 配置在 macOS 运行真实沙箱测试，在 Linux 运行代理测试和不支持平台时拒绝执行的测试。
+silo 完整测试显式创建并清理两个真实 macOS loopback 别名；检查同端口监听、各自 localhost 连接、双栈/通配绑定、UDP、子进程继承、其他 World 地址拒绝、没有监听者时不回退宿主，以及停止 A 后 B 的同端口服务仍正常。没有管理员能力时这些用例明确标为未运行，不能冒充验证通过。CI 的 macOS job 必须开启完整测试；Linux 仅验证可移植逻辑和不支持平台时拒绝执行。

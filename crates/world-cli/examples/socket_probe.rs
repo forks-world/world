@@ -1,0 +1,95 @@
+//! An ordinary application fixture: no World/silo dependencies or rewriting.
+use std::{
+    io::{Read, Write},
+    net::{TcpListener, TcpStream, UdpSocket},
+    time::Duration,
+};
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("{e}");
+        std::process::exit(if e.kind() == std::io::ErrorKind::PermissionDenied {
+            77
+        } else {
+            78
+        });
+    }
+}
+fn run() -> std::io::Result<()> {
+    let args: Vec<_> = std::env::args().collect();
+    match args[1].as_str() {
+        "serve" => {
+            let listener = TcpListener::bind(&args[2])?;
+            println!("READY {}", listener.local_addr()?.port());
+            for stream in listener.incoming() {
+                stream?.write_all(args[3].as_bytes())?;
+            }
+        }
+        "udp-serve" => {
+            let socket = UdpSocket::bind(&args[2])?;
+            println!("READY {}", socket.local_addr()?.port());
+            loop {
+                let mut buf = [0; 100];
+                let (_, peer) = socket.recv_from(&mut buf)?;
+                socket.send_to(args[3].as_bytes(), peer)?;
+            }
+        }
+        "get" => {
+            let mut stream =
+                TcpStream::connect_timeout(&args[2].parse().unwrap(), Duration::from_secs(1))?;
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            let mut value = String::new();
+            stream.read_to_string(&mut value)?;
+            print!("{value}");
+        }
+        "udp-get" => {
+            let socket = UdpSocket::bind("127.0.0.1:0")?;
+            socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+            socket.send_to(b"ping", &args[2])?;
+            let mut buf = [0; 100];
+            let (n, _) = socket.recv_from(&mut buf)?;
+            print!("{}", String::from_utf8_lossy(&buf[..n]));
+        }
+        "dial" => {
+            TcpStream::connect_timeout(&args[2].parse().unwrap(), Duration::from_secs(1))?;
+        }
+        "udp-dial" => {
+            let socket = UdpSocket::bind("127.0.0.1:0")?;
+            socket.connect(&args[2])?;
+        }
+        "unix" => {
+            #[cfg(unix)]
+            {
+                std::os::unix::net::UnixStream::connect(&args[2])?;
+            }
+        }
+        "write" => {
+            std::fs::write(&args[2], "escape")?;
+        }
+        "child" => {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(&args[2..])
+                .status()?;
+            std::process::exit(status.code().unwrap_or(99));
+        }
+        "fd" => {
+            let fd: i32 = args[2].parse().unwrap();
+            #[cfg(unix)]
+            unsafe {
+                let mut addr: libc::sockaddr_storage = std::mem::zeroed();
+                let mut size = std::mem::size_of_val(&addr) as libc::socklen_t;
+                if libc::getpeername(
+                    fd,
+                    (&mut addr as *mut libc::sockaddr_storage).cast(),
+                    &mut size,
+                ) == 0
+                {
+                    std::process::exit(99);
+                }
+            }
+            print!("descriptor-closed");
+        }
+        _ => panic!("unknown probe"),
+    }
+    Ok(())
+}

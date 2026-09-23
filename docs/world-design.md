@@ -356,26 +356,20 @@ World 原子记录取消意图并阻止尚未发送的 outbox 执行；已经发
 ## 8. 建议代码结构
 
 ```text
-cmd/world/                 CLI 入口
-                           同时提供 mcp serve 子命令
-cmd/world-api/             API 服务入口
-cmd/world-worker/          异步任务入口
-internal/identity/         身份、组织与授权
-internal/networks/         隔离边界与生命周期
-internal/metadata/         元信息与配置版本
-internal/billing/          订阅、权益、配额与计量
-internal/operations/       Operation、outbox 与重试
-internal/audit/            审计记录
-internal/adapters/         支付服务、运行环境、密钥服务
-internal/mcp/              MCP 工具注册、参数与结果映射
-skills/world/              待实现的 World Skill 与工作流程参考
-contracts/mcp/             工具输入输出 schema 与契约示例
-api/                      接口规范与 schema
-migrations/               数据库迁移
+crates/world-cli/          已实现：CLI 入口
+crates/world-runtime/      已实现：策略、出站代理、进程监督、silo 状态
+vendor/silo-bind/          已接入：固定版本 silo 动态库，保留许可证与本地补丁说明
+crates/world-core/         待实现：身份、Network、元信息、付费、Operation
+crates/world-mcp/          待实现：Agent 工具与共享授权入口
+crates/world-forkfs/       待实现：版本化 RPC 客户端与领域映射
+contracts/                待实现：forkfs/MCP 协议规格
+skills/world/             待实现：Agent 使用流程
+migrations/               待实现：控制面数据库迁移
+tests/                    真实进程与 macOS 集成测试
 docs/                     设计与使用说明
 ```
 
-以上是职责组织建议。首个本地 CLI 和 macOS 网络运行时使用 Go，实现位于 `cmd/world/` 与 `internal/network/`；其余模块仍为拟议结构。
+World 已从 Go 原型迁移到 Rust。当前实际 workspace 仅包含 CLI、运行时与 silo 动态库，其余列出的 crate 是后续规划。系统 socket 拦截需要 OS C 调用约定，forkfs 仍只通过 RPC 接入。
 
 ## 9. 实现顺序与验收
 
@@ -747,7 +741,7 @@ Linux 当前沙箱保留宿主网络，宿主可读文件也不是保密边界�
 
 因此 World 受管执行必须禁止静默降级，并额外部署 Network 流量策略及跨 Network 文件访问限制。只传 `--require-sandbox` 不足以完成这些保证。节点未提供所需隔离能力时拒绝受管执行，Network 不标为可执行状态。授权撤销也需要终止或隔离已有执行进程，不能仅删除控制面授权记录。
 
-macOS 本地出站访问限制已有首版实现与内核集成测试：`world network exec` 使用默认拒绝的 Seatbelt 网络策略、每次执行独立且带凭证的 HTTP/CONNECT 代理、不可变目标白名单和有限执行期限。该实现禁止监听，不能满足多个 World 同端口独立监听、栈内互连的要求；每个 World 的独立网络栈后端仍待实现。此入口尚未接入组织授权、forkfs RPC、远程租约和跨 Network 文件保密边界，不能据此将节点标为完整受管执行就绪。具体能力、限制和验证方法见 [macOS 网络隔离](macos-network-isolation.md)。
+macOS 本地出站访问限制已有首版实现与内核集成测试：`world network exec` 使用默认拒绝的 Seatbelt 网络策略、每次执行独立且带凭证的 HTTP/CONNECT 代理、不可变目标白名单和有限执行期限。该出站模式禁止监听。另提供 `world silo exec`，使用固定版本的 silo 动态库透明映射 localhost，支持同端口开发服务；它的注入兼容性有限，不能作为恶意任务的内核隔离边界。此入口尚未接入组织授权、forkfs RPC、远程租约和跨 Network 文件保密边界，不能据此将节点标为完整受管执行就绪。具体能力、限制和验证方法见 [macOS 网络隔离](macos-network-isolation.md)。
 
 forkfs 底层状态保留 `CREATING / ACTIVE / TRASHING / TRASHED / DEAD`，World Operation 单独表示任务进度。discard 后仍占空间，restore 可能因 GC 已开始或基线消失而失败。删除 Network 前处理运行中的 Execution、活跃资源、trash 和 pool；不能将 discard 成功解释为清理完成。
 
