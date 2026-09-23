@@ -193,6 +193,7 @@ world operation inspect op_123
 | `GET /v1/orgs/{org}/networks/{network}/nodes` | 分页查询该 Network 可见的节点身份、能力与健康状态 |
 | `GET /v1/orgs/{org}/networks/{network}/stores` | 分页查询 StoreBinding，支持 node_id 和状态筛选 |
 | `GET /v1/orgs/{org}/networks/{network}/stores/{store_binding}` | 查询指定绑定的节点、底层 Store 身份、状态与可用能力 |
+| `POST /v1/orgs/{org}/networks/{network}/stores/{store_binding}/decommission` | 停用已清空的 StoreBinding，返回 Operation；不隐式删除资源 |
 | `GET/POST /v1/orgs/{org}/networks/{network}/resources` | 查询或创建资源 |
 | `GET/PATCH/DELETE /v1/orgs/{org}/networks/{network}/resources/{resource}` | 资源元信息与生命周期管理 |
 | `GET /v1/orgs/{org}/networks/{network}/operations/{operation}` | 查询异步操作 |
@@ -200,6 +201,7 @@ world operation inspect op_123
 | `GET /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}` | 查询登记阶段及需要的本机动作 |
 | `POST /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}/complete` | 提交节点证明，幂等完成激活与绑定发布 |
 | `POST /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}/abort` | 管理员请求中止未激活登记，返回可查询的中止阶段 |
+| `POST /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}/renew` | 管理员为原登记续发短期授权，固定原归属与已确认节点身份 |
 | `POST /v1/orgs/{org}/networks/{network}/workspaces/{workspace}/executions` | 异步启动受管执行，返回启动 Operation 与 Execution 引用 |
 | `GET /v1/orgs/{org}/networks/{network}/executions/{execution}` | 查询执行状态、退出码或信号与终止原因 |
 | `GET /v1/orgs/{org}/networks/{network}/executions/{execution}/output` | 按游标和大小上限读取 stdout/stderr |
@@ -254,6 +256,7 @@ Skill 的流程约定：
 | `world_execution_cancel` | 在相同归属下以幂等键请求终止 Execution，不将受理结果解释为已经退出 |
 | `world_enrollment_create` / `world_enrollment_get` / `world_enrollment_complete` / `world_enrollment_abort` | 发起、查询、完成或中止未激活登记；不代替节点本机的管理员确认 |
 | `world_node_list` / `world_store_list` / `world_store_get` | 指定组织与 Network，发现节点和 StoreBinding；列表分页，Store 可按节点与状态筛选 |
+| `world_store_decommission` / `world_enrollment_renew` | 停用空 Store 或续发登记授权；Network admin/组织 owner 权限，幂等请求 |
 
 上下文查询和组织列表不要求组织 ID；组织级工具要求 `organization_id`；所有已有 Network 的操作要求显式 `organization_id` 和 `network_id`。MCP 不提供修改全局默认 Network 的工具，避免多个 Agent 并发时相互影响。来自启动配置的建议上下文必须解析成每次调用的显式参数。
 
@@ -285,7 +288,7 @@ Network 状态：`provisioning → active → deleting → deleted`；执行失�
 
 数据库与运行环境无法共享事务，因此采用 outbox 和幂等执行。Worker 按至少一次投递设计，适配器使用稳定操作 ID 去重，并能查询未知结果。旧版本任务不得覆盖新版本配置，删除标记阻止后续创建或更新任务重新激活资源。
 
-删除 Network 前检查依赖与资源，非空时拒绝；首版不提供隐式级联删除。进入删除状态后阻止新增资源与授权，撤销访问凭证，清理运行边界，再标记删除。失败时保持不可写状态并允许重试。账单、用量和审计历史不随 Network 删除而直接清除。
+删除 Network 前检查依赖与资源，非空时拒绝；首版不提供隐式级联删除。必须先中止未激活登记、完成活跃 StoreBinding 的显式停用及在途任务收尾，历史 tombstone 不计为活动依赖。进入删除状态后阻止新增资源、登记和授权，撤销访问凭证，清理运行边界，再标记删除。失败时保持不可写状态并允许重试。账单、用量和审计历史不随 Network 删除而直接清除。
 
 ### 异步操作的完成判据
 
@@ -401,13 +404,15 @@ World 首版只提供组织管理路径：无论节点在本机还是远程，�
 
 forkfs 先取得 Store 独占所有权，确认无独立写入者，验证 schema、资源状态和路径范围，再安装受管访问限制。无法取得锁或限制无法落实时登记失败，不发布绑定。准备成功后持久化 `prepared` 和 Enrollment ID，返回签名证明，包含节点、store_id、组织/Network、资源清单摘要及当前阶段；Store 此时保持维护状态，尚不执行普通管理操作。
 
-管理员或已授权的 World Worker 通过 complete API 提交证明。World 核验登记权限和 Network 状态，并在事务中独占认领 Store 身份、登记 Node 与处于 `activating` 的 StoreBinding，根据受保护的资源清单计算导入给组织和 Network 带来的各项正增量，按第 5 节在同一事务内校验权益并原子预留额度，再写入待激活资源映射。已有文件不等于已占用 World 额度；任何管理员登记都不能豁免这次增长准入，新 Store 也需预留受限的 Store 数量等指标。清单在维护期间不能变化，其摘要绑定激活消息。额度不足时不进入 activating、不发送激活消息，Enrollment 保留可诊断的待准入状态，管理员可在额度可用后重试。
+管理员或已授权的 World Worker 通过 complete API 提交证明。World 核验登记权限和 Network 状态，并在事务中独占认领 Store 身份、登记 Node 与处于 `activating` 的 StoreBinding 及其 generation（由 forkfs 的持久化绑定计数递增分配并纳入准备证明），根据受保护的资源清单计算导入给组织和 Network 带来的各项正增量，按第 5 节在同一事务内校验权益并原子预留额度，再写入待激活资源映射。已有文件不等于已占用 World 额度；任何管理员登记都不能豁免这次增长准入，新 Store 也需预留受限的 Store 数量等指标。清单在维护期间不能变化，其摘要绑定激活消息。额度不足时不进入 activating、不发送激活消息，Enrollment 保留可诊断的待准入状态，管理员可在额度可用后重试。
 
 随后 World 使用绑定节点和 Enrollment 的签名激活消息调用 forkfs `ActivateEnrollment`。forkfs 幂等确认原 prepared 状态、持有的 Store 所有权和归属后记录 active；World 收到对应证明后，在同一事务内幂等确认导入预留、发布资源映射并将绑定设为 active；响应丢失或激活结果未知时继续保留预留，只有确认未激活且无受管副作用后才可释放。普通受管 RPC 同时要求 active 绑定及操作授权，激活消息不能用于执行文件操作。跨节点重复或冲突的 Store 身份认领必须拒绝，不能把复制的 Store 当成独立身份导入。
 
 bootstrap RPC 集合为 `PrepareEnrollment`、`GetEnrollmentStatus`、`ActivateEnrollment`、`AbortEnrollment`，使用 Enrollment ID、一次性授权或已固定的节点身份认证；未登记阶段不要求普通 RPC 的 store_id/StoreBinding，身份分配后固定关联，不能修改归属。`GetCapabilities/GetHealth` 的未绑定探测仅返回协议与服务身份，不暴露 Store 目录；其他方法仍要求受管上下文。
 
 重试使用原 Enrollment，重复 prepare/activate 返回原结果；激活响应丢失时通过 `GetEnrollmentStatus` 对账，不能重新初始化或另建绑定。凭证过期后由同一有权管理员为原 Enrollment 重新签发并绑定已有节点身份；过期本身不解除已准备 Store 的限制。World 暂不可达或阶段不明时保留维护状态；首版允许继续登记、诊断或显式中止尚未激活的登记，不自动退管或删除用户数据。无权恢复时需组织管理员与节点管理员共同处理，不通过直接改库跳过流程。
+
+续期通过 renew API、`world_enrollment_renew` 或 `world enrollment renew <id>` 发起，需重新认证和检查原登记的管理权限；幂等键只重放本次签发结果，新的续期使用新键但沿用原 Enrollment ID。响应通过受控凭证通道交给节点管理员，日志和普通 get 结果只显示授权版本与到期时间。续期固定已有节点公钥、Store 身份及组织/Network；身份尚未确认时不得据此放宽原接入意图。forkfs 在 PrepareEnrollment 重试中接受经签名验证的新授权版本，更新已记录版本后拒绝旧版本；重放不重新创建 Store。终态 active/aborted 不允许续期，已进入 aborting 的登记只允许继续中止。续期不重置阶段、锁或配额，也不是普通操作授权。
 
 登记验收覆盖空节点、新 Store、已有 Store、并发导入超额、反复登记去重、激活响应丢失时保留预留、存活写入者、重复认领、授权过期、prepare/activate 各阶段断线及激活响应丢失；断言绑定只在握手完成后可用、重试不重复初始化、未知状态下不开放独立写入。
 
@@ -419,12 +424,24 @@ forkfs 只有在本地持久化记录证明该 Enrollment 从未激活时才能�
 
 中止响应丢失通过 `GetEnrollmentStatus` 重取证明；重复 abort 返回原结果，aborted Enrollment 不能再次 prepare/activate，重新登记须使用新意图。节点离线或激活结果未知时不能仅凭超时释放限制或额度。验收补充额度拒绝后成功恢复本地使用、abort/activate 两种先后顺序、旧激活消息重放、权限恢复中崩溃和证明响应丢失。
 
+### 已激活 Store 的停用
+
+已激活 StoreBinding 通过 decommission API、`world_store_decommission` 或 `world store decommission <binding-id>` 显式停用，限组织 owner / Network admin，欠费或超额仍可执行。首版只允许空 Store，不提供保留活跃数据的退管或级联擦除。调用前需结束 Execution，discard 并完成 GC，清空 Snapshot、Workspace、trash 和 pool；底层历史记录可保留。Node 可服务其他 Store，停用一个绑定不注销整台节点。
+
+World 原子将绑定从 active 置为 decommissioning，记录 Operation 并阻止新的文件操作、登记接管和普通授权刷新。forkfs 的 `DecommissionStore` RPC 携带绑定 ID、当前绑定 generation、Operation 和限定停用授权，进入同一 Store 队列。在独占所有权下检查真实资源、后台任务和执行占用，并将早先入队但未执行的普通任务终结为未执行；等待这些结果完成配额对账后再确认无增长预留。非空或仍有任务时返回明确拒绝证明，World 对账后恢复 active，管理员可清理并用新 Operation 重试；结果未知则保留 decommissioning，不擅自恢复。
+
+确认可以停用后，forkfs 持久化当前绑定 generation 的停用 tombstone，使所有旧操作/激活/刷新授权失效，再退出后台调度并释放该 Store 的受管所有权及访问限制。恢复权限与崩溃处理沿用登记中止的受控恢复规则，不能在已有进程尚可写入时释放保护。RPC 返回签名停用证明，World 通过原 Operation 结果验证后幂等标记 decommissioned，并释放受限 Store 数量等剩余额度；物理空间额度仅依据实际回收事实结算。
+
+停用证明与 Operation 状态在 forkfs 服务级日志中保留，释放 Store 锁后仍可通过限定的 `GetOperation` 查询/重复 `DecommissionStore` 取得；这些恢复请求仅能读取原停用结果，不能执行新文件操作。断线和服务重启不会丢失旧 generation 的拒绝记录，World 未收到证明前仍将其视为 Network 活动依赖。重新接入该空 Store 必须新建 Enrollment 和更高 generation，不能复活旧绑定；所有受管 RPC 与授权需携带并匹配绑定 generation。
+
+验收覆盖非空拒绝、空 Store 停用后删除 Network、停用与队列任务竞争、停用落盘后断线、重复请求、重启恢复、旧令牌重放及重新登记；必须证明无孤立受管锁、无旧写入者继续执行、无提前释放额度。
+
 ### 资源归属与身份
 
 | 控制面对象 | 底层映射 |
 | --- | --- |
 | Node | forkfs 服务所在主机、RPC 端点、服务身份、能力与健康状态 |
-| StoreBinding | 组织、Network、Node、存储卷、forkfs `store_id` 和受管路径 |
+| StoreBinding | 组织、Network、Node、存储卷、forkfs `store_id`、绑定 generation 和受管路径 |
 | `forkfs.snapshot` Resource | Store 内的 Snapshot `S<n>`、来源、状态 |
 | `forkfs.workspace` Resource | Store 内的 World `W<n>`、基线、父 Workspace、路径、设备号与 inode |
 | Execution | Workspace、Network、命令参数、运行身份、策略版本、执行状态与退出码 |
@@ -466,6 +483,7 @@ CLI 提供 `world node list --network dev`、`world store list --network dev`、
 | `StartExecution` / `GetExecution` / `ReadExecutionOutput` / `CancelExecution` | 在指定 Workspace 执行、查询、按偏移读取输出、请求终止 |
 | `GetOperation` / `CancelOperation` | 查询持久化操作、对可取消操作请求取消 |
 | `RefreshOperationAuthorization` | 为原 Operation 更新执行授权；不创建任务、不修改原请求和配额预留 |
+| `DecommissionStore` | 队列内停用空 Store，持久化绑定 generation tombstone 并返回可恢复的停用证明 |
 
 首版 `InitSnapshot` 只接受同机调用方经认证本地 Unix socket 提交的目录引用，包括组织管理下的本机节点；远程 RPC 连接不开放此方法。CLI 与 MCP 的本地服务进程须验证目标节点身份确属本机，相对路径只相对于调用方显式工作目录解析，然后由 forkfs 再验证允许导入的根目录与路径。不能把客户端路径字符串发送到任意节点并在节点上重新解释，也不能仅凭 `localhost` 名称断定同机。
 
