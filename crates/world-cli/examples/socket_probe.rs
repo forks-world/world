@@ -87,6 +87,15 @@ fn run() -> std::io::Result<()> {
                 .status()?;
             std::process::exit(status.code().unwrap_or(99));
         }
+        "launch-envpath" | "exec-envpath" => {
+            let mut cmd = std::process::Command::new(&args[3]);
+            cmd.env("PATH", &args[2]).args(&args[4..]);
+            if args[1] == "exec-envpath" {
+                use std::os::unix::process::CommandExt;
+                return Err(cmd.exec());
+            }
+            std::process::exit(cmd.status()?.code().unwrap_or(99));
+        }
         "launch" => {
             let status = std::process::Command::new(&args[2])
                 .args(&args[3..])

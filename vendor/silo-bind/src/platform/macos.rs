@@ -191,9 +191,13 @@ unsafe fn spawn_common(
         let p = unsafe { CStr::from_ptr(path) }.to_string_lossy();
         eprintln!("[silo-bind] {} called: {}", label, p);
     }
-    if let Some((resolved, _owned, new_argv)) =
-        unsafe { resolve_sip_exec(path, argv as *const *const libc::c_char) }
-    {
+    if let Some((resolved, _owned, new_argv)) = unsafe {
+        resolve_sip_exec(
+            path,
+            argv as *const *const libc::c_char,
+            envp as *const *const libc::c_char,
+        )
+    } {
         if debug_enabled() {
             let orig = unsafe { CStr::from_ptr(path) }.to_string_lossy();
             eprintln!(
@@ -287,7 +291,7 @@ unsafe extern "C" fn silo_execve_entry(
         let p = unsafe { CStr::from_ptr(path) }.to_string_lossy();
         eprintln!("[silo-bind] execve called: {}", p);
     }
-    if let Some((resolved, _owned, new_argv)) = unsafe { resolve_sip_exec(path, argv) } {
+    if let Some((resolved, _owned, new_argv)) = unsafe { resolve_sip_exec(path, argv, envp) } {
         if debug_enabled() {
             let orig = unsafe { CStr::from_ptr(path) }.to_string_lossy();
             eprintln!(

@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::env;
 use std::ffi::{CStr, CString};
 
@@ -8,10 +9,14 @@ pub fn is_sip_path(path: &str) -> bool {
         || path.starts_with("/usr/sbin/")
 }
 
+#[cfg(test)]
 pub fn find_non_sip_in_path(name: &str) -> Option<CString> {
+    find_non_sip_in(name, &env::var("PATH").ok()?)
+}
+
+fn find_non_sip_in(name: &str, path_var: &str) -> Option<CString> {
     // An interpreter name is part of the script's semantics, not an alias.
     let names = [name];
-    let path_var = env::var("PATH").ok()?;
     for try_name in names {
         for dir in path_var.split(':') {
             if dir.is_empty() {
@@ -31,6 +36,7 @@ pub fn find_non_sip_in_path(name: &str) -> Option<CString> {
             let candidate = format!("{}/{}", dir, try_name);
             if let Ok(c) = CString::new(candidate)
                 && unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0
+                && unsafe { crate::world::native_target(c.as_ptr()) }
             {
                 return Some(c);
             }
@@ -98,19 +104,42 @@ fn env_interpreter_args(arg: &str) -> Option<Vec<String>> {
     Some(words)
 }
 
+unsafe fn child_path(envp: *const *const libc::c_char) -> Option<String> {
+    if envp.is_null() {
+        return None;
+    }
+    for i in 0..65536 {
+        let entry = unsafe { *envp.add(i) };
+        if entry.is_null() {
+            break;
+        }
+        if let Some(path) = unsafe { CStr::from_ptr(entry) }
+            .to_bytes()
+            .strip_prefix(b"PATH=")
+        {
+            return Some(std::str::from_utf8(path).ok()?.to_owned());
+        }
+    }
+    // The default system PATH contains no injectable interpreters.
+    None
+}
+
 pub unsafe fn resolve_sip_exec(
     path: *const libc::c_char,
     argv: *const *const libc::c_char,
+    envp: *const *const libc::c_char,
 ) -> Option<(CString, Vec<CString>, Vec<*const libc::c_char>)> {
     if path.is_null() {
         return None;
     }
 
     let path_str = unsafe { CStr::from_ptr(path) }.to_str().ok()?;
+    // /usr/bin/env sees the environment of the child, not its caller.
+    let path_var = unsafe { child_path(envp) }?;
 
     if is_sip_path(path_str) {
         let basename = path_str.rsplit('/').next()?;
-        let resolved = find_non_sip_in_path(basename)?;
+        let resolved = find_non_sip_in(basename, &path_var)?;
         return Some((resolved, Vec::new(), Vec::new()));
     }
 
@@ -122,10 +151,10 @@ pub unsafe fn resolve_sip_exec(
     let is_env = interpreter.ends_with("/env");
     let (resolved, interpreter_args) = if is_env {
         let words = env_interpreter_args(arg.as_deref()?)?;
-        (find_non_sip_in_path(&words[0])?, words[1..].to_vec())
+        (find_non_sip_in(&words[0], &path_var)?, words[1..].to_vec())
     } else {
         (
-            find_non_sip_in_path(interpreter.rsplit('/').next()?)?,
+            find_non_sip_in(interpreter.rsplit('/').next()?, &path_var)?,
             arg.into_iter().collect(),
         )
     };
@@ -413,7 +442,8 @@ mod tests {
 
     #[test]
     fn resolve_sip_exec_null_path_returns_none() {
-        let result = unsafe { resolve_sip_exec(std::ptr::null(), std::ptr::null()) };
+        let result =
+            unsafe { resolve_sip_exec(std::ptr::null(), std::ptr::null(), std::ptr::null()) };
         assert!(result.is_none());
     }
 
@@ -423,7 +453,8 @@ mod tests {
         let bin = dir.path().join("mybinary");
         std::fs::write(&bin, [0x7f, 0x45, 0x4c, 0x46]).unwrap();
         let cpath = CString::new(bin.to_str().unwrap()).unwrap();
-        let result = unsafe { resolve_sip_exec(cpath.as_ptr(), std::ptr::null()) };
+        let result =
+            unsafe { resolve_sip_exec(cpath.as_ptr(), std::ptr::null(), std::ptr::null()) };
         assert!(result.is_none());
     }
 
@@ -433,7 +464,8 @@ mod tests {
         let script = dir.path().join("safe.sh");
         std::fs::write(&script, "#!/opt/homebrew/bin/bash\necho hello\n").unwrap();
         let cpath = CString::new(script.to_str().unwrap()).unwrap();
-        let result = unsafe { resolve_sip_exec(cpath.as_ptr(), std::ptr::null()) };
+        let result =
+            unsafe { resolve_sip_exec(cpath.as_ptr(), std::ptr::null(), std::ptr::null()) };
         assert!(result.is_none());
     }
 

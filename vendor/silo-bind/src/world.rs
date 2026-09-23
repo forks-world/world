@@ -127,6 +127,9 @@ pub unsafe fn spawn_allowed(path: *const libc::c_char, envp: *const *const libc:
             };
             p
         };
+        if !executable_file(&path) {
+            return false;
+        }
         let Ok(path) = path.canonicalize() else {
             return false;
         };

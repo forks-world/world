@@ -211,6 +211,37 @@ class CLI(unittest.TestCase):
         script.write_text('#!/usr/bin/env -S python3 "quoted argument"\n')
         self.assertEqual(run(PROBE, "launch", script, env=env).returncode, 77)
 
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_child_shebang_path_and_permissions(self):
+        ack = self.dir / "ack"
+        ack.touch()
+        parent, child = self.dir / "parent", self.dir / "child"
+        parent.mkdir()
+        child.mkdir()
+        for directory in [parent, child]:
+            (directory / "python3").symlink_to(PROBE)
+        script = self.dir / "script"
+        script.write_text("#!/usr/bin/env python3\n")
+        script.chmod(0o755)
+        env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), PATH=str(parent))
+        bad_dir, bad_link = self.dir / "bad-dir", self.dir / "bad-link"
+        bad_dir.mkdir()
+        bad_link.mkdir()
+        (bad_dir / "python3").mkdir()
+        (bad_link / "python3").symlink_to("/bin/sh")
+        child_path = f"{bad_dir}:{bad_link}:{child}"
+        for mode in ["launch-envpath", "exec-envpath"]:
+            result = run(PROBE, mode, child_path, script, "arg", env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), [str(child / "python3"), str(script), "arg"])
+            result = run(PROBE, mode, str(bad_dir), script, env=env)
+            self.assertEqual(result.returncode, 77, result.stderr)
+            script.chmod(0o644)
+            result = run(PROBE, mode, child_path, script, env=env)
+            self.assertEqual(result.returncode, 77, result.stderr)
+            script.chmod(0o755)
+
     @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
     def test_slow_output_consumer_does_not_lose_tail(self):
         for destination in ["stdout", "stderr"]:
