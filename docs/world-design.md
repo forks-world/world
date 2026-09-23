@@ -294,7 +294,7 @@ Skill 的流程约定：
 | `world_enrollment_create` / `world_enrollment_get` / `world_enrollment_complete` / `world_enrollment_abort` | 发起、查询、完成或中止未激活登记；不代替节点本机的管理员确认 |
 | `world_node_list` / `world_store_list` / `world_store_get` | 指定组织与 Network，发现节点和 StoreBinding；列表分页，Store 可按节点与状态筛选 |
 | `world_store_decommission` / `world_enrollment_renew` | 停用空 Store 或续发登记授权；Network admin/组织 owner 权限，幂等请求 |
-| `world_fs_export` / `world_export_get` / `world_export_close` | 创建、查询和关闭只读内容导出；只返回非秘密引用，实际下载使用受认证客户端 |
+| `world_fs_export` / `world_export_get` / `world_export_close` / `world_export_renew` | 创建、查询和关闭只读内容导出；只返回非秘密引用，实际下载使用受认证客户端 |
 
 上下文查询和组织列表不要求组织 ID；组织级工具要求 `organization_id`；所有已有 Network 的操作要求显式 `organization_id` 和 `network_id`。MCP 不提供修改全局默认 Network 的工具，避免多个 Agent 并发时相互影响。来自启动配置的建议上下文必须解析成每次调用的显式参数。
 
@@ -557,7 +557,7 @@ CLI 提供 `world node list --network dev`、`world store list --network dev`、
 | `RefreshOperationAuthorization` | 为原 Operation 更新执行授权；不创建任务、不修改原请求和配额预留 |
 | `DecommissionStore` | 队列内停用空 Store，持久化绑定 generation tombstone 并返回可恢复的停用证明 |
 | `ApplyAuthorizationRevocation` | 仅 World 授权服务可签发，按事件 ID 幂等推进范围内授权版本、取消未开始任务并终止失权 Execution；已开始存储变更按安全收尾规则处理 |
-| `OpenExport` / `GetExport` / `CloseExport` | 打开、查询和关闭绑定资源身份的只读流式导出，生命周期与数据读保护由 forkfs 管理 |
+| `OpenExport` / `GetExport` / `CloseExport` / `RenewExportLease` | 打开、查询和关闭绑定资源身份的只读流式导出，生命周期与数据读保护由 forkfs 管理 |
 
 首版 `InitSnapshot` 只接受同机调用方经认证本地 Unix socket 提交的目录引用，包括组织管理下的本机节点；远程 RPC 连接不开放此方法。CLI 与 MCP 的本地服务进程须验证目标节点身份确属本机，相对路径只相对于调用方显式工作目录解析，然后由 forkfs 再验证允许导入的根目录与路径。不能把客户端路径字符串发送到任意节点并在节点上重新解释，也不能仅凭 `localhost` 名称断定同机。
 
@@ -658,11 +658,15 @@ forkfs 在经过认证的节点数据端点 `GET /exports/{export_id}/content` �
 
 数据端点只接受限定 Export ID、源身份、节点、只读方法与有效期的传输授权，并逐次验证当前权限；CLI 在受保护凭证通道取得该授权，MCP 的 structuredContent/文本仅返回 Export ID 和非秘密下载入口。受认证用户可通过 CLI 或 World 下载页面调用 `POST /v1/orgs/{org}/networks/{network}/exports/{export}/download-authorization` 兑换仅供该会话的短期授权（不注册为 MCP 工具，受信客户端消费后不写入 stdout/日志），API 会话令牌不直接转发给任意节点地址。导出授权不能用于 forkfs 管理方法，且不向模型暴露 bearer URL。数据读取是内容传输通道，不扩大本地 init 的管理 RPC 例外。
 
-Export 保存独立的有限传输期限，断线超过空闲期限、取消、权限撤销或到期时节点关闭数据流并释放读保护，不依赖 World 在线才能清理。增长权益到期不撤销仍有读取权限的导出；权限撤销则按授权版本和短期传输授权上限生效。导出服务端状态区分等待、传输中、发送完成（transfer_completed）、失败和关闭；发送完成仅证明节点已生成并发送完整归档及校验信息，不能证明客户端收到、落盘或验证成功。forkfs 在自身读取/发送结束后即可释放读保护，不等待客户端验证。CloseExport 幂等，节点故障时报告源暂不可达而非要求续费。
+Export 使用可续期的有限传输租约，而非不可延长的总导出时限；持续有进度且仍有读取权限时不设置固定的累计传输时长上限。断线超过空闲期限、取消、权限撤销或租约到期未续期时，节点关闭数据流并释放读保护，不依赖 World 在线才能清理。增长权益到期不撤销仍有读取权限的导出；权限撤销则按授权版本和短期传输授权上限生效。导出服务端状态区分等待、传输中、发送完成（transfer_completed）、失败和关闭；发送完成仅证明节点已生成并发送完整归档及校验信息，不能证明客户端收到、落盘或验证成功。forkfs 在自身读取/发送结束后即可释放读保护，不等待客户端验证。CloseExport 幂等，节点故障时报告源暂不可达而非要求续费。
+
+客户端或负责该导出的 World Worker 在租约到期前调用 `POST /v1/orgs/{org}/networks/{network}/exports/{export}/renew`（MCP `world_export_renew`），World 重查读取权限并向节点 GetExport 查询实际发送字节/进度序号，再调用 `RenewExportLease` RPC 为同一 Export 下发绑定身份、generation、递增序号及新截止时间的租约。续期响应只返回到期时间和状态，不暴露凭证、不重新生成归档、不重新取得读锁，也不消耗付费增长额度；受认证 CLI 自动续期，大归档不要求用户重复启动导出。
+
+节点接受更高序号的有效续期后更新本地单调截止时间，流式响应继续发送；过期或已关闭会话不能复活，重复续期不累计延长。续期要求自上次确认有节点观测的有效进度，短暂无进度按可配置的空闲窗口处理，不将一个固定最小吞吐量作为付费或导出准入条件。权限被撤销时不再续签，旧租约到期即本地中止；World 不可达时最多维持当前租约。进度和租约检查在持续 HTTP 响应期间同样执行，不能只在建连时校验授权。首版仍不支持断点续传，但健康且持续推进的慢连接可以跨多个租约周期完成任意受支持大小的归档。
 
 客户端独立记录 downloaded/verified 或本地写入、校验失败；CLI 必须在完整接收、成功关闭本地文件并通过校验后才返回数据取回成功，否则返回非零并保留明确标识的不完整产物。MCP 查询到 transfer_completed 时只能报告“服务端发送完成，客户端验证未知”，不能报告用户已取回数据。首版不将客户端结果同步为服务端 Export 终态，也不提供或隐含客户端确认接口；同一 Export 的服务端成功与客户端失败可以同时成立。
 
-验收覆盖过期且配额为零时导出完整 Snapshot/Workspace、无需启动 Execution、跨 Network 拒绝、运行中写入与导出互斥、慢客户端期限、断线及权限撤销后的读保护释放、源包含越界符号链接、归档截断检测、服务端发送完成但客户端落盘/校验失败，以及模型输出中无传输凭证。
+验收覆盖过期且配额为零时导出完整 Snapshot/Workspace、无需启动 Execution、跨 Network 拒绝、运行中写入与导出互斥、大归档跨多个租约周期且慢速持续传输成功、无进度无法无限续期、乱序续期、断线及权限撤销后的读保护释放、源包含越界符号链接、归档截断检测、服务端发送完成但客户端落盘/校验失败，以及模型输出中无传输凭证。
 
 ### 文件系统动作接口
 
