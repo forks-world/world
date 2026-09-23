@@ -650,13 +650,19 @@ forkfs 服务持久化 `(调用主体, Store, operation_id)` 与请求摘要。�
 
 ### 内容读取与欠费后导出
 
-Export 是元信息会话，不是 Snapshot 克隆或 Execution。具备资源读取权限的主体可通过上述 exports API、`world_fs_export` 或 `world fs export <resource> --output <local-file>` 导出 Snapshot 或 Workspace 的完整文件树；即使订阅到期、增长额度用尽，仍允许该操作。CLI 取得数据流后写入用户指定本地目标，默认拒绝覆盖已有文件。World 只保存会话身份、权限和状态，不中转或存储归档内容。
+Export 是元信息会话，不是 Snapshot 克隆或 Execution。具备资源读取权限的主体可通过上述 exports API、`world_fs_export` 或 `world fs export <resource> --output <local-file>` 导出 Snapshot 或 Workspace 的完整文件树；即使订阅到期、增长额度用尽，仍允许该操作。CLI 取得数据流后写入用户指定本地目标，默认拒绝覆盖已有文件。World 控制面只保存会话身份、权限和状态；独立的导出数据网关可流式转发归档，但不持久化或缓存文件内容。
 
 World 创建 Export 时检查身份、归属和读权限，调用 forkfs OpenExport；节点在与 diff 相同的并发仲裁下取得源的读保护，活跃写进程存在时返回资源忙碌，不能静默导出变化中的树。Snapshot 通过 forkfs 的受控访问门读取，不解除原保护。读保护覆盖整个传输，期间 discard/GC/启动写执行等冲突操作等待或拒绝。导出不创建新的 Snapshot，也不占用并发执行数量或存储增长额度；节点可用独立、固定的传输并发上限和公平队列保护容量，但不能以欠费或无付费额度拒绝排队。
 
-forkfs 在经过认证的节点数据端点 `GET /exports/{export_id}/content` 流式生成版本化归档（首版 tar 加清单摘要），使用有界缓冲，不要求节点先存放完整归档。特殊文件、外部符号链接和超出安全范围的路径按明确格式规则拒绝或记录，不跟随链接读出源树之外内容。末尾完整性信息、文件数与校验结果供客户端下载后验证；连接中断时目标保留为不完整文件，不能报告成功。首版不承诺断点续传，重新导出须重新取得读保护。
+forkfs 在经过认证的节点数据端点 `GET /exports/{export_id}/content`（同机部署也可通过 Unix socket 承载）流式生成版本化归档（首版 tar 加清单摘要），使用有界缓冲，不要求节点先存放完整归档。特殊文件、外部符号链接和超出安全范围的路径按明确格式规则拒绝或记录，不跟随链接读出源树之外内容。末尾完整性信息、文件数与校验结果供客户端下载后验证；连接中断时目标保留为不完整文件，不能报告成功。首版不承诺断点续传，重新导出须重新取得读保护。
 
-数据端点建连时只接受限定 Export ID、源身份、节点、只读方法与有效期的一次性建连授权，并验证当前权限；CLI 在受保护凭证通道取得该授权，MCP 的 structuredContent/文本仅返回 Export ID 和非秘密下载入口。受认证用户可通过 CLI 或 World 下载页面调用 `POST /v1/orgs/{org}/networks/{network}/exports/{export}/download-authorization` 兑换仅供该会话的短期授权（不注册为 MCP 工具，受信客户端消费后不写入 stdout/日志），API 会话令牌不直接转发给任意节点地址。导出授权不能用于 forkfs 管理方法，且不向模型暴露 bearer URL。数据读取是内容传输通道，不扩大本地 init 的管理 RPC 例外。
+World 部署必须提供与公开 API 同源、客户端可达的导出数据网关，入口为 `GET /v1/orgs/{org}/networks/{network}/exports/{export}/content`；默认 CLI/浏览器连接该入口，不要求能直接访问私网节点。网关与控制面分进程部署，使用经过验证的绑定路由连接 forkfs：私网节点走双向认证连接，Unix socket 节点由同机网关或受认证的节点数据转发器接入。转发器的连接绑定节点身份，不把任意宿主 socket 暴露给客户端。节点登记时必须验证这条导出路由可用后才发布 active StoreBinding，不能只有管理 RPC 可达。
+
+网关逐次校验读取主体与 Export，将受限的节点侧建连授权通过服务通道传递；客户端的 World 会话令牌不发给节点。TLS 身份、目标端点和 Export/stream_id 映射都来自已验证的服务配置，不能按客户端提供 URL 转发。网关和转发器使用有界缓冲与背压，不落盘、不记录文件内容，连接中断时关闭下游；当前租约及空闲期限仍由 forkfs 执行，网关不能绕过撤权、续期检查或读保护。节点可直接访问时可选择原有直连路径，但网关是支持私网和仅 socket 部署的必需恢复通道，不能按付费套餐关闭。
+
+MCP 只返回同源非秘密下载入口，浏览器凭自己的认证会话下载，CLI 自动选择网关；模型既不接触节点侧凭证，也不需要任意网络访问权限。验收包括客户端只能访问 World、节点仅私网可达、节点仅 Unix socket、网关断线、撤权和欠费情况下的完整取回；网关无法连通源时明确返回暂不可达，不跳过鉴权或偷偷复制内容到控制面存储。
+
+数据端点建连时只接受限定 Export ID、源身份、节点、只读方法与有效期的一次性建连授权，并验证当前权限；CLI 在受保护凭证通道取得该授权，MCP 的 structuredContent/文本仅返回 Export ID 和非秘密下载入口。受认证用户可通过 CLI 或 World 下载页面调用 `POST /v1/orgs/{org}/networks/{network}/exports/{export}/download-authorization` 兑换仅供该会话的短期授权（不注册为 MCP 工具，受信客户端消费后不写入 stdout/日志），API 会话令牌不直接转发给任意节点地址。导出授权不能用于 forkfs 管理方法，且不向模型暴露 bearer URL。上述短期建连授权适用于节点直连或网关到节点这一段；客户端到网关采用自身会话认证。数据读取是内容传输通道，不扩大本地 init 的管理 RPC 例外。
 
 节点消费短期下载凭证后，原子创建 stream_id 并绑定 Export、读取主体、源身份和当前授权版本；同一 Export 首版只允许一个活跃流，凭证重放不能建立第二条流。建连成功必须已有有效 Export 运行租约，之后持续授权完全由该租约及撤销状态决定，原建连凭证自然过期不会中断现有流。RenewExportLease 同时绑定 stream_id 和原读取主体，只能续期这一条流，不能把授权转给另一个调用者。World Worker 代为续期也须检查该原读取主体的当前权限，而非只检查 Worker 自身权限。
 
