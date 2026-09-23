@@ -4,6 +4,8 @@
 
 ## World 网络栈验收要求
 
+任务已确认必须运行 macOS 原生程序。宿主原生机制的实测结果与当前限制见 [原生网络可行性核对](macos-native-network-feasibility.md)。以下独立 `localhost` 是此前采用的目标解释；若采用不同显式 IP，必须先确认接口语义调整，不能静默替换。
+
 World/Workspace 是独立端口空间的边界。W1 和 W2 必须能够同时监听相同的地址、协议和端口，例如各自的 `127.0.0.1:8080`；应用无需改地址、改端口或增加代理配置。同一个 World 的不同进程和不同 `exec` 共享该网络栈，客户端访问 `localhost:8080` 只能连接本 World 的服务。
 
 运行时身份须使用全局 Workspace Resource ID 和运行代际，不能只用 Store 内的 `W1` 简写或每次 Execution ID。Network 仍是授权与出站策略边界，不因两个 Workspace 属于同一个 Network 就合并它们的端口空间。
