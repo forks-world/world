@@ -149,6 +149,10 @@ Network admin 可为本组织有效成员授予或撤销该 Network 的 operator
 
 套餐价格、币种、计费指标、宽限期和数据保留时间作为发布前的产品配置确定，本设计不预设商业数值。
 
+Billing 发布版本化套餐目录，`GET /v1/orgs/{org}/billing/plans` 返回该组织可选套餐及分页游标。每项包含稳定 plan_id、plan_version、显示名称、价格的最小货币单位整数、币种、计费周期、功能与各指标额度、可购买状态及生效时间；未确定价格的方案不标为可直接购买。owner / billing-admin 可查询并购买，普通 Network 权限不授予账单管理权。CLI `world billing plans` 和 MCP `world_billing_plans` 共用该目录，不查询支付服务私有价格表或内置价格。
+
+checkout 请求提交目录的 plan_id、plan_version 和幂等键，服务端重新验证当前可用性并映射支付服务价格引用，客户端不能自报收费金额。套餐下架或价格版本变化返回明确冲突，CLI/Agent 刷新目录后展示新条件，不静默替换为新价格；实际支付仍在托管页面由有权用户确认。验收覆盖目录分页、币种/周期展示、目录与 checkout 的版本竞争及客户端篡改价格拒绝。
+
 正增量按指标分别计算，不能用存储缩减抵扣执行数量增长，也不能以尚未完成的缩容抵扣并行扩容。混合操作先保留已有计量占用，再预留执行期间需要的额外额度；若替换资源需要新旧并存，预留覆盖峰值，不能只按最终净增量计算。减少用量只在对应释放事实确认后入账，discard 不自动等于物理空间释放。
 
 同一资源尚有未完成增长操作时，首版拒绝另一个增长变更，避免从同一旧版本重复计算差额；不同资源、不同 Store 和节点的增长由 World 的组织/Network 配额事务统一仲裁。释放请求仍可受理，但由工作流先协调冲突任务和执行端状态，再确认减少量。额度下降不抹去已有预留；后续增长按新额度拒绝，原操作继续结算。
@@ -234,6 +238,7 @@ world operation inspect op_123
 | `GET /v1/orgs/{org}/networks/{network}/executions/{execution}/output` | 按游标和大小上限读取 stdout/stderr |
 | `POST /v1/orgs/{org}/networks/{network}/executions/{execution}/cancel` | 幂等请求终止执行；返回取消受理状态，最终状态仍通过 Execution 查询 |
 | `GET /v1/orgs/{org}/billing` | 查询订阅与权益 |
+| `GET /v1/orgs/{org}/billing/plans` | 查询该组织可选的版本化套餐、价格、币种、周期和权益 |
 | `GET /v1/orgs/{org}/billing/usage` | 按周期及 Network 查询用量 |
 | `POST /v1/orgs/{org}/billing/checkout` | 创建套餐购买会话 |
 | `POST /v1/orgs/{org}/billing/portal` | 创建付费管理会话 |
@@ -275,6 +280,7 @@ Skill 的流程约定：
 | `world_resource_list` / `world_resource_get` | 指定组织、Network、筛选条件或资源 ID |
 | `world_resource_create` / `world_resource_update` / `world_resource_delete` | 指定归属、结构化配置或资源 ID、幂等键；update/delete 另带期望版本 |
 | `world_billing_get` / `world_billing_usage` | 查询组织权益、订阅或归属到 Network 的用量 |
+| `world_billing_plans` | 指定组织，分页读取可选套餐目录；checkout 使用返回的 plan_id 与 plan_version |
 | `world_billing_checkout` / `world_billing_portal` | 为有付费权限的主体生成托管页面链接，不直接完成支付 |
 | `world_operation_get` | 指定组织、Network 和 Operation ID，查询执行结果 |
 | `world_operation_cancel` | 指定组织、Network、Operation ID 和幂等键，请求取消支持取消的任务 |
