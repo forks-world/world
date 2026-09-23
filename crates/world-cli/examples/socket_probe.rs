@@ -130,6 +130,12 @@ fn run() -> std::io::Result<()> {
                 } else {
                     None
                 };
+                #[cfg(target_os = "macos")]
+                let fileport = if has_actions {
+                    Some(SpawnFileport::new()?)
+                } else {
+                    None
+                };
                 if has_actions {
                     let result = libc::posix_spawn_file_actions_init(actions.as_mut_ptr());
                     if result != 0 {
@@ -151,6 +157,17 @@ fn run() -> std::io::Result<()> {
                 // Force handle growth, then move the opaque object to another
                 // stack location before spawning, as native callers can do.
                 if has_actions {
+                    #[cfg(target_os = "macos")]
+                    for _ in 0..128 {
+                        let result = posix_spawn_file_actions_add_fileportdup2_np(
+                            actions.as_mut_ptr(),
+                            fileport.as_ref().unwrap().0,
+                            100,
+                        );
+                        if result != 0 {
+                            return Err(std::io::Error::from_raw_os_error(result));
+                        }
+                    }
                     for _ in 0..64 {
                         let result =
                             libc::posix_spawn_file_actions_adddup2(actions.as_mut_ptr(), 2, 2);
@@ -176,6 +193,8 @@ fn run() -> std::io::Result<()> {
                 if let Some(actions) = moved.as_mut() {
                     libc::posix_spawn_file_actions_destroy(actions);
                 }
+                #[cfg(target_os = "macos")]
+                drop(fileport);
                 if result != 0 {
                     return Err(std::io::Error::from_raw_os_error(result));
                 }
@@ -261,6 +280,38 @@ fn run() -> std::io::Result<()> {
         _ => panic!("unknown probe"),
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn fileport_makeport(fd: libc::c_int, port: *mut libc::mach_port_t) -> libc::c_int;
+    fn mach_port_deallocate(task: libc::mach_port_t, port: libc::mach_port_t) -> libc::c_int;
+    static mach_task_self_: libc::mach_port_t;
+    fn posix_spawn_file_actions_add_fileportdup2_np(
+        actions: *mut libc::posix_spawn_file_actions_t,
+        port: libc::mach_port_t,
+        newfd: libc::c_int,
+    ) -> libc::c_int;
+}
+#[cfg(target_os = "macos")]
+struct SpawnFileport(libc::mach_port_t);
+#[cfg(target_os = "macos")]
+impl SpawnFileport {
+    fn new() -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open("/dev/null")?;
+        let mut port = 0;
+        if unsafe { fileport_makeport(file.as_raw_fd(), &mut port) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(port))
+    }
+}
+#[cfg(target_os = "macos")]
+impl Drop for SpawnFileport {
+    fn drop(&mut self) {
+        unsafe { mach_port_deallocate(mach_task_self_, self.0) };
+    }
 }
 
 #[cfg(target_os = "macos")]

@@ -177,6 +177,8 @@ other_action!(CLOSE, close, real_close, "posix_spawn_file_actions_addclose", fd:
 other_action!(DUP2, dup2, real_dup2, "posix_spawn_file_actions_adddup2", fd: c_int, newfd: c_int);
 other_action!(OPEN, open, real_open, "posix_spawn_file_actions_addopen", fd: c_int, path: *const c_char, flags: c_int, mode: mode_t);
 other_action!(INHERIT, inherit, real_inherit, "posix_spawn_file_actions_addinherit_np", fd: c_int);
+// This exported Darwin extension also grows the same action buffer.
+other_action!(FILEPORT_DUP2, fileport_dup2, real_fileport_dup2, "posix_spawn_file_actions_add_fileportdup2_np", port: libc::mach_port_t, newfd: c_int);
 
 #[cfg(test)]
 mod tests {
