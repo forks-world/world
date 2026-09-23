@@ -25,7 +25,7 @@ forkfs 是 World 首批直接管理的资源：World 通过 forkfs RPC 服务管
 
 forkfs RPC 服务是待实现的接入契约，World 不链接 forkfs 库，也不通过解析 CLI 输出控制它。
 
-已实现 macOS 本地网络隔离执行入口：默认断网，通过每次执行独立的 HTTP/CONNECT 代理按目标白名单放行；包含真实 Seatbelt 内核集成测试。使用方式与边界见 [macOS 网络隔离](docs/macos-network-isolation.md)。
+已实现 macOS 本地出站访问限制入口：默认断网，通过每次执行独立的 HTTP/CONNECT 代理按目标白名单放行；包含真实 Seatbelt 内核集成测试。该入口禁止监听端口，尚不满足“不同 World 同端口独立监听、同 World 内自由连接”的独立网络栈要求。使用方式与边界见 [macOS 网络隔离](docs/macos-network-isolation.md)。
 
 ```sh
 go build -o bin/world ./cmd/world

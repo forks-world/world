@@ -1,6 +1,22 @@
 # macOS 本地网络隔离
 
-`world network exec` 已实现 macOS 进程网络隔离。代码使用 Go 标准库与系统 `/usr/bin/sandbox-exec`；不修改系统 PF 规则、不需要 root、不调用 forkfs C ABI。策略由可信调用方提供，不接受任务自行扩权。它是本地运行时入口，尚未接入 World 的组织授权或 forkfs RPC。
+`world network exec` 已实现 macOS 进程出站访问限制，尚未实现每个 World 独立的网络栈。代码使用 Go 标准库与系统 `/usr/bin/sandbox-exec`；不修改系统 PF 规则、不需要 root、不调用 forkfs C ABI。策略由可信调用方提供，不接受任务自行扩权。它是本地运行时入口，尚未接入 World 的组织授权或 forkfs RPC。
+
+## World 网络栈验收要求
+
+World/Workspace 是独立端口空间的边界。W1 和 W2 必须能够同时监听相同的地址、协议和端口，例如各自的 `127.0.0.1:8080`；应用无需改地址、改端口或增加代理配置。同一个 World 的不同进程和不同 `exec` 共享该网络栈，客户端访问 `localhost:8080` 只能连接本 World 的服务。
+
+运行时身份须使用全局 Workspace Resource ID 和运行代际，不能只用 Store 内的 `W1` 简写或每次 Execution ID。Network 仍是授权与出站策略边界，不因两个 Workspace 属于同一个 Network 就合并它们的端口空间。
+
+必须验证：
+
+- W1 与 W2 同时监听相同 TCP 端口，分别返回不同标记；另一次 `exec` 在各自 World 内只能读到自己的标记。
+- IPv4、IPv6、UDP 和通配地址监听均保持独立；子进程加入所属 World 的网络栈。
+- 停止 W1 后，W2 的同端口服务继续工作；重建 W1 不串入旧运行代际的服务。
+- 宿主或另一 World 不会因端口号相同而访问到该服务；对外发布端口必须显式配置并单独处理宿主端口冲突。
+- 并发创建、进入与停止同一个 World 时，不得产生两个网络栈、连接到错误 World 或在停止后接受新任务。
+
+当前 Seatbelt/代理测试验证的是出站访问限制和禁止监听，不能作为以上验收的通过证据。独立网络栈后端完成这些测试前，不能宣称该功能已经实现。
 
 ## 使用
 

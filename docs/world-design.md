@@ -90,6 +90,8 @@ flowchart LR
 
 隔离必须由服务端和运行环境共同执行，CLI 的当前上下文仅用于选择操作目标。
 
+每个 World/Workspace 必须拥有独立网络栈：不同 World 能同时监听相同的地址、协议和端口，同一 World 的多个进程与多次 Execution 共享栈内的 `localhost` 和监听服务。应用不得为此修改端口或配置代理。运行时绑定使用全局 Workspace 身份与运行代际，不能使用 Store 局部简写或每次 Execution 身份；同属一个 Network 不代表共用端口空间。对外发布端口是显式授权动作，宿主端口冲突单独处理。完整验收要求见 [World 网络栈验收](macos-network-isolation.md#world-网络栈验收要求)。
+
 ### 请求与权限
 
 所有 Network 级接口使用显式路径：`/v1/orgs/{org_id}/networks/{network_id}/...`。服务端先认证主体，再校验组织归属与 Network 权限；请求体中的归属字段不能覆盖路径。查询、列表、批量操作和后台任务均使用同一套授权规则。
@@ -745,7 +747,7 @@ Linux 当前沙箱保留宿主网络，宿主可读文件也不是保密边界�
 
 因此 World 受管执行必须禁止静默降级，并额外部署 Network 流量策略及跨 Network 文件访问限制。只传 `--require-sandbox` 不足以完成这些保证。节点未提供所需隔离能力时拒绝受管执行，Network 不标为可执行状态。授权撤销也需要终止或隔离已有执行进程，不能仅删除控制面授权记录。
 
-macOS 本地网络运行时已有首版实现与内核集成测试：`world network exec` 使用默认拒绝的 Seatbelt 网络策略、每次执行独立且带凭证的 HTTP/CONNECT 代理、不可变目标白名单和有限执行期限。此入口是供运行环境接入的本地原语，尚未接入组织授权、forkfs RPC、远程租约和跨 Network 文件保密边界，不能据此将节点标为完整受管执行就绪。具体能力、限制和验证方法见 [macOS 网络隔离](macos-network-isolation.md)。
+macOS 本地出站访问限制已有首版实现与内核集成测试：`world network exec` 使用默认拒绝的 Seatbelt 网络策略、每次执行独立且带凭证的 HTTP/CONNECT 代理、不可变目标白名单和有限执行期限。该实现禁止监听，不能满足多个 World 同端口独立监听、栈内互连的要求；每个 World 的独立网络栈后端仍待实现。此入口尚未接入组织授权、forkfs RPC、远程租约和跨 Network 文件保密边界，不能据此将节点标为完整受管执行就绪。具体能力、限制和验证方法见 [macOS 网络隔离](macos-network-isolation.md)。
 
 forkfs 底层状态保留 `CREATING / ACTIVE / TRASHING / TRASHED / DEAD`，World Operation 单独表示任务进度。discard 后仍占空间，restore 可能因 GC 已开始或基线消失而失败。删除 Network 前处理运行中的 Execution、活跃资源、trash 和 pool；不能将 discard 成功解释为清理完成。
 
