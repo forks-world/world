@@ -198,7 +198,7 @@ fn resolve_executable(name: &std::ffi::OsStr, workdir: &Path) -> Result<PathBuf>
         workdir.join(path)
     } else {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|p| p.join(name))
+            .map(|p| workdir.join(p).join(name))
             .find(|p| executable_file(p))
             .context("executable not found in PATH")?
     }

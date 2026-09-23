@@ -433,6 +433,24 @@ class Silo(unittest.TestCase):
             result = run(*self.command("A", "launch", "probe", "fd", "999"), env=env)
             self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
 
+    def test_main_relative_path_uses_world_workdir(self):
+        work = pathlib.Path(self.worlds["A"]["workdir"])
+        local = work / "workdir-probe"
+        local.symlink_to(PROBE)
+        self.addCleanup(local.unlink)
+        with tempfile.TemporaryDirectory(dir=work) as bindir, tempfile.TemporaryDirectory() as caller:
+            bindir = pathlib.Path(bindir)
+            (bindir / "workdir-probe").symlink_to(PROBE)
+            caller = pathlib.Path(caller)
+            (caller / "workdir-probe").symlink_to("/bin/echo")
+            (caller / bindir.name).mkdir()
+            (caller / bindir.name / "workdir-probe").symlink_to("/bin/echo")
+            for path in ["", ":", f"./{bindir.name}"]:
+                command = self.command("A", "fd", "999")
+                command[-3] = "workdir-probe"
+                result = run(*command, env=dict(os.environ, PATH=path), cwd=caller)
+                self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
     def test_udp_disconnect_uses_kernel_semantics(self):
         baseline = run(PROBE, "udp-disconnect", "127.0.0.1:12345")
         self.assertEqual(baseline.returncode, 0, baseline.stderr)
