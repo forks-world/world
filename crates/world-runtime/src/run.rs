@@ -144,7 +144,7 @@ pub(crate) async fn supervise(
         }
         std::future::pending::<()>().await;
     };
-    let status = tokio::select! {biased;
+    let mut status = tokio::select! {biased;
         _=injection_failure=>None,
         _=cancel.cancelled()=>None,
         _=sleep_until(deadline)=>None,
@@ -159,6 +159,22 @@ pub(crate) async fn supervise(
         let _ = child.wait().await;
     }
     for mut task in [out, err] {
+        if status.is_some() {
+            // A slow consumer is normal: retain every byte on successful exit.
+            // Cancellation and the execution deadline still bound the drain.
+            let result = tokio::select! { biased;
+                _ = cancel.cancelled() => None,
+                _ = sleep_until(deadline) => None,
+                result = &mut task => Some(result),
+            };
+            if let Some(result) = result {
+                result
+                    .context("output forwarding task")?
+                    .context("forward workload output")?;
+                continue;
+            }
+            status = None;
+        }
         if timeout(Duration::from_secs(1), &mut task).await.is_err() {
             task.abort();
             let _ = task.await;

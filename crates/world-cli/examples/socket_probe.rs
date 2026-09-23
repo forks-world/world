@@ -17,7 +17,22 @@ fn main() {
 }
 fn run() -> std::io::Result<()> {
     let args: Vec<_> = std::env::args().collect();
+    if ["bash", "zsh", "sh", "python3"]
+        .iter()
+        .any(|name| std::path::Path::new(&args[0]).file_name().unwrap() == *name)
+    {
+        print!("{}", serde_json::to_string(&args).unwrap());
+        return Ok(());
+    }
     match args[1].as_str() {
+        "burst" => {
+            let bytes = vec![b'x'; 16384];
+            if args[2] == "stderr" {
+                std::io::stderr().write_all(&bytes)?;
+            } else {
+                std::io::stdout().write_all(&bytes)?;
+            }
+        }
         "serve" => {
             let listener = TcpListener::bind(&args[2])?;
             println!("READY {}", listener.local_addr()?.port());

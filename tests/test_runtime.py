@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -184,6 +185,63 @@ class CLI(unittest.TestCase):
         for mode in ["launch", "exec"]:
             result = run(PROBE, mode, PROBE, "fd", "999", env=env)
             self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_shebang_preserves_interpreter_and_arguments(self):
+        ack = self.dir / "ack"
+        ack.touch()
+        for name in ["bash", "zsh", "python3"]:
+            (self.dir / name).symlink_to(PROBE)
+        script = self.dir / "script"
+        env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), PATH=str(self.dir))
+        for shebang, interpreter, options in [("/bin/zsh", "zsh", []),
+                ("/usr/bin/env -S python3 -u -B", "python3", ["-u", "-B"])]:
+            script.write_text(f"#!{shebang}\n")
+            script.chmod(0o755)
+            for mode in ["launch", "exec"]:
+                result = run(PROBE, mode, script, "user-argument", env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), [str(self.dir / interpreter), *options, str(script), "user-argument"])
+        (self.dir / "zsh").unlink()
+        script.write_text("#!/bin/zsh\n")
+        self.assertEqual(run(PROBE, "launch", script, env=env).returncode, 77)
+        script.write_text('#!/usr/bin/env -S python3 "quoted argument"\n')
+        self.assertEqual(run(PROBE, "launch", script, env=env).returncode, 77)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
+    def test_slow_output_consumer_does_not_lose_tail(self):
+        for destination in ["stdout", "stderr"]:
+            r, w = os.pipe()
+            try:
+                os.set_blocking(w, False)
+                prefix = 0
+                while True:
+                    try:
+                        prefix += os.write(w, b"p" * 4096)
+                    except BlockingIOError:
+                        break
+                os.set_blocking(w, True)
+                streams = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+                streams[destination] = w
+                with subprocess.Popen([str(WORLD), "network", "exec", "--policy", str(self.policy),
+                        "--workdir", str(self.dir), "--timeout", "10s", "--", str(PROBE), "burst", destination], **streams) as process:
+                    os.close(w)
+                    w = None
+                    time.sleep(2)
+                    received = bytearray()
+                    while True:
+                        self.assertTrue(select.select([r], [], [], 12)[0], "output drain timed out")
+                        chunk = os.read(r, 65536)
+                        if not chunk:
+                            break
+                        received.extend(chunk)
+                    self.assertEqual(process.wait(timeout=5), 0)
+                    self.assertEqual(received, b"p" * prefix + b"x" * 16384)
+            finally:
+                os.close(r)
+                if w is not None:
+                    os.close(w)
 
     @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
     def test_https_connect(self):

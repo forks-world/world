@@ -9,19 +9,8 @@ pub fn is_sip_path(path: &str) -> bool {
 }
 
 pub fn find_non_sip_in_path(name: &str) -> Option<CString> {
-    let fallbacks: &[&str] = match name {
-        "sh" | "bash" | "zsh" => &["bash", "zsh", "sh"],
-        "dash" => &["dash", "bash", "zsh", "sh"],
-        "ksh" => &["ksh", "bash", "zsh", "sh"],
-        "make" => &["make", "gmake"],
-        _ => &[],
-    };
-    let names = if fallbacks.is_empty() {
-        std::slice::from_ref(&name)
-    } else {
-        fallbacks
-    };
-
+    // An interpreter name is part of the script's semantics, not an alias.
+    let names = [name];
     let path_var = env::var("PATH").ok()?;
     for try_name in names {
         for dir in path_var.split(':') {
@@ -87,6 +76,28 @@ pub unsafe fn read_shebang_of(path: *const libc::c_char) -> Option<(String, Opti
     Some((interpreter, arg))
 }
 
+// Accept literal env -S tokens. Expansion, escaping and quoting require an
+// explicitly invoked interpreter rather than silently changing their meaning.
+fn env_interpreter_args(arg: &str) -> Option<Vec<String>> {
+    let split = arg.strip_prefix("-S");
+    let command = split.unwrap_or(arg).trim();
+    if command.contains(['\\', '\'', '"', '$', '`', '#']) {
+        return None;
+    }
+    let words: Vec<String> = command
+        .split_ascii_whitespace()
+        .map(str::to_owned)
+        .collect();
+    if words.is_empty()
+        || words[0].starts_with('-')
+        || words[0].contains('=')
+        || (split.is_none() && words.len() != 1)
+    {
+        return None;
+    }
+    Some(words)
+}
+
 pub unsafe fn resolve_sip_exec(
     path: *const libc::c_char,
     argv: *const *const libc::c_char,
@@ -109,16 +120,14 @@ pub unsafe fn resolve_sip_exec(
     }
 
     let is_env = interpreter.ends_with("/env");
-    let resolved = if is_env {
-        let cmd = arg.as_deref()?;
-        let stripped = cmd
-            .strip_prefix("-S")
-            .map(|s| s.trim_start())
-            .unwrap_or(cmd);
-        let actual = stripped.split_whitespace().next()?;
-        find_non_sip_in_path(actual)?
+    let (resolved, interpreter_args) = if is_env {
+        let words = env_interpreter_args(arg.as_deref()?)?;
+        (find_non_sip_in_path(&words[0])?, words[1..].to_vec())
     } else {
-        find_non_sip_in_path(interpreter.rsplit('/').next()?)?
+        (
+            find_non_sip_in_path(interpreter.rsplit('/').next()?)?,
+            arg.into_iter().collect(),
+        )
     };
 
     let mut owned: Vec<CString> = Vec::new();
@@ -126,10 +135,8 @@ pub unsafe fn resolve_sip_exec(
 
     ptrs.push(resolved.as_ptr());
 
-    if !is_env
-        && let Some(ref a) = arg
-        && let Ok(c) = CString::new(a.as_bytes())
-    {
+    for arg in interpreter_args {
+        let c = CString::new(arg).ok()?;
         ptrs.push(c.as_ptr());
         owned.push(c);
     }
