@@ -96,6 +96,12 @@ flowchart LR
 
 组织角色初期为 owner、billing-admin、member；Network 角色为 admin、operator、viewer。owner 可管理组织内所有 Network；billing-admin 仅管理付费；普通成员只能访问被授权的 Network。operator 可操作资源但不能授权成员，viewer 只读。
 
+成员和授权由 World Identity 模块管理，不要求直接修改数据库。身份提供方只负责稳定 principal ID 与登录证明，不能用请求体自报身份授予角色。组织创建者在 `POST /v1/orgs` 的认证事务中成为首个 owner（CLI `world org create`、MCP `world_org_create`）；后续组织成员的新增、改角色和移除仅 owner 可执行，且事务内禁止删除或降级最后一个 owner。
+
+Network admin 可为本组织有效成员授予或撤销该 Network 的 operator/viewer，只有 owner 可授予或撤销 Network admin。赋予组织成员资格不自动授予 Network 访问权；Network 授权必须有有效 Membership。成员移除在同一事务中使其该组织全部 Network 授权失效，角色和授权变更使用版本前置条件，防止并发更新恢复已撤销权限。服务账号适用相同 principal 与成员规则，不能以账号类型绕过授权。
+
+成员与授权 PUT/DELETE 使用幂等键；新增采用不存在前置条件，修改和删除采用 If-Match。CLI 对应 --if-version，MCP 对应 expected_version；角色更新不能静默覆盖并发变更。CLI 另提供 `world network grants` 列表。权限变更事务推进授权版本并写入撤销 outbox，World 立即拒绝后续越权请求；已下发的任务按原主体重查权限。对于不再有执行权限的主体，内部撤销事件通过 forkfs `ApplyAuthorizationRevocation` RPC 幂等更新主体/范围的最低有效授权版本，拒绝旧凭证并取消排队任务、终止受管执行。节点未确认时显示撤销传播未完成，不声称既有进程已停止；节点离线期间旧授权仅在此前约定的短期窗口内有效。管理员可查询变更返回的传播 Operation，直到节点确认或报告阻塞。授权变更不能取消其他主体任务或提升执行权限。
+
 所有操作均检查身份、权限、归属和对应的 Network 生命周期条件。创建、扩容及其他增加受限资源的操作另检查有效权益与可用配额；删除、discard、GC、pool drain、缩容和终止执行等释放操作不受欠费、套餐到期或当前超额阻断。只读查询与已有数据取回也不要求剩余配额。Network 处于 deleting 或因欠费受限时仍允许合法清理，但不得绕过资源依赖、执行占用和文件系统安全检查。查找不可见资源时返回统一的不存在响应，避免泄露其他 Network 的资源信息。
 
 操作分类由服务端根据实际效果决定，不以 HTTP 方法或客户端自报类型判断。混合增减的请求须分别核验增长部分；restore 若重新消耗活跃资源额度则按增长处理。释放操作确实需要的临时磁盘空间仍由执行端检查，空间不足返回存储错误，不能伪装为要求升级套餐。
@@ -156,6 +162,11 @@ CLI 使用 `world` 命令，以下是拟议交互：
 ```sh
 world auth login
 world org list
+world member list --org acme
+world member set principal_123 --role member --org acme
+world network grant principal_123 --role operator --org acme --network dev
+world network revoke principal_123 --org acme --network dev
+world member remove principal_123 --org acme
 world context use --org acme --network dev
 world context show
 
@@ -188,6 +199,11 @@ world operation inspect op_123
 | 接口 | 用途 |
 | --- | --- |
 | `GET /v1/orgs` | 当前主体可见组织 |
+| `POST /v1/orgs` | 已认证用户创建组织并成为首个 owner |
+| `GET /v1/orgs/{org}/members` | owner 分页查看成员及角色 |
+| `PUT/DELETE /v1/orgs/{org}/members/{principal}` | owner 添加/更新或移除已知身份的成员；保护最后一个 owner |
+| `GET /v1/orgs/{org}/networks/{network}/grants` | owner / Network admin 分页查看授权 |
+| `PUT/DELETE /v1/orgs/{org}/networks/{network}/grants/{principal}` | 按角色边界赋权或撤权，返回授权版本与传播 Operation |
 | `GET/POST /v1/orgs/{org}/networks` | 列出或创建 Network |
 | `GET/DELETE /v1/orgs/{org}/networks/{network}` | 查询或删除 Network |
 | `GET /v1/orgs/{org}/networks/{network}/nodes` | 分页查询该 Network 可见的节点身份、能力与健康状态 |
@@ -197,6 +213,8 @@ world operation inspect op_123
 | `GET/POST /v1/orgs/{org}/networks/{network}/resources` | 查询或创建资源 |
 | `GET/PATCH/DELETE /v1/orgs/{org}/networks/{network}/resources/{resource}` | 资源元信息与生命周期管理 |
 | `GET /v1/orgs/{org}/networks/{network}/operations/{operation}` | 查询异步操作 |
+| `POST /v1/orgs/{org}/networks/{network}/operations/{operation}/cancel` | 幂等请求取消可取消任务；最终取消结果从原 Operation 查询 |
+| `GET /v1/orgs/{org}/operations/{operation}` | 查询成员变更等组织级 Operation；仅有相应组织管理权限的主体可见 |
 | `POST /v1/orgs/{org}/networks/{network}/enrollments` | 管理员创建节点/Store 登记意图，返回 Enrollment 与一次性节点接入授权 |
 | `GET /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}` | 查询登记阶段及需要的本机动作 |
 | `POST /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}/complete` | 提交节点证明，幂等完成激活与绑定发布 |
@@ -250,6 +268,10 @@ Skill 的流程约定：
 | `world_billing_get` / `world_billing_usage` | 查询组织权益、订阅或归属到 Network 的用量 |
 | `world_billing_checkout` / `world_billing_portal` | 为有付费权限的主体生成托管页面链接，不直接完成支付 |
 | `world_operation_get` | 指定组织、Network 和 Operation ID，查询执行结果 |
+| `world_operation_cancel` | 指定组织、Network、Operation ID 和幂等键，请求取消支持取消的任务 |
+| `world_org_operation_get` | 查询组织级授权变更的传播 Operation |
+| `world_org_create` / `world_member_list` / `world_member_set` / `world_member_remove` | 创建组织或按 owner 权限管理成员；set/remove 使用版本条件 |
+| `world_network_grant_list` / `world_network_grant_set` / `world_network_grant_remove` | 指定组织与 Network 管理授权，不允许角色越权 |
 | `world_workspace_exec` | 指定组织、Network、Workspace、参数数组、受限环境变量、超时与幂等键，返回启动 Operation 和 Execution 引用 |
 | `world_execution_get` | 指定组织、Network 和 Execution ID，查询终态、退出码/信号与终止原因 |
 | `world_execution_output` | 在相同归属下按 Execution ID、游标和大小上限读取带流标识的输出 |
@@ -306,6 +328,12 @@ Operation 成功必须包含与该操作 ID 关联的结果证据，由执行端
 | 取消 | 排队任务确认未执行，或运行任务已停止且副作用核实完成；取消请求受理不等于取消完成，已经提交的操作返回原结果 |
 
 结果未知、节点不可达或恢复中均为非成功状态，保留操作引用与必要的配额预留；不能根据超时释放资源或启动替代任务。
+
+取消入口为 cancel API、`world_operation_cancel` 和 `world operation cancel <id>`。服务端重新验证归属及原动作的角色要求；operator 只能取消自己提交且当前仍有权执行的普通资源任务，Network admin/owner 可取消其管理范围内的用户任务。取消不检查可用额度或付费状态；后台撤销任务、登记激活/中止/停用的恢复流程不开放通用取消，以各自专用状态机为准。`GetOperation` 返回 `cancel_supported`、当前可取消阶段和原因，不可取消返回稳定错误，不伪造成功。
+
+World 原子记录取消意图并阻止尚未发送的 outbox 执行；已经发送或发送结果未知时，将同一操作身份传给 forkfs `CancelOperation`。forkfs 必须在 Store 队列与操作日志下串行化取消和开始，若取消先于迟到提交到达，保存取消 tombstone，后续同 ID 提交仍不得执行；查不到任务不等于证明从未执行。重复取消返回当前结果，原操作已成功则保留成功及其副作用。已运行任务停止并核实副作用后才能确认取消和释放相应预留；启动 Execution 的 Operation 已完成时，终止进程必须使用 execution cancel。
+
+验收覆盖排队取消、提交响应丢失、取消先于提交到达、运行中安全停止、重复取消与自然完成竞争、viewer 和跨 Network 取消拒绝；成员管理验收覆盖最后一个 owner 并发删除、Network admin 提权拒绝、移除成员后的授权失效和节点撤销传播延迟。
 
 ## 8. 建议代码结构
 
@@ -484,6 +512,7 @@ CLI 提供 `world node list --network dev`、`world store list --network dev`、
 | `GetOperation` / `CancelOperation` | 查询持久化操作、对可取消操作请求取消 |
 | `RefreshOperationAuthorization` | 为原 Operation 更新执行授权；不创建任务、不修改原请求和配额预留 |
 | `DecommissionStore` | 队列内停用空 Store，持久化绑定 generation tombstone 并返回可恢复的停用证明 |
+| `ApplyAuthorizationRevocation` | 仅 World 授权服务可签发，按事件 ID 幂等推进范围内授权版本并停止失权任务，返回传播状态 |
 
 首版 `InitSnapshot` 只接受同机调用方经认证本地 Unix socket 提交的目录引用，包括组织管理下的本机节点；远程 RPC 连接不开放此方法。CLI 与 MCP 的本地服务进程须验证目标节点身份确属本机，相对路径只相对于调用方显式工作目录解析，然后由 forkfs 再验证允许导入的根目录与路径。不能把客户端路径字符串发送到任意节点并在节点上重新解释，也不能仅凭 `localhost` 名称断定同机。
 
