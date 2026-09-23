@@ -1,11 +1,35 @@
 //! Track cwd-changing actions by their opaque handle, including handle moves and
 //! reallocations by other add-action calls. No private macOS structure is parsed.
-//! Lock-free storage also works in post-fork paths. Exhaustion fails before a
+//! Spawn queries are lock-free, while mutations (already allocating libc APIs)
+//! are serialized so allocator reuse cannot race registry updates. Exhaustion fails before a
 //! cwd action is added, rather than allowing an untracked directory change.
 use libc::{c_char, c_int, mode_t, posix_spawn_file_actions_t};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static CWD_ACTIONS: [AtomicUsize; 4096] = [const { AtomicUsize::new(0) }; 4096];
+
+static MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+thread_local! { static IN_MUTATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+struct MutationGuard(Option<std::sync::MutexGuard<'static, ()>>);
+impl MutationGuard {
+    fn enter() -> Self {
+        // The legacy and POSIX aliases may delegate to each other in libSystem.
+        // Only the outermost call takes the lock; all nested updates stay inside it.
+        if IN_MUTATION.get() {
+            return Self(None);
+        }
+        let guard = MUTATION.lock().unwrap_or_else(|error| error.into_inner());
+        IN_MUTATION.set(true);
+        Self(Some(guard))
+    }
+}
+impl Drop for MutationGuard {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            IN_MUTATION.set(false);
+        }
+    }
+}
 
 unsafe fn handle(actions: *const posix_spawn_file_actions_t) -> usize {
     if actions.is_null() {
@@ -73,6 +97,7 @@ unsafe extern "C" {
     fn real_destroy(actions: *mut posix_spawn_file_actions_t) -> c_int;
 }
 unsafe extern "C" fn init(actions: *mut posix_spawn_file_actions_t) -> c_int {
+    let _mutation = MutationGuard::enter();
     let result = unsafe { real_init(actions) };
     if result == 0 {
         clear(unsafe { handle(actions) });
@@ -80,6 +105,7 @@ unsafe extern "C" fn init(actions: *mut posix_spawn_file_actions_t) -> c_int {
     result
 }
 unsafe extern "C" fn destroy(actions: *mut posix_spawn_file_actions_t) -> c_int {
+    let _mutation = MutationGuard::enter();
     let value = unsafe { handle(actions) };
     let result = unsafe { real_destroy(actions) };
     if result == 0 {
@@ -107,6 +133,7 @@ macro_rules! cwd_action {
             actions: *mut posix_spawn_file_actions_t,
             $arg: $ty,
         ) -> c_int {
+            let _mutation = MutationGuard::enter();
             let (slot, fresh) = match reserve(unsafe { handle(actions) }) {
                 Ok(slot) => slot,
                 Err(error) => return error,
@@ -137,6 +164,7 @@ macro_rules! other_action {
             fn $original(actions: *mut posix_spawn_file_actions_t, $($arg: $ty),+) -> c_int;
         }
         unsafe extern "C" fn $wrapper(actions: *mut posix_spawn_file_actions_t, $($arg: $ty),+) -> c_int {
+            let _mutation = MutationGuard::enter();
             let slot = find(unsafe { handle(actions) });
             let result = unsafe { $original(actions, $($arg),+) };
             if let Some(slot) = slot { CWD_ACTIONS[slot].store(unsafe { handle(actions) }, Ordering::Release); }
@@ -149,3 +177,41 @@ other_action!(CLOSE, close, real_close, "posix_spawn_file_actions_addclose", fd:
 other_action!(DUP2, dup2, real_dup2, "posix_spawn_file_actions_adddup2", fd: c_int, newfd: c_int);
 other_action!(OPEN, open, real_open, "posix_spawn_file_actions_addopen", fd: c_int, path: *const c_char, flags: c_int, mode: mode_t);
 other_action!(INHERIT, inherit, real_inherit, "posix_spawn_file_actions_addinherit_np", fd: c_int);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_actions_survive_growth_move_and_destroy() {
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..100 {
+                        unsafe {
+                            let mut actions = std::mem::MaybeUninit::uninit();
+                            assert_eq!(init(actions.as_mut_ptr()), 0);
+                            assert_eq!(chdir_np(actions.as_mut_ptr(), c"/tmp".as_ptr()), 0);
+                            for _ in 0..64 {
+                                assert_eq!(dup2(actions.as_mut_ptr(), 2, 2), 0);
+                            }
+                            let mut moved = actions.assume_init();
+                            assert!(changes_cwd(
+                                (&moved as *const posix_spawn_file_actions_t).cast()
+                            ));
+                            assert_eq!(destroy(&mut moved), 0);
+                            assert_eq!(init(&mut moved), 0);
+                            assert!(!changes_cwd(
+                                (&moved as *const posix_spawn_file_actions_t).cast()
+                            ));
+                            assert_eq!(destroy(&mut moved), 0);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+}
