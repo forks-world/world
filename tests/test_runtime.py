@@ -159,6 +159,32 @@ class CLI(unittest.TestCase):
         result = run(PROBE, "get", "127.77.254.253:12345", env=env)
         self.assertEqual(result.returncode, 77, result.stderr)
 
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_child_script_cannot_drop_injection(self):
+        ack = self.dir / "ack"
+        ack.touch()
+        script = self.dir / "child.sh"
+        script.write_text("#!/bin/sh\necho escaped\n")
+        script.chmod(0o755)
+        env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack),
+                   PATH=str(self.dir))
+        for mode in ["launch", "exec"]:
+            result = run(PROBE, mode, script, env=env)
+            self.assertEqual(result.returncode, 77, result.stderr)
+            self.assertNotIn("escaped", result.stdout)
+            self.assertEqual(ack.read_text(), "world-silo-v1")
+        # A superficially non-SIP PATH replacement must not resolve back to /bin/sh.
+        (self.dir / "bash").symlink_to("/bin/sh")
+        for mode in ["launch", "exec"]:
+            result = run(PROBE, mode, script, env=env)
+            self.assertEqual(result.returncode, 77, result.stderr)
+            self.assertNotIn("escaped", result.stdout)
+        # Ordinary native children still execute with the inherited injection.
+        for mode in ["launch", "exec"]:
+            result = run(PROBE, mode, PROBE, "fd", "999", env=env)
+            self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
     @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
     def test_https_connect(self):
         config = self.dir / "openssl.cnf"

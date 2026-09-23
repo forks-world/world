@@ -9,6 +9,8 @@ its address translation behind an unrelated name. Local changes enforce
 unconditional localhost translation (no host fallback or listener probe),
 reject other loopback aliases through the intercepted socket calls, reject
 unsupported IPv6-only operations, and check injection/child environment.
+Final child exec targets must be native binaries; unresolved shebangs and
+replacement interpreters that resolve to SIP-protected paths fail with EACCES.
 This remains a developer compatibility layer, not a hostile-code security
 boundary: raw syscalls and uninjected code can bypass interposition.
 

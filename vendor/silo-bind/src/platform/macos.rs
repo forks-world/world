@@ -203,6 +203,9 @@ unsafe fn spawn_common(
                 resolved.to_string_lossy()
             );
         }
+        if !unsafe { crate::world::native_target(resolved.as_ptr()) } {
+            return libc::EACCES;
+        }
         if new_argv.is_empty() {
             return unsafe {
                 real_posix_spawn(pid, resolved.as_ptr(), file_actions, attrp, argv, envp)
@@ -218,6 +221,9 @@ unsafe fn spawn_common(
                 envp,
             )
         };
+    }
+    if !unsafe { crate::world::native_target(path) } {
+        return libc::EACCES;
     }
     unsafe { fallback(pid, path, file_actions, attrp, argv, envp) }
 }
@@ -290,10 +296,16 @@ unsafe extern "C" fn silo_execve_entry(
                 resolved.to_string_lossy()
             );
         }
+        if !unsafe { crate::world::native_target(resolved.as_ptr()) } {
+            return -1;
+        }
         if new_argv.is_empty() {
             return unsafe { real_execve(resolved.as_ptr(), argv, envp) };
         }
         return unsafe { real_execve(resolved.as_ptr(), new_argv.as_ptr(), envp) };
+    }
+    if !unsafe { crate::world::native_target(path) } {
+        return -1;
     }
     unsafe { real_execve(path, argv, envp) }
 }

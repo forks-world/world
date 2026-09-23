@@ -72,6 +72,16 @@ fn run() -> std::io::Result<()> {
                 .status()?;
             std::process::exit(status.code().unwrap_or(99));
         }
+        "launch" => {
+            let status = std::process::Command::new(&args[2])
+                .args(&args[3..])
+                .status()?;
+            std::process::exit(status.code().unwrap_or(99));
+        }
+        "exec" => {
+            use std::os::unix::process::CommandExt;
+            return Err(std::process::Command::new(&args[2]).args(&args[3..]).exec());
+        }
         "fd" => {
             let fd: i32 = args[2].parse().unwrap();
             #[cfg(unix)]
