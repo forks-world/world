@@ -221,11 +221,10 @@ fn resolve_executable(name: &std::ffi::OsStr, workdir: &Path) -> Result<PathBuf>
     Ok(path)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     #[test]
-    #[cfg(target_os = "macos")]
     fn allocation_serializes_world_identity() {
         let state = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
