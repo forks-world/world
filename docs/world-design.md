@@ -53,7 +53,7 @@ flowchart LR
 | --- | --- | --- |
 | CLI | 上下文、交互、配置输入、结果展示 | 权限与权益由服务端校验 |
 | Skill | 任务流程、工具选择、结果验证与恢复指引 | 不持有凭证，不充当授权机制 |
-| MCP | 工具发现、参数验证、结构化结果、API 调用 | 与 CLI 共用 API，不直接访问数据库或运行环境 |
+| MCP | 工具发现、参数验证、结构化结果、API 调用 | 与 CLI 共用 API，不访问数据库；仅本地 init 有受限 RPC 提交例外（第 10 节） |
 | ForkFS Controller | Snapshot、Workspace 生命周期、节点执行与状态同步 | 经 RPC 调用 forkfs 服务，复用资源与 Operation 模型 |
 | Identity | 身份认证、组织成员、Network 授权 | 服务账号也遵循相同授权路径 |
 | Networks | Network 生命周期、配额、运行环境绑定 | 对接适配器，跟踪实际状态 |
@@ -609,7 +609,7 @@ forkfs 服务持久化 `(调用主体, Store, operation_id)` 与请求摘要。�
 
 ### CLI、MCP 与 Skill
 
-forkfs 生命周期使用下列公开 World API，统一前缀为 `/v1/orgs/{org}/networks/{network}`。表中的资源 ID 为 World 全局 ID，`{binding}` 为 StoreBinding ID；CLI 与 MCP 均经同一应用服务调用这些路由，不自行直连管理 RPC。
+forkfs 生命周期使用下列公开 World API，统一前缀为 `/v1/orgs/{org}/networks/{network}`。表中的资源 ID 为 World 全局 ID，`{binding}` 为 StoreBinding ID；CLI 与 MCP 均经同一应用服务调用这些路由；唯一的本机 RPC 例外是下述 init 授权后的源提交，其他动作不自行直连管理 RPC。
 
 | 相对路由 | 主要输入与结果 / MCP 对应 |
 | --- | --- |
@@ -631,6 +631,8 @@ forkfs 生命周期使用下列公开 World API，统一前缀为 `/v1/orgs/{org
 | `POST /stores/{binding}/pool/drain` | Snapshot ID、是否禁用后续补充；返回 Operation，`world_fs_pool_drain` |
 
 动作的 POST 请求支持幂等键，异步结果返回 202 和 Operation 引用；查询和结果读取仍逐次鉴权。只读 diff 使用 POST 建立遍历任务，不因此受增长权益门槛限制；forkfs 遍历结束并持久化结果后即可释放读保护，结果分页读取不重复遍历。结果保留期、截断和过期明确返回，不能以缺失结果冒充空 diff。repair=false 的 verify 走只读验证权限，允许修复则检查写权限与 revision；GC 与 pool 的变更要求 Network admin，普通资源写入要求 operator。调用者不能通过改走通用 CRUD 绕过这些角色和领域规则。
+
+本地 init 是明确的两步例外：World CLI 或本机 World MCP Server 先调用 init API，再由同一受信客户端进程持该次受限授权向已验证同机 forkfs socket 调用 InitSnapshot。它只能提交绑定原 Operation 的目录引用；不能据此调用 fork、exec、GC、授权刷新或其他管理 RPC。令牌不返回给模型或写入日志；forkfs 校验具体方法、节点、绑定 generation、Operation 与允许源范围，返回原操作的受理结果。后续授权刷新、状态查询、结果与配额结算仍走 World，不赋予 Agent 通用 forkfs 身份。
 
 init API 仅创建限定节点、绑定与 Operation 的提交授权，客户端完成同机前置检查后才请求；forkfs 的路径范围校验仍是最终依据。World API 不读取客户端目录，也不把路径在远程节点重新解释。所有 POST 成功受理后的最终完成标准仍按第 7 节执行。
 
