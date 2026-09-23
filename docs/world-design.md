@@ -221,11 +221,11 @@ world operation inspect op_123
 | `GET /v1/orgs/{org}/networks/{network}/operations/{operation}` | 查询异步操作 |
 | `POST /v1/orgs/{org}/networks/{network}/operations/{operation}/cancel` | 幂等请求取消可取消任务；最终取消结果从原 Operation 查询 |
 | `GET /v1/orgs/{org}/operations/{operation}` | 查询成员变更等组织级 Operation；仅有相应组织管理权限的主体可见 |
-| `POST /v1/orgs/{org}/networks/{network}/enrollments` | 管理员创建节点/Store 登记意图，返回 Enrollment 与一次性节点接入授权 |
+| `POST /v1/orgs/{org}/networks/{network}/enrollments` | 管理员创建节点/Store 登记意图，只返回 Enrollment、状态与无授权能力的 handoff 引用 |
 | `GET /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}` | 查询登记阶段及需要的本机动作 |
 | `POST /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}/complete` | 提交节点证明，幂等完成激活与绑定发布 |
 | `POST /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}/abort` | 管理员请求中止未激活登记，返回可查询的中止阶段 |
-| `POST /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}/renew` | 管理员为原登记续发短期授权，固定原归属与已确认节点身份 |
+| `POST /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}/renew` | 管理员为原登记创建续期 handoff，只返回引用，固定原归属与已确认节点身份 |
 | `POST /v1/orgs/{org}/networks/{network}/workspaces/{workspace}/executions` | 异步启动受管执行，返回启动 Operation 与 Execution 引用 |
 | `GET /v1/orgs/{org}/networks/{network}/executions/{execution}` | 查询执行状态、退出码或信号与终止原因 |
 | `GET /v1/orgs/{org}/networks/{network}/executions/{execution}/output` | 按游标和大小上限读取 stdout/stderr |
@@ -432,9 +432,15 @@ World 首版只提供组织管理路径：无论节点在本机还是远程，�
 
 ### 首次登记与 Store 接管
 
-登记使用独立 bootstrap 接口，不要求先存在 StoreBinding。组织 owner 或被授权的 Network admin 可通过拟议 `world node enroll --network dev`（或 `world_enrollment_create`）创建 Enrollment；普通 operator 不能接管 Store。Enrollment 固定组织、Network 和接入意图，使用幂等键防止重复创建；一次性短期授权经受控通道交给节点管理员，不写入日志或 Skill。
+登记使用独立 bootstrap 接口，不要求先存在 StoreBinding。组织 owner 或被授权的 Network admin 可通过拟议 `world node enroll --network dev`（或 `world_enrollment_create`）创建 Enrollment；普通 operator 不能接管 Store。Enrollment 固定组织、Network 和接入意图，使用幂等键防止重复创建；创建响应只包含 Enrollment ID、handoff 引用和状态，不包含一次性短期授权；实际凭证通过以下节点交付流程传递，不写入日志或 Skill。
 
-节点管理员在目标机器运行拟议 `forkfs enroll`，通过本机权限受限 socket 调用 `PrepareEnrollment`，提交授权、节点公钥及自己选择的允许路径，明确选择“新建空 Store”或“接管已有 Store”。节点验证 World 授权签名及目标，World 验证一次性授权与节点持钥证明并固定节点身份；远程请求不能仅凭一段路径触发接管。新建通过 forkfs 自身初始化逻辑分配 store_id，已有 Store 则读取并核实真实身份，两者均由 forkfs 执行，无需手工改库。
+handoff 引用只是随机关联 ID，不是 bearer credential，持有它不能批准登记或领取授权。节点进程通过 `POST /v1/enrollment-handoffs/{handoff}/candidate` 提交公钥及服务挑战的持钥证明；管理员在单独认证的 World 管理页面核对组织、Network、节点公钥指纹和接入意图，通过 `/approve` 明确批准该候选。批准要求独立用户会话及重新认证，MCP/Agent 服务令牌不能调用 approve，链接或引用本身不构成批准。
+
+节点随后通过 `/redeem` 证明持有获批私钥，取得仅对该节点密钥可解密的短期授权；领取协议绑定 handoff、候选和防重放挑战。凭证在任何 PrepareEnrollment 之前就绑定已批准节点，未获批的竞争候选不能替换该身份。重复领取只返回同一节点可解密的原交付结果，不延长有效期；过期则用原 Enrollment 发起新续期 handoff。候选提交、批准与领取都是独立身份校验端点，不开放为 MCP 工具；实际解密材料仅交给节点服务，不经过模型上下文、CLI stdout 或通用 MCP 结果序列化。
+
+MCP 对 create/renew 的输出 schema 采用字段白名单，仅允许 enrollment_id、handoff_id、状态和不含秘密的人工操作提示。即使底层响应意外附带 credential，也不得透传到 structuredContent、文本、错误或调试日志。CLI 的 JSON 输出遵循同一规则。验收应扫描全部模型可见内容，覆盖创建、续期、错误及重试，确认不包含凭证；泄露 handoff 引用不能领取授权，错误节点私钥和 Agent 调用 approve 均被拒绝。
+
+节点管理员先通过上述 handoff 取得绑定该节点的授权，再在目标机器运行拟议 `forkfs enroll`，通过本机权限受限 socket 调用 `PrepareEnrollment`，提交授权、节点公钥及自己选择的允许路径，明确选择“新建空 Store”或“接管已有 Store”。节点验证 World 授权签名及目标，World 验证一次性授权与节点持钥证明并固定节点身份；远程请求不能仅凭一段路径触发接管。新建通过 forkfs 自身初始化逻辑分配 store_id，已有 Store 则读取并核实真实身份，两者均由 forkfs 执行，无需手工改库。
 
 forkfs 先取得 Store 独占所有权，确认无独立写入者，验证 schema、资源状态和路径范围，再安装受管访问限制。无法取得锁或限制无法落实时登记失败，不发布绑定。准备成功后持久化 `prepared` 和 Enrollment ID，返回签名证明，包含节点、store_id、组织/Network、资源清单摘要及当前阶段；Store 此时保持维护状态，尚不执行普通管理操作。
 
@@ -446,7 +452,7 @@ bootstrap RPC 集合为 `PrepareEnrollment`、`GetEnrollmentStatus`、`ActivateE
 
 重试使用原 Enrollment，重复 prepare/activate 返回原结果；激活响应丢失时通过 `GetEnrollmentStatus` 对账，不能重新初始化或另建绑定。凭证过期后由同一有权管理员为原 Enrollment 重新签发并绑定已有节点身份；过期本身不解除已准备 Store 的限制。World 暂不可达或阶段不明时保留维护状态；首版允许继续登记、诊断或显式中止尚未激活的登记，不自动退管或删除用户数据。无权恢复时需组织管理员与节点管理员共同处理，不通过直接改库跳过流程。
 
-续期通过 renew API、`world_enrollment_renew` 或 `world enrollment renew <id>` 发起，需重新认证和检查原登记的管理权限；幂等键只重放本次签发结果，新的续期使用新键但沿用原 Enrollment ID。响应通过受控凭证通道交给节点管理员，日志和普通 get 结果只显示授权版本与到期时间。续期固定已有节点公钥、Store 身份及组织/Network；身份尚未确认时不得据此放宽原接入意图。forkfs 在 PrepareEnrollment 重试中接受经签名验证的新授权版本，更新已记录版本后拒绝旧版本；重放不重新创建 Store。终态 active/aborted 不允许续期，已进入 aborting 的登记只允许继续中止。续期不重置阶段、锁或配额，也不是普通操作授权。
+续期通过 renew API、`world_enrollment_renew` 或 `world enrollment renew <id>` 发起，需重新认证和检查原登记的管理权限；幂等键只重放本次 handoff 引用，新的续期使用新键但沿用原 Enrollment ID。普通响应只返回 handoff 引用；续发凭证仍经节点交付流程领取，日志和普通 get 结果只显示授权版本与到期时间。续期固定已有节点公钥、Store 身份及组织/Network；身份尚未确认时不得据此放宽原接入意图。forkfs 在 PrepareEnrollment 重试中接受经签名验证的新授权版本，更新已记录版本后拒绝旧版本；重放不重新创建 Store。终态 active/aborted 不允许续期，已进入 aborting 的登记只允许继续中止。续期不重置阶段、锁或配额，也不是普通操作授权。
 
 登记验收覆盖空节点、新 Store、已有 Store、并发导入超额、反复登记去重、激活响应丢失时保留预留、存活写入者、重复认领、授权过期、prepare/activate 各阶段断线及激活响应丢失；断言绑定只在握手完成后可用、重试不重复初始化、未知状态下不开放独立写入。
 
