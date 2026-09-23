@@ -130,27 +130,50 @@ impl Drop for Proxy {
     }
 }
 
+// Conservative DNS policy: special-purpose destinations require literal-IP grants.
+// IANA IPv4/IPv6 special-purpose registries, checked 2026-09-24:
+// https://www.iana.org/assignments/iana-ipv4-special-registry/
+// https://www.iana.org/assignments/iana-ipv6-special-registry/
 fn public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => {
-            !v.is_private()
-                && !v.is_loopback()
-                && !v.is_link_local()
-                && !v.is_unspecified()
-                && !v.is_multicast()
-                && !v.is_broadcast()
-                && !v.is_documentation()
+            let n = u32::from(v);
+            ![
+                (0x00000000, 8),
+                (0x0a000000, 8),
+                (0x64400000, 10),
+                (0x7f000000, 8),
+                (0xa9fe0000, 16),
+                (0xac100000, 12),
+                (0xc0000000, 24),
+                (0xc0000200, 24),
+                (0xc01fc400, 24),
+                (0xc034c100, 24),
+                (0xc0586300, 24),
+                (0xc0a80000, 16),
+                (0xc0af3000, 24),
+                (0xc6120000, 15),
+                (0xc6336400, 24),
+                (0xcb007100, 24),
+                (0xe0000000, 4),
+                (0xf0000000, 4),
+            ]
+            .iter()
+            .any(|&(base, bits)| n >> (32 - bits) == base >> (32 - bits))
         }
         IpAddr::V6(v) => {
             if let Some(v) = v.to_ipv4_mapped() {
-                public_ip(v.into())
-            } else {
-                !v.is_loopback()
-                    && !v.is_unspecified()
-                    && !v.is_multicast()
-                    && !v.is_unique_local()
-                    && !v.is_unicast_link_local()
+                return public_ip(v.into());
             }
+            let s = v.segments();
+            // Only ordinary global unicast; exclude protocol assignments,
+            // transition mechanisms, documentation and special anycast space.
+            s[0] & 0xe000 == 0x2000
+                && !(s[0] == 0x2001 && s[1] < 0x0200)
+                && !(s[0] == 0x2001 && s[1] == 0x0db8)
+                && s[0] != 0x2002
+                && !(s[0] == 0x2620 && s[1] == 0x004f && s[2] == 0x8000)
+                && !(s[0] == 0x3fff && s[1] & 0xf000 == 0)
         }
     }
 }
@@ -296,6 +319,67 @@ fn strip_hop_headers(headers: &mut header::HeaderMap) {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[test]
+    fn dns_addresses_require_ordinary_public_unicast() {
+        for ip in [
+            "0.1.2.3",
+            "10.0.0.1",
+            "100.64.0.0",
+            "100.127.255.255",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.31.255.255",
+            "192.0.0.9",
+            "192.0.2.1",
+            "192.31.196.1",
+            "192.52.193.1",
+            "192.88.99.2",
+            "192.168.1.1",
+            "192.175.48.1",
+            "198.18.0.0",
+            "198.19.255.255",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::ffff:100.64.1.1",
+            "::ffff:198.18.1.1",
+            "64:ff9b::a00:1",
+            "64:ff9b:1::1",
+            "100::1",
+            "2001::1",
+            "2001:2::1",
+            "2001:20::1",
+            "2001:db8::1",
+            "2002:a00:1::1",
+            "2620:4f:8000::1",
+            "3fff:fff::1",
+            "5f00::1",
+            "fc00::1",
+            "fe80::1",
+            "fec0::1",
+            "ff02::1",
+        ] {
+            assert!(!public_ip(ip.parse().unwrap()), "accepted {ip}");
+        }
+        for ip in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "100.63.255.255",
+            "100.128.0.0",
+            "198.17.255.255",
+            "198.20.0.0",
+            "::ffff:8.8.8.8",
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+            "2001:200::1",
+        ] {
+            assert!(public_ip(ip.parse().unwrap()), "rejected {ip}");
+        }
+    }
     #[tokio::test]
     async fn proxy_auth_policy_and_revocation() {
         let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();

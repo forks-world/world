@@ -70,7 +70,7 @@ mkdir -p /tmp/world-a /tmp/world-b
 ./target/debug/world network exec --policy examples/network-web.json --workdir /tmp/world-a --timeout 30s -- /usr/bin/curl -fsS https://example.com/
 ```
 
-策略结构保持 `{ "network_id": "web", "allow": [{ "host": "example.com", "port": 443 }] }`。空 allow 为断网；支持明确的 TCP 域名/IP 和端口，拒绝未知字段、通配符和非法端口。域名启动时解析并固定地址，私网/回环解析需改为可信配置中的显式 IP 授权。
+策略结构保持 `{ "network_id": "web", "allow": [{ "host": "example.com", "port": 443 }] }`。空 allow 为断网；支持明确的 TCP 域名/IP 和端口，拒绝未知字段、通配符和非法端口。域名启动时解析并固定地址，特殊用途地址（含共享地址、基准测试、文档和地址转换前缀）保守拒绝，需改为可信配置中的显式 IP 授权。
 
 每次执行有独立不可变路由和随机代理凭证，同时占住 IPv4/IPv6 的代理端口。HTTP 请求与 CONNECT 都检查目标和凭证；代理凭证不转发至目标。HTTP 响应重定向不会绕过下一次目标校验。
 
