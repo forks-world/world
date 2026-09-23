@@ -373,7 +373,7 @@ migrations/               数据库迁移
 docs/                     设计与使用说明
 ```
 
-以上是职责组织建议，尚未决定实现语言。技术选型应结合现有运行环境 SDK 与部署方式，不影响四个核心模块的边界。
+以上是职责组织建议。首个本地 CLI 和 macOS 网络运行时使用 Go，实现位于 `cmd/world/` 与 `internal/network/`；其余模块仍为拟议结构。
 
 ## 9. 实现顺序与验收
 
@@ -744,6 +744,8 @@ Skill 的编码流程改为：确定 Network、节点与 Store → 选择或初�
 Linux 当前沙箱保留宿主网络，宿主可读文件也不是保密边界；macOS 使用允许默认访问的 seatbelt 策略，主要保护当前 Store 和其他 Workspace 的写入，且未指定 `--require-sandbox` 时可能降级为无沙箱。依据：[Linux 执行隔离说明](https://github.com/forks-world/forkfs/blob/6a89c15e121f0f42d50a72437ae5088e93af6b5b/docs/LINUX_XFS.md)、[CLI 沙箱实现](https://github.com/forks-world/forkfs/blob/6a89c15e121f0f42d50a72437ae5088e93af6b5b/cli/main.cpp)。
 
 因此 World 受管执行必须禁止静默降级，并额外部署 Network 流量策略及跨 Network 文件访问限制。只传 `--require-sandbox` 不足以完成这些保证。节点未提供所需隔离能力时拒绝受管执行，Network 不标为可执行状态。授权撤销也需要终止或隔离已有执行进程，不能仅删除控制面授权记录。
+
+macOS 本地网络运行时已有首版实现与内核集成测试：`world network exec` 使用默认拒绝的 Seatbelt 网络策略、每次执行独立且带凭证的 HTTP/CONNECT 代理、不可变目标白名单和有限执行期限。此入口是供运行环境接入的本地原语，尚未接入组织授权、forkfs RPC、远程租约和跨 Network 文件保密边界，不能据此将节点标为完整受管执行就绪。具体能力、限制和验证方法见 [macOS 网络隔离](macos-network-isolation.md)。
 
 forkfs 底层状态保留 `CREATING / ACTIVE / TRASHING / TRASHED / DEAD`，World Operation 单独表示任务进度。discard 后仍占空间，restore 可能因 GC 已开始或基线消失而失败。删除 Network 前处理运行中的 Execution、活跃资源、trash 和 pool；不能将 discard 成功解释为清理完成。
 
