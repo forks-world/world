@@ -108,6 +108,13 @@ pub unsafe fn native_target(path: *const libc::c_char) -> bool {
         if !path.is_file() {
             return false;
         }
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = path.metadata() else {
+            return false;
+        };
+        if metadata.permissions().mode() & 0o6000 != 0 {
+            return false;
+        }
         let Ok(mut file) = std::fs::File::open(path) else {
             return false;
         };

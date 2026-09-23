@@ -11,6 +11,8 @@ reject other loopback aliases through the intercepted socket calls, reject
 unsupported IPv6-only operations, and check injection/child environment.
 Final child exec targets must be native binaries; unresolved shebangs and
 replacement interpreters that resolve to SIP-protected paths fail with EACCES.
+World also rejects setuid/setgid targets and tracks cwd-changing spawn actions
+through their public APIs, including handle relocation and both API spellings.
 This remains a developer compatibility layer, not a hostile-code security
 boundary: raw syscalls and uninjected code can bypass interposition.
 

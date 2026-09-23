@@ -306,6 +306,46 @@ class CLI(unittest.TestCase):
             result = run(PROBE, mode, "candidate", "fd", "999", env=env, cwd=cwd)
             self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
 
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_spawn_chdir_cannot_switch_relative_target(self):
+        ack = self.dir / "ack"
+        ack.touch()
+        current, other = self.dir / "current", self.dir / "other"
+        current.mkdir()
+        other.mkdir()
+        (current / "candidate").symlink_to(PROBE)
+        (other / "candidate").symlink_to("/bin/echo")
+        env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack))
+        import ctypes
+        modes = ["raw-spawn-chdir", "raw-spawn-fchdir"]
+        if hasattr(ctypes.CDLL(None), "posix_spawn_file_actions_addchdir"):
+            modes += ["raw-spawn-chdir-posix", "raw-spawn-fchdir-posix"]
+        for mode in modes:
+            baseline = run(PROBE, mode, "candidate", other, "fd", "999", cwd=current)
+            self.assertEqual((baseline.returncode, baseline.stdout), (0, "fd 999\n"), baseline.stderr)
+            result = run(PROBE, mode, "candidate", other, "fd", "999", cwd=current, env=env)
+            self.assertEqual(result.returncode, 77, result.stderr)
+            result = run(PROBE, mode, PROBE, other, "fd", "999", cwd=current, env=env)
+            self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_privileged_child_mode_is_rejected(self):
+        ack = self.dir / "ack"
+        ack.touch()
+        program = self.dir / "privileged"
+        program.write_bytes(PROBE.read_bytes())
+        env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack))
+        for mode in [0o4755, 0o2755]:
+            program.chmod(mode)
+            for launch in ["raw-spawn", "raw-exec"]:
+                result = run(PROBE, launch, program, "fd", "999", env=env)
+                self.assertEqual(result.returncode, 77, result.stderr)
+        program.chmod(0o755)
+        result = run(PROBE, "raw-spawn", program, "fd", "999", env=env)
+        self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
     @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
     def test_slow_output_consumer_does_not_lose_tail(self):
         for destination in ["stdout", "stderr"]:
@@ -463,6 +503,18 @@ class Silo(unittest.TestCase):
                 result = run(*command, env=dict(os.environ, PATH=str(bindir)))
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout), [requested, "caller-argument"])
+
+    def test_main_privileged_mode_is_rejected(self):
+        program = self.root / "privileged"
+        program.write_bytes(PROBE.read_bytes())
+        self.addCleanup(program.unlink)
+        for mode in [0o4755, 0o2755]:
+            program.chmod(mode)
+            command = self.command("A", "fd", "999")
+            command[-3] = program
+            result = run(*command)
+            self.assertEqual(result.returncode, 125, result.stderr)
+            self.assertIn("privileged executable unsupported", result.stderr)
 
     def test_udp_disconnect_uses_kernel_semantics(self):
         baseline = run(PROBE, "udp-disconnect", "127.0.0.1:12345")

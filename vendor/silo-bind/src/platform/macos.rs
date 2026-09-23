@@ -184,6 +184,15 @@ unsafe fn spawn_common(
     label: &str,
     fallback: PosixSpawnFn,
 ) -> c_int {
+    let changes_cwd = unsafe { super::file_actions::changes_cwd(file_actions) };
+    // Tracked file actions change cwd before exec. Do not validate
+    // one relative pathname and then let the kernel execute another target.
+    if changes_cwd
+        && !path.is_null()
+        && !unsafe { CStr::from_ptr(path) }.to_bytes().starts_with(b"/")
+    {
+        return libc::EACCES;
+    }
     let candidate = if label == "posix_spawnp" {
         let Some(candidate) = (unsafe { crate::world::path_candidate(path) }) else {
             return libc::EACCES;
@@ -209,6 +218,9 @@ unsafe fn spawn_common(
             envp as *const *const libc::c_char,
         )
     } {
+        if changes_cwd && !resolved.to_bytes().starts_with(b"/") {
+            return libc::EACCES;
+        }
         if debug_enabled() {
             let orig = unsafe { CStr::from_ptr(path) }.to_string_lossy();
             eprintln!(

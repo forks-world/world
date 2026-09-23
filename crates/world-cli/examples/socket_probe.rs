@@ -87,10 +87,22 @@ fn run() -> std::io::Result<()> {
                 .status()?;
             std::process::exit(status.code().unwrap_or(99));
         }
-        "raw-spawn" | "raw-exec" => {
+        "raw-spawn"
+        | "raw-exec"
+        | "raw-spawn-chdir"
+        | "raw-spawn-fchdir"
+        | "raw-spawn-chdir-posix"
+        | "raw-spawn-fchdir-posix" => {
             use std::{ffi::CString, os::unix::ffi::OsStrExt};
-            let argv: Vec<_> = args[2..]
-                .iter()
+            let argv: Vec<_> = std::iter::once(&args[2])
+                .chain(
+                    args[if args[1].starts_with("raw-spawn-") {
+                        4
+                    } else {
+                        3
+                    }..]
+                        .iter(),
+                )
                 .map(|s| CString::new(s.as_bytes()).unwrap())
                 .collect();
             let env: Vec<_> = std::env::vars_os()
@@ -110,15 +122,60 @@ fn run() -> std::io::Result<()> {
                     libc::execve(argv[0].as_ptr(), argp.as_ptr(), envp.as_ptr());
                     return Err(std::io::Error::last_os_error());
                 }
+                let mut actions =
+                    std::mem::MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
+                let has_actions = args[1].starts_with("raw-spawn-");
+                let directory_file = if has_actions {
+                    Some(std::fs::File::open(&args[3])?)
+                } else {
+                    None
+                };
+                if has_actions {
+                    let result = libc::posix_spawn_file_actions_init(actions.as_mut_ptr());
+                    if result != 0 {
+                        return Err(std::io::Error::from_raw_os_error(result));
+                    }
+                    let directory = CString::new(args[3].as_bytes()).unwrap();
+                    use std::os::fd::AsRawFd;
+                    let result = add_directory_action(
+                        actions.as_mut_ptr(),
+                        directory.as_ptr(),
+                        directory_file.as_ref().unwrap().as_raw_fd(),
+                        &args[1],
+                    );
+                    if result != 0 {
+                        libc::posix_spawn_file_actions_destroy(actions.as_mut_ptr());
+                        return Err(std::io::Error::from_raw_os_error(result));
+                    }
+                }
+                // Force handle growth, then move the opaque object to another
+                // stack location before spawning, as native callers can do.
+                if has_actions {
+                    for _ in 0..64 {
+                        let result =
+                            libc::posix_spawn_file_actions_adddup2(actions.as_mut_ptr(), 2, 2);
+                        if result != 0 {
+                            return Err(std::io::Error::from_raw_os_error(result));
+                        }
+                    }
+                }
+                let mut moved = if has_actions {
+                    Some(actions.assume_init())
+                } else {
+                    None
+                };
                 let mut pid = 0;
                 let result = libc::posix_spawn(
                     &mut pid,
                     argv[0].as_ptr(),
-                    std::ptr::null(),
+                    moved.as_ref().map_or(std::ptr::null(), |actions| actions),
                     std::ptr::null(),
                     argp.as_ptr().cast(),
                     envp.as_ptr().cast(),
                 );
+                if let Some(actions) = moved.as_mut() {
+                    libc::posix_spawn_file_actions_destroy(actions);
+                }
                 if result != 0 {
                     return Err(std::io::Error::from_raw_os_error(result));
                 }
@@ -204,4 +261,52 @@ fn run() -> std::io::Result<()> {
         _ => panic!("unknown probe"),
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+core::arch::global_asm!(
+    ".weak_reference _posix_spawn_file_actions_addchdir",
+    ".weak_reference _posix_spawn_file_actions_addfchdir",
+);
+unsafe fn add_directory_action(
+    actions: *mut libc::posix_spawn_file_actions_t,
+    path: *const libc::c_char,
+    fd: libc::c_int,
+    mode: &str,
+) -> libc::c_int {
+    unsafe extern "C" {
+        fn posix_spawn_file_actions_addchdir_np(
+            actions: *mut libc::posix_spawn_file_actions_t,
+            path: *const libc::c_char,
+        ) -> libc::c_int;
+        fn posix_spawn_file_actions_addfchdir_np(
+            actions: *mut libc::posix_spawn_file_actions_t,
+            fd: libc::c_int,
+        ) -> libc::c_int;
+        #[cfg(target_os = "macos")]
+        fn posix_spawn_file_actions_addchdir(
+            actions: *mut libc::posix_spawn_file_actions_t,
+            path: *const libc::c_char,
+        ) -> libc::c_int;
+        #[cfg(target_os = "macos")]
+        fn posix_spawn_file_actions_addfchdir(
+            actions: *mut libc::posix_spawn_file_actions_t,
+            fd: libc::c_int,
+        ) -> libc::c_int;
+    }
+    unsafe {
+        #[cfg(target_os = "macos")]
+        if mode.ends_with("-posix") {
+            return if mode.contains("fchdir") {
+                posix_spawn_file_actions_addfchdir(actions, fd)
+            } else {
+                posix_spawn_file_actions_addchdir(actions, path)
+            };
+        }
+        if mode.contains("fchdir") {
+            posix_spawn_file_actions_addfchdir_np(actions, fd)
+        } else {
+            posix_spawn_file_actions_addchdir_np(actions, path)
+        }
+    }
 }

@@ -218,6 +218,10 @@ fn resolve_executable(name: &std::ffi::OsStr, workdir: &Path) -> Result<PathBuf>
             path.display()
         );
     }
+    use std::os::unix::fs::PermissionsExt;
+    if path.metadata()?.permissions().mode() & 0o6000 != 0 {
+        bail!("privileged executable unsupported: setuid/setgid can suppress silo injection");
+    }
     let mut file = File::open(&path)?;
     let mut header = [0u8; 32];
     use std::io::Read;
