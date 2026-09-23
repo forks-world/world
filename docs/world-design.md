@@ -155,6 +155,12 @@ Network admin 可为本组织有效成员授予或撤销该 Network 的 operator
 
 预留只适用于已定义且能可靠计算或限制的指标；执行端不得超过授权预留量，需要追加时先完成 World 原子追加预留。首版无法准确计算或限制的物理存储指标继续展示为观测信息，不承诺由 API 预留实现硬配额。
 
+并发执行额度使用以 Execution ID 和指标为唯一键的占用账本，生命周期为 reserved → active → released：启动前原子预留，确认启动后转为活跃占用，**不是永久计入累计用量**。World Worker 通过 `GetExecution` 轮询和周期对账取得 forkfs 的持久化终态证明；自然退出、取消、命令超时或授权失效均在整个受管进程组确认退出后，在同一事务中将占用置为 released 并减少组织及 Network 的并发用量。启动前确认未执行则直接释放 reserved；结果未知、进程仍存活或节点不可达时保留原占用。
+
+终态结算以 Execution 身份、绑定 generation 和终态版本去重，重复通知/查询不重复扣减。若终态先于启动确认到达，事务直接从 reserved 结算为 released，并记录是否曾实际启动；迟到的启动事件不能把 released 恢复成 active。forkfs 保留可查询的终态回执，至少到 World 明确确认结算后及约定保留期结束，不能仅依靠易失的退出通知。
+
+若套餐另外启用“周期累计启动次数”指标，只有实际成功启动才累计一次，退出不退还该次数；它与可释放的并发额度分开建账和展示。恢复对账需覆盖终态通知丢失、乱序与重复、World 重启和取消竞争，确认运行结束后容量最终可再次使用，未知状态不提前腾出容量。
+
 ## 6. CLI 与 API
 
 CLI 使用 `world` 命令，以下是拟议交互：
@@ -510,6 +516,7 @@ CLI 提供 `world node list --network dev`、`world store list --network dev`、
 | `FillPool` / `GetPoolStatus` / `DrainPool` | 按 Store 和 Snapshot 管理预热资源 |
 | `StartExecution` / `GetExecution` / `ReadExecutionOutput` / `CancelExecution` | 在指定 Workspace 执行、查询、按偏移读取输出、请求终止 |
 | `RenewExecutionLease` | World Worker 为运行中的 Execution 续发有期限的运行授权；不是重新启动进程 |
+| `AcknowledgeExecutionSettlement` | World 在本地终态结算事务成功后幂等确认指定 Execution 终态版本，允许按保留策略清理回执 |
 | `GetOperation` / `CancelOperation` | 查询持久化操作、对可取消操作请求取消 |
 | `RefreshOperationAuthorization` | 为原 Operation 更新执行授权；不创建任务、不修改原请求和配额预留 |
 | `DecommissionStore` | 队列内停用空 Store，持久化绑定 generation tombstone 并返回可恢复的停用证明 |
@@ -544,6 +551,12 @@ World 的组织 API 可完成本地 init 的授权和额度预留，实际目录
 到期无法续期（包括网络断开）时，节点本地立即撤销该执行的网络通道并启动终止流程，在有限宽限期后强制结束整个受管进程组/容器。运行监督器必须独立于 RPC 连接存活；服务崩溃也不能留下无截止时间的写进程，依靠受管容器/进程监督和出口租约执行同一失效策略。底层环境无法提供这些能力时不开放受管 exec。Workspace 占用只有在全部受管进程确认退出后释放；异常无法杀死的进程使运行环境保持隔离和资源忙碌，并报告阻塞，不能对外宣称取消完成。
 
 Execution 记录 `lease_expires_at`、最后续期序号及 `authorization_expired` / `authorization_revoked` 等终止原因，通过现有 get API/MCP 展示；RPC 离线期间仍按本地期限处理。已有运行租约至多在规定短期窗口内有效，最终退出另受明确的终止期限约束；普通文件系统控制操作继续使用原来的安全停止/恢复规则，不因入队凭证到期中断提交。
+
+命令 `timeout` 与 RPC 等待 deadline、运行授权租约分别定义。首版 timeout 是从节点实际启动命令开始计算的最大运行时长，不包含排队等待；必须为正且不超过配置的有限上限，省略时使用明确默认值。节点在启动子进程前持久化 `started_at` 和不可延长的 `command_deadline`，监督器在二者建立后才允许命令运行。API/MCP 的 Execution 查询返回这些字段与采用的 timeout；同一 Execution 的重试、服务重启和租约续期都不得重新计时。
+
+本地监督器按命令 deadline、运行租约截止、显式取消/撤销中最先到达的停止条件执行；命令 deadline 到期时记录 `command_timeout` 并停止整个受管进程组/容器，按有限宽限期升级为强制终止。超过 deadline 后不再接受续期来延长该执行，只有确认进程全部退出才记录终态、解除 Workspace 占用并触发并发额度结算。停止原因和实际退出码/信号同时保存，不用 RPC 超时冒充命令超时；节点离线仍须执行本地 deadline。单调计时和重启恢复规则同运行租约，无法可靠恢复剩余时间时停止进程，不重置完整时长。
+
+命令超时验收需覆盖挂起命令在授权持续正常续期时仍按期停止、派生子进程、排队不消耗运行时长、RPC 断线、服务重启、时钟回拨及自然退出与 deadline 竞争；超时不允许释放尚未退出进程占用的额度。
 
 验收需在刚启动后撤权并阻断节点到 World 的通信，确认本地按期隔离并停止执行；同时覆盖正常长任务持续续期、乱序/重放续期、续期与到期竞争、RPC 服务崩溃、时钟回拨以及退出未确认时占用不释放。
 
