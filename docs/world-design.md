@@ -199,6 +199,7 @@ world operation inspect op_123
 | `POST /v1/orgs/{org}/networks/{network}/enrollments` | 管理员创建节点/Store 登记意图，返回 Enrollment 与一次性节点接入授权 |
 | `GET /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}` | 查询登记阶段及需要的本机动作 |
 | `POST /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}/complete` | 提交节点证明，幂等完成激活与绑定发布 |
+| `POST /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}/abort` | 管理员请求中止未激活登记，返回可查询的中止阶段 |
 | `POST /v1/orgs/{org}/networks/{network}/workspaces/{workspace}/executions` | 异步启动受管执行，返回启动 Operation 与 Execution 引用 |
 | `GET /v1/orgs/{org}/networks/{network}/executions/{execution}` | 查询执行状态、退出码或信号与终止原因 |
 | `GET /v1/orgs/{org}/networks/{network}/executions/{execution}/output` | 按游标和大小上限读取 stdout/stderr |
@@ -251,7 +252,7 @@ Skill 的流程约定：
 | `world_execution_get` | 指定组织、Network 和 Execution ID，查询终态、退出码/信号与终止原因 |
 | `world_execution_output` | 在相同归属下按 Execution ID、游标和大小上限读取带流标识的输出 |
 | `world_execution_cancel` | 在相同归属下以幂等键请求终止 Execution，不将受理结果解释为已经退出 |
-| `world_enrollment_create` / `world_enrollment_get` / `world_enrollment_complete` | 发起、查询及完成节点/Store 登记；不代替节点本机的管理员确认 |
+| `world_enrollment_create` / `world_enrollment_get` / `world_enrollment_complete` / `world_enrollment_abort` | 发起、查询、完成或中止未激活登记；不代替节点本机的管理员确认 |
 | `world_node_list` / `world_store_list` / `world_store_get` | 指定组织与 Network，发现节点和 StoreBinding；列表分页，Store 可按节点与状态筛选 |
 
 上下文查询和组织列表不要求组织 ID；组织级工具要求 `organization_id`；所有已有 Network 的操作要求显式 `organization_id` 和 `network_id`。MCP 不提供修改全局默认 Network 的工具，避免多个 Agent 并发时相互影响。来自启动配置的建议上下文必须解析成每次调用的显式参数。
@@ -388,7 +389,7 @@ forkfs 服务需将现有 CLI 中的 exec、信号转发、GC worker 与 pool �
 
 World 首版只提供组织管理路径：无论节点在本机还是远程，均要求已认证主体、真实组织与 Network、已登记的 StoreBinding；本机部署不等于匿名或离线独立模式。缺少这些上下文时 World CLI/MCP 返回认证或上下文错误，不合成隐式租户，不回退到 forkfs 独立入口。本节 RPC 的必填归属字段仅适用于这一受管协议，无需为离线入口填充占位值。
 
-未受管 Store 进入 World 前必须显式登记、核对 Store 身份并绑定组织与 Network；登记期间先停止独立写入者，再取得所有权、安装受管访问限制并完成状态核对，成功后才发布 StoreBinding。失败时不得发布可用绑定；状态不明时保持维护状态。受管 Store 禁止独立入口直接写入，组织服务离线也不解除该限制。首版不提供自动退管或匿名接管，避免云端授权与本地写入形成两个控制源。
+未受管 Store 进入 World 前必须显式登记、核对 Store 身份并绑定组织与 Network；登记期间先停止独立写入者，再取得所有权、安装受管访问限制并完成状态核对，成功后才发布 StoreBinding。失败时不得发布可用绑定；状态不明时保持维护状态。受管 Store 禁止独立入口直接写入，组织服务离线也不解除该限制。首版不提供已激活 Store 的自动退管或匿名接管，避免云端授权与本地写入形成两个控制源。
 
 验收需分别覆盖：未受管 Store 可通过 forkfs 自身入口离线使用；World 缺少身份或归属时拒绝请求；本机受管调用仍携带真实组织与 Network；登记时现存写入者阻止接管；登记成功后独立 CLI 不能再绕过受管服务。
 
@@ -404,11 +405,19 @@ forkfs 先取得 Store 独占所有权，确认无独立写入者，验证 schem
 
 随后 World 使用绑定节点和 Enrollment 的签名激活消息调用 forkfs `ActivateEnrollment`。forkfs 幂等确认原 prepared 状态、持有的 Store 所有权和归属后记录 active；World 收到对应证明后，在同一事务内幂等确认导入预留、发布资源映射并将绑定设为 active；响应丢失或激活结果未知时继续保留预留，只有确认未激活且无受管副作用后才可释放。普通受管 RPC 同时要求 active 绑定及操作授权，激活消息不能用于执行文件操作。跨节点重复或冲突的 Store 身份认领必须拒绝，不能把复制的 Store 当成独立身份导入。
 
-bootstrap RPC 集合为 `PrepareEnrollment`、`GetEnrollmentStatus`、`ActivateEnrollment`，使用 Enrollment ID、一次性授权或已固定的节点身份认证；未登记阶段不要求普通 RPC 的 store_id/StoreBinding，身份分配后固定关联，不能修改归属。`GetCapabilities/GetHealth` 的未绑定探测仅返回协议与服务身份，不暴露 Store 目录；其他方法仍要求受管上下文。
+bootstrap RPC 集合为 `PrepareEnrollment`、`GetEnrollmentStatus`、`ActivateEnrollment`、`AbortEnrollment`，使用 Enrollment ID、一次性授权或已固定的节点身份认证；未登记阶段不要求普通 RPC 的 store_id/StoreBinding，身份分配后固定关联，不能修改归属。`GetCapabilities/GetHealth` 的未绑定探测仅返回协议与服务身份，不暴露 Store 目录；其他方法仍要求受管上下文。
 
-重试使用原 Enrollment，重复 prepare/activate 返回原结果；激活响应丢失时通过 `GetEnrollmentStatus` 对账，不能重新初始化或另建绑定。凭证过期后由同一有权管理员为原 Enrollment 重新签发并绑定已有节点身份；过期本身不解除已准备 Store 的限制。World 暂不可达或阶段不明时保留维护状态；首版只提供继续登记和诊断，不自动退管或删除用户数据。无权恢复时需组织管理员与节点管理员共同处理，不通过直接改库跳过流程。
+重试使用原 Enrollment，重复 prepare/activate 返回原结果；激活响应丢失时通过 `GetEnrollmentStatus` 对账，不能重新初始化或另建绑定。凭证过期后由同一有权管理员为原 Enrollment 重新签发并绑定已有节点身份；过期本身不解除已准备 Store 的限制。World 暂不可达或阶段不明时保留维护状态；首版允许继续登记、诊断或显式中止尚未激活的登记，不自动退管或删除用户数据。无权恢复时需组织管理员与节点管理员共同处理，不通过直接改库跳过流程。
 
 登记验收覆盖空节点、新 Store、已有 Store、并发导入超额、反复登记去重、激活响应丢失时保留预留、存活写入者、重复认领、授权过期、prepare/activate 各阶段断线及激活响应丢失；断言绑定只在握手完成后可用、重试不重复初始化、未知状态下不开放独立写入。
+
+登记被额度或权益拒绝后，管理员可通过 abort API、`world_enrollment_abort` 或 `world enrollment abort <id>` 请求恢复独立使用。World 在事务中将原 Enrollment 置为 `aborting` 并停止发送新的激活消息，签发绑定原节点、Store 和 Enrollment 的中止授权。节点管理员使用 `forkfs enroll abort` 经本机受限 socket 确认，forkfs 在同一登记锁下执行 `AbortEnrollment`，与 ActivateEnrollment 原子互斥。
+
+forkfs 只有在本地持久化记录证明该 Enrollment 从未激活时才能中止；先持久化不可逆的 abort 决定，使所有在途或重放的旧激活消息都被拒绝，再恢复此次 prepare 修改的访问限制、释放 Store 所有权并记录 `aborted` 证明。访问限制的原值和恢复进度在 prepare/abort 日志中保存，崩溃后沿原步骤继续，不能覆盖其他管理员后来改变的权限；出现差异时保持维护状态并报告需要节点管理员处理。恢复完成前不返回中止成功。
+
+若 activate 先完成，则 abort 返回已激活并附当前状态证明，World 恢复激活对账，不能解除限制或释放导入预留；这不是已激活 Store 的退管入口。若 abort 成功，World 验证证明后幂等撤销待发布映射、释放该登记的预留并标记 aborted，保留审计与去重记录。中止不会删除既有数据或新建的空 Store，后者可作为未受管 Store 留给本机管理员。
+
+中止响应丢失通过 `GetEnrollmentStatus` 重取证明；重复 abort 返回原结果，aborted Enrollment 不能再次 prepare/activate，重新登记须使用新意图。节点离线或激活结果未知时不能仅凭超时释放限制或额度。验收补充额度拒绝后成功恢复本地使用、abort/activate 两种先后顺序、旧激活消息重放、权限恢复中崩溃和证明响应丢失。
 
 ### 资源归属与身份
 
@@ -528,6 +537,31 @@ forkfs 服务持久化 `(调用主体, Store, operation_id)` 与请求摘要。�
 授权验收需覆盖排队超过入队令牌有效期后仍能刷新并执行、刷新凭证再次过期、等待期间权限撤销、World 不可达、刷新重放、取消与刷新竞争；断言不重复预留、不绕过权限、不因正常排队时间单独判定操作失败。
 
 ### CLI、MCP 与 Skill
+
+forkfs 生命周期使用下列公开 World API，统一前缀为 `/v1/orgs/{org}/networks/{network}`。表中的资源 ID 为 World 全局 ID，`{binding}` 为 StoreBinding ID；CLI 与 MCP 均经同一应用服务调用这些路由，不自行直连管理 RPC。
+
+| 相对路由 | 主要输入与结果 / MCP 对应 |
+| --- | --- |
+| `POST /stores/{binding}/snapshots/init` | 本地源引用、名称；创建受限本机提交授权与 Operation，`world_fs_init`；内容与实际路径提交遵循前述本机握手 |
+| `POST /resources/{source}/fork` | 名称、源 revision、可选相对目标位置；返回 Operation，`world_fs_fork` |
+| `POST /workspaces/{workspace}/checkpoint` | 名称、期望 revision；返回 Operation，`world_fs_checkpoint` |
+| `GET /stores/{binding}/resources` | 类型、状态、分页游标；返回资源目录，`world_fs_list` |
+| `GET /resources/{resource}` | 返回身份、归属、状态及 revision，`world_fs_inspect`，复用通用查询 |
+| `POST /workspaces/{workspace}/diff` | 对比选项和遍历上限；返回只读遍历 Operation，`world_fs_diff` |
+| `GET /operations/{operation}/result` | 游标、大小上限；读取与 Operation 绑定的分段结果，包括结构化 diff；MCP `world_operation_result` |
+| `POST /resources/{resource}/verify` | 修复开关、期望 revision；返回 Operation 与验证报告，`world_fs_verify` |
+| `POST /resources/{resource}/discard` | 期望 revision；返回进入 trash 的 Operation，`world_fs_discard` |
+| `POST /workspaces/{workspace}/restore` | 期望 revision；返回恢复 Operation，`world_fs_restore` |
+| `GET /stores/{binding}/status` | Store 状态与观测时间，`world_fs_status` |
+| `POST /stores/{binding}/gc` | 保留期、批次上限；返回 Operation，`world_fs_gc` |
+| `GET /stores/{binding}/gc` | 回收进度和剩余项，`world_fs_gc_status` |
+| `POST /stores/{binding}/pool/fill` | Snapshot 全局 ID、目标数量；返回 Operation，`world_fs_pool_fill` |
+| `GET /stores/{binding}/pool` | 按 Snapshot 查询池状态，`world_fs_pool_status` |
+| `POST /stores/{binding}/pool/drain` | Snapshot ID、是否禁用后续补充；返回 Operation，`world_fs_pool_drain` |
+
+动作的 POST 请求支持幂等键，异步结果返回 202 和 Operation 引用；查询和结果读取仍逐次鉴权。只读 diff 使用 POST 建立遍历任务，不因此受增长权益门槛限制；forkfs 遍历结束并持久化结果后即可释放读保护，结果分页读取不重复遍历。结果保留期、截断和过期明确返回，不能以缺失结果冒充空 diff。repair=false 的 verify 走只读验证权限，允许修复则检查写权限与 revision；GC 与 pool 的变更要求 Network admin，普通资源写入要求 operator。调用者不能通过改走通用 CRUD 绕过这些角色和领域规则。
+
+init API 仅创建限定节点、绑定与 Operation 的提交授权，客户端完成同机前置检查后才请求；forkfs 的路径范围校验仍是最终依据。World API 不读取客户端目录，也不把路径在远程节点重新解释。所有 POST 成功受理后的最终完成标准仍按第 7 节执行。
 
 World CLI 沿用已实现的领域动词，增加组织、Network 和节点上下文。下例中的 Network 参数为 World 待实现扩展；init 一行要求当前选中的已认证节点与 CLI 同机，`./project` 是 CLI 工作目录下的本地源：
 
