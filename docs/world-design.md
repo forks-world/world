@@ -69,6 +69,8 @@ flowchart LR
 | Membership | `organization_id`、`principal_id`、`role` |
 | Network | `id`、`organization_id`、`name`、`status`、`runtime_binding`、`policy_version`；名称在组织内唯一 |
 | NetworkGrant | `organization_id`、`network_id`、`principal_id`、`role` |
+| Node / StoreBinding | 节点身份与 RPC 端点；Store 到组织、Network、节点的唯一绑定及登记状态，见第 10 节 |
+| Enrollment | 一次性登记意图、组织/Network、节点身份、Store 候选、有效期、阶段和证明；恢复始终沿用原 ID |
 | Resource | `id`、`organization_id`、`network_id`、`kind`、`name`、`labels`、`spec`、`spec_version`、`status`、`observed_version` |
 | ResourceRevision | 资源归属、配置版本、配置快照、操作者、时间；用于追踪变更 |
 | BillingAccount | `organization_id`、支付服务客户引用；一个组织一个账户 |
@@ -191,6 +193,9 @@ world operation inspect op_123
 | `GET/POST /v1/orgs/{org}/networks/{network}/resources` | 查询或创建资源 |
 | `GET/PATCH/DELETE /v1/orgs/{org}/networks/{network}/resources/{resource}` | 资源元信息与生命周期管理 |
 | `GET /v1/orgs/{org}/networks/{network}/operations/{operation}` | 查询异步操作 |
+| `POST /v1/orgs/{org}/networks/{network}/enrollments` | 管理员创建节点/Store 登记意图，返回 Enrollment 与一次性节点接入授权 |
+| `GET /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}` | 查询登记阶段及需要的本机动作 |
+| `POST /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}/complete` | 提交节点证明，幂等完成激活与绑定发布 |
 | `POST /v1/orgs/{org}/networks/{network}/workspaces/{workspace}/executions` | 异步启动受管执行，返回启动 Operation 与 Execution 引用 |
 | `GET /v1/orgs/{org}/networks/{network}/executions/{execution}` | 查询执行状态、退出码或信号与终止原因 |
 | `GET /v1/orgs/{org}/networks/{network}/executions/{execution}/output` | 按游标和大小上限读取 stdout/stderr |
@@ -243,6 +248,7 @@ Skill 的流程约定：
 | `world_execution_get` | 指定组织、Network 和 Execution ID，查询终态、退出码/信号与终止原因 |
 | `world_execution_output` | 在相同归属下按 Execution ID、游标和大小上限读取带流标识的输出 |
 | `world_execution_cancel` | 在相同归属下以幂等键请求终止 Execution，不将受理结果解释为已经退出 |
+| `world_enrollment_create` / `world_enrollment_get` / `world_enrollment_complete` | 发起、查询及完成节点/Store 登记；不代替节点本机的管理员确认 |
 
 上下文查询和组织列表不要求组织 ID；组织级工具要求 `organization_id`；所有已有 Network 的操作要求显式 `organization_id` 和 `network_id`。MCP 不提供修改全局默认 Network 的工具，避免多个 Agent 并发时相互影响。来自启动配置的建议上下文必须解析成每次调用的显式参数。
 
@@ -382,6 +388,24 @@ World 首版只提供组织管理路径：无论节点在本机还是远程，�
 
 验收需分别覆盖：未受管 Store 可通过 forkfs 自身入口离线使用；World 缺少身份或归属时拒绝请求；本机受管调用仍携带真实组织与 Network；登记时现存写入者阻止接管；登记成功后独立 CLI 不能再绕过受管服务。
 
+### 首次登记与 Store 接管
+
+登记使用独立 bootstrap 接口，不要求先存在 StoreBinding。组织 owner 或被授权的 Network admin 可通过拟议 `world node enroll --network dev`（或 `world_enrollment_create`）创建 Enrollment；普通 operator 不能接管 Store。Enrollment 固定组织、Network 和接入意图，使用幂等键防止重复创建；一次性短期授权经受控通道交给节点管理员，不写入日志或 Skill。
+
+节点管理员在目标机器运行拟议 `forkfs enroll`，通过本机权限受限 socket 调用 `PrepareEnrollment`，提交授权、节点公钥及自己选择的允许路径，明确选择“新建空 Store”或“接管已有 Store”。节点验证 World 授权签名及目标，World 验证一次性授权与节点持钥证明并固定节点身份；远程请求不能仅凭一段路径触发接管。新建通过 forkfs 自身初始化逻辑分配 store_id，已有 Store 则读取并核实真实身份，两者均由 forkfs 执行，无需手工改库。
+
+forkfs 先取得 Store 独占所有权，确认无独立写入者，验证 schema、资源状态和路径范围，再安装受管访问限制。无法取得锁或限制无法落实时登记失败，不发布绑定。准备成功后持久化 `prepared` 和 Enrollment ID，返回签名证明，包含节点、store_id、组织/Network、资源清单摘要及当前阶段；Store 此时保持维护状态，尚不执行普通管理操作。
+
+管理员或已授权的 World Worker 通过 complete API 提交证明。World 核验登记权限和 Network 状态，并在事务中独占认领 Store 身份、登记 Node 与处于 `activating` 的 StoreBinding，导入已有资源清单并记录现存用量。接管已有占用不被当作新增长，超额时导入后阻止后续增长；该资源清单在维护期间不能变化。
+
+随后 World 使用绑定节点和 Enrollment 的签名激活消息调用 forkfs `ActivateEnrollment`。forkfs 幂等确认原 prepared 状态、持有的 Store 所有权和归属后记录 active；World 收到对应证明后才将绑定发布为 active。普通受管 RPC 同时要求 active 绑定及操作授权，激活消息不能用于执行文件操作。跨节点重复或冲突的 Store 身份认领必须拒绝，不能把复制的 Store 当成独立身份导入。
+
+bootstrap RPC 集合为 `PrepareEnrollment`、`GetEnrollmentStatus`、`ActivateEnrollment`，使用 Enrollment ID、一次性授权或已固定的节点身份认证；未登记阶段不要求普通 RPC 的 store_id/StoreBinding，身份分配后固定关联，不能修改归属。`GetCapabilities/GetHealth` 的未绑定探测仅返回协议与服务身份，不暴露 Store 目录；其他方法仍要求受管上下文。
+
+重试使用原 Enrollment，重复 prepare/activate 返回原结果；激活响应丢失时通过 `GetEnrollmentStatus` 对账，不能重新初始化或另建绑定。凭证过期后由同一有权管理员为原 Enrollment 重新签发并绑定已有节点身份；过期本身不解除已准备 Store 的限制。World 暂不可达或阶段不明时保留维护状态；首版只提供继续登记和诊断，不自动退管或删除用户数据。无权恢复时需组织管理员与节点管理员共同处理，不通过直接改库跳过流程。
+
+登记验收覆盖空节点、新 Store、已有 Store、存活写入者、重复认领、授权过期、prepare/activate 各阶段断线及激活响应丢失；断言绑定只在握手完成后可用、重试不重复初始化、未知状态下不开放独立写入。
+
 ### 资源归属与身份
 
 | 控制面对象 | 底层映射 |
@@ -424,7 +448,7 @@ World 的组织 API 可完成本地 init 的授权和额度预留，实际目录
 
 首版不实现目录上传、暂存或跨节点导入。远程节点若已有经其本机入口创建并登记的 Snapshot，World 可继续调用 fork、查询等已授权操作；没有基线时应明确提示先在该节点本机导入。未来的数据传输协议单独设计，不由当前的 init 参数暗含。
 
-请求公共字段包括 `protocol_version`、`request_id`、`organization_id`、`network_id`、`store_id`、可选资源引用及 deadline；写操作额外包含稳定的 `operation_id`，修改已有资源时提供服务端可验证的 `expected_revision`。World 元信息版本与 forkfs 资源 revision 分开记录；forkfs revision 管理控制操作，不表示用户每次文件写入的内容版本。
+普通受管请求公共字段包括 `protocol_version`、`request_id`、`organization_id`、`network_id`、`store_id`、可选资源引用及 deadline；首次登记及最小能力探测采用上述 bootstrap 契约。写操作额外包含稳定的 `operation_id`，修改已有资源时提供服务端可验证的 `expected_revision`。World 元信息版本与 forkfs 资源 revision 分开记录；forkfs revision 管理控制操作，不表示用户每次文件写入的内容版本。
 
 响应包含请求标识、服务身份、实际资源归属、结果或稳定错误码。业务错误至少区分权限不足、版本冲突、资源忙碌、跨卷、不支持、源丢失、Store 不可达、回收已开始和结果待核实；底层错误可作为诊断字段。客户端不根据错误文本自动开启 force、copy 或跳过检查。
 
