@@ -242,6 +242,32 @@ class CLI(unittest.TestCase):
             self.assertEqual(result.returncode, 77, result.stderr)
             script.chmod(0o755)
 
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_child_injection_values_are_immutable(self):
+        ack = self.dir / "ack"
+        ack.touch()
+        env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack))
+        for key, value in [("SILO_IP", "127.77.254.253"), ("DYLD_INSERT_LIBRARIES", "/usr/lib/libSystem.B.dylib")]:
+            for mode in ["launch", "exec"]:
+                result = run(PROBE, "tamper-child", mode, key, value, env=env)
+                self.assertEqual(result.returncode, 77, result.stderr)
+                self.assertNotIn("descriptor-closed", result.stdout)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_path_script_uses_resolved_shebang(self):
+        ack = self.dir / "ack"
+        ack.touch()
+        (self.dir / "python3").symlink_to(PROBE)
+        script = self.dir / "path-script"
+        script.write_text("#!/usr/bin/env -S python3 -u\n")
+        script.chmod(0o755)
+        env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), PATH=str(self.dir))
+        result = run(PROBE, "launch", "path-script", "caller-arg", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [str(self.dir / "python3"), "-u", str(script), "caller-arg"])
+
     @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
     def test_slow_output_consumer_does_not_lose_tail(self):
         for destination in ["stdout", "stderr"]:

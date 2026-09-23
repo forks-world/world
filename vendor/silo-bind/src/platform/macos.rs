@@ -184,6 +184,17 @@ unsafe fn spawn_common(
     label: &str,
     fallback: PosixSpawnFn,
 ) -> c_int {
+    let candidate = if label == "posix_spawnp" {
+        let Some(candidate) = (unsafe { crate::world::path_candidate(path) }) else {
+            return libc::EACCES;
+        };
+        Some(candidate)
+    } else {
+        None
+    };
+    let path = candidate
+        .as_ref()
+        .map_or(path, |candidate| candidate.as_ptr());
     if !unsafe { crate::world::spawn_allowed(path, envp as *const *const libc::c_char) } {
         return libc::EACCES;
     }

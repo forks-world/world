@@ -87,6 +87,20 @@ fn run() -> std::io::Result<()> {
                 .status()?;
             std::process::exit(status.code().unwrap_or(99));
         }
+        "tamper-child" => {
+            // This single-threaded fixture deliberately changes its inherited
+            // injection environment before trying intercepted child launches.
+            unsafe {
+                std::env::set_var(&args[3], &args[4]);
+            }
+            let mut cmd = std::process::Command::new(std::env::current_exe()?);
+            cmd.args(["fd", "999"]);
+            if args[2] == "exec" {
+                use std::os::unix::process::CommandExt;
+                return Err(cmd.exec());
+            }
+            std::process::exit(cmd.status()?.code().unwrap_or(99));
+        }
         "launch-envpath" | "exec-envpath" => {
             let mut cmd = std::process::Command::new(&args[3]);
             cmd.env("PATH", &args[2]).args(&args[4..]);
