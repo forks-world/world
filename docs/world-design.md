@@ -137,7 +137,7 @@ flowchart LR
 
 1. Webhook 验证签名，以支付服务事件 ID 去重，持久化后再确认接收。浏览器跳转成功不能作为开通依据。
 2. 针对乱序事件，查询支付服务的当前订阅状态并串行更新同一订阅；后台定期对账修复漏事件和不同步状态。
-3. 所有增长操作都须原子预留配额，包括创建、扩容、混合更新的增长部分、重新消耗额度的 restore，以及启用后会消耗受限指标的 pool 或执行。服务端基于受保护的资源版本计算各指标正增量，在同一事务中校验组织与 Network 的“已确认用量 + 未结算预留 + 本次预留”不超过各自上限，写入 QuotaReservation、期望变更、Operation 和 outbox。计数更新须使用行锁或条件更新，不能先读剩余额度再独立写入。
+3. 所有增长操作都须原子预留配额，包括创建、扩容、Store 登记导入、混合更新的增长部分、重新消耗额度的 restore，以及启用后会消耗受限指标的 pool 或执行。服务端基于受保护的资源版本计算各指标正增量，在同一事务中校验组织与 Network 的“已确认用量 + 未结算预留 + 本次预留”不超过各自上限，写入 QuotaReservation、期望变更、Operation 和 outbox。计数更新须使用行锁或条件更新，不能先读剩余额度再独立写入。
 4. 每个 Operation 的预留与结算幂等。操作成功后将预留转为已确认用量；失败或取消只有在执行端证明相应增长未发生或已补偿后才释放。部分成功按已确认的实际变化结算，未核实部分继续占用预留。结果未知时先向执行端查询，不能因超时、重试或预留到期自动释放。
 5. 用量事件只能来自受信任的采集端，依据稳定事件 ID 去重；保存原始事件与按周期汇总结果。迟到事件进入明确的周期调整流程。
 
@@ -190,6 +190,9 @@ world operation inspect op_123
 | `GET /v1/orgs` | 当前主体可见组织 |
 | `GET/POST /v1/orgs/{org}/networks` | 列出或创建 Network |
 | `GET/DELETE /v1/orgs/{org}/networks/{network}` | 查询或删除 Network |
+| `GET /v1/orgs/{org}/networks/{network}/nodes` | 分页查询该 Network 可见的节点身份、能力与健康状态 |
+| `GET /v1/orgs/{org}/networks/{network}/stores` | 分页查询 StoreBinding，支持 node_id 和状态筛选 |
+| `GET /v1/orgs/{org}/networks/{network}/stores/{store_binding}` | 查询指定绑定的节点、底层 Store 身份、状态与可用能力 |
 | `GET/POST /v1/orgs/{org}/networks/{network}/resources` | 查询或创建资源 |
 | `GET/PATCH/DELETE /v1/orgs/{org}/networks/{network}/resources/{resource}` | 资源元信息与生命周期管理 |
 | `GET /v1/orgs/{org}/networks/{network}/operations/{operation}` | 查询异步操作 |
@@ -249,6 +252,7 @@ Skill 的流程约定：
 | `world_execution_output` | 在相同归属下按 Execution ID、游标和大小上限读取带流标识的输出 |
 | `world_execution_cancel` | 在相同归属下以幂等键请求终止 Execution，不将受理结果解释为已经退出 |
 | `world_enrollment_create` / `world_enrollment_get` / `world_enrollment_complete` | 发起、查询及完成节点/Store 登记；不代替节点本机的管理员确认 |
+| `world_node_list` / `world_store_list` / `world_store_get` | 指定组织与 Network，发现节点和 StoreBinding；列表分页，Store 可按节点与状态筛选 |
 
 上下文查询和组织列表不要求组织 ID；组织级工具要求 `organization_id`；所有已有 Network 的操作要求显式 `organization_id` 和 `network_id`。MCP 不提供修改全局默认 Network 的工具，避免多个 Agent 并发时相互影响。来自启动配置的建议上下文必须解析成每次调用的显式参数。
 
@@ -396,15 +400,15 @@ World 首版只提供组织管理路径：无论节点在本机还是远程，�
 
 forkfs 先取得 Store 独占所有权，确认无独立写入者，验证 schema、资源状态和路径范围，再安装受管访问限制。无法取得锁或限制无法落实时登记失败，不发布绑定。准备成功后持久化 `prepared` 和 Enrollment ID，返回签名证明，包含节点、store_id、组织/Network、资源清单摘要及当前阶段；Store 此时保持维护状态，尚不执行普通管理操作。
 
-管理员或已授权的 World Worker 通过 complete API 提交证明。World 核验登记权限和 Network 状态，并在事务中独占认领 Store 身份、登记 Node 与处于 `activating` 的 StoreBinding，导入已有资源清单并记录现存用量。接管已有占用不被当作新增长，超额时导入后阻止后续增长；该资源清单在维护期间不能变化。
+管理员或已授权的 World Worker 通过 complete API 提交证明。World 核验登记权限和 Network 状态，并在事务中独占认领 Store 身份、登记 Node 与处于 `activating` 的 StoreBinding，根据受保护的资源清单计算导入给组织和 Network 带来的各项正增量，按第 5 节在同一事务内校验权益并原子预留额度，再写入待激活资源映射。已有文件不等于已占用 World 额度；任何管理员登记都不能豁免这次增长准入，新 Store 也需预留受限的 Store 数量等指标。清单在维护期间不能变化，其摘要绑定激活消息。额度不足时不进入 activating、不发送激活消息，Enrollment 保留可诊断的待准入状态，管理员可在额度可用后重试。
 
-随后 World 使用绑定节点和 Enrollment 的签名激活消息调用 forkfs `ActivateEnrollment`。forkfs 幂等确认原 prepared 状态、持有的 Store 所有权和归属后记录 active；World 收到对应证明后才将绑定发布为 active。普通受管 RPC 同时要求 active 绑定及操作授权，激活消息不能用于执行文件操作。跨节点重复或冲突的 Store 身份认领必须拒绝，不能把复制的 Store 当成独立身份导入。
+随后 World 使用绑定节点和 Enrollment 的签名激活消息调用 forkfs `ActivateEnrollment`。forkfs 幂等确认原 prepared 状态、持有的 Store 所有权和归属后记录 active；World 收到对应证明后，在同一事务内幂等确认导入预留、发布资源映射并将绑定设为 active；响应丢失或激活结果未知时继续保留预留，只有确认未激活且无受管副作用后才可释放。普通受管 RPC 同时要求 active 绑定及操作授权，激活消息不能用于执行文件操作。跨节点重复或冲突的 Store 身份认领必须拒绝，不能把复制的 Store 当成独立身份导入。
 
 bootstrap RPC 集合为 `PrepareEnrollment`、`GetEnrollmentStatus`、`ActivateEnrollment`，使用 Enrollment ID、一次性授权或已固定的节点身份认证；未登记阶段不要求普通 RPC 的 store_id/StoreBinding，身份分配后固定关联，不能修改归属。`GetCapabilities/GetHealth` 的未绑定探测仅返回协议与服务身份，不暴露 Store 目录；其他方法仍要求受管上下文。
 
 重试使用原 Enrollment，重复 prepare/activate 返回原结果；激活响应丢失时通过 `GetEnrollmentStatus` 对账，不能重新初始化或另建绑定。凭证过期后由同一有权管理员为原 Enrollment 重新签发并绑定已有节点身份；过期本身不解除已准备 Store 的限制。World 暂不可达或阶段不明时保留维护状态；首版只提供继续登记和诊断，不自动退管或删除用户数据。无权恢复时需组织管理员与节点管理员共同处理，不通过直接改库跳过流程。
 
-登记验收覆盖空节点、新 Store、已有 Store、存活写入者、重复认领、授权过期、prepare/activate 各阶段断线及激活响应丢失；断言绑定只在握手完成后可用、重试不重复初始化、未知状态下不开放独立写入。
+登记验收覆盖空节点、新 Store、已有 Store、并发导入超额、反复登记去重、激活响应丢失时保留预留、存活写入者、重复认领、授权过期、prepare/activate 各阶段断线及激活响应丢失；断言绑定只在握手完成后可用、重试不重复初始化、未知状态下不开放独立写入。
 
 ### 资源归属与身份
 
@@ -421,6 +425,18 @@ bootstrap RPC 集合为 `PrepareEnrollment`、`GetEnrollmentStatus`、`ActivateE
 首版每个受管 Store 只归属一个 Network；一个 Network 可有多个节点/卷上的 Store。源 Snapshot、Workspace 和目标必须在相同归属下，首版 fork 仅在同一 Store 内进行。跨卷克隆能力需探测；copy 是显式选择，并预留不同的时间与容量预算。
 
 Store 目录分开只是元信息和生命周期隔离。相同宿主用户仍可能访问其他目录，必须另由受管运行环境提供文件可见性和网络边界，不能把独立 Store 当成完整租户隔离。
+
+### Store 发现与选择
+
+World 公共接口以 `store_binding_id` 标识归属已验证的绑定，区别于 forkfs 在 RPC 中使用的底层 `store_id`。列表和 get 只返回调用方获授权的 Network 记录，包含绑定 ID、节点 ID、底层 Store 身份和登记状态；普通发现不返回宿主敏感路径或凭证。Enrollment 完成结果返回绑定 ID，后续会话也可通过 `world_store_list` 重新发现。
+
+CLI 提供 `world node list --network dev`、`world store list --network dev`、`world store inspect <binding-id> --network dev`，并支持 `world context use --org acme --network dev --store <binding-id>`。文件操作的 `--store <binding-id>` 覆盖本地上下文；在 World CLI 中该参数始终表示绑定 ID，不沿用 forkfs 调试 CLI 的目录含义。上下文中的 Store 与显式 Network 不匹配时直接报错，不隐式切换归属。
+
+`world_fs_init`、Store 范围的 list/status/GC/pool 工具及其 API 请求要求 `store_binding_id`；CLI 的 init、GC、pool 和裸 `S1/W1` 操作需通过参数或已保存上下文明确 Store，缺失时返回 `STORE_CONTEXT_REQUIRED`，不自动挑选首项。Network 级资源目录查询可跨 Store 聚合，但每条结果必须携带绑定 ID 和全局资源 ID。
+
+对已有全局资源 ID 的 inspect、diff、fork、checkpoint、discard、restore、exec，World 从已授权元信息映射 Store；调用方同时提供绑定时必须一致，否则拒绝。fork 首版目标沿用来源 Store，不允许用另一绑定隐式跨 Store 克隆。创建 Snapshot 的资源 API/应用服务同样要求绑定，校验 active、归属和本机条件后，将绑定映射为正确节点与底层 `store_id`，不能直接信任客户端自报的 RPC 路由。
+
+多 Store 验收覆盖同一 Network 两个 Store 都有 S1/W1、未设置 Store 的 init、跨 Network 的陈旧上下文、全局资源与显式绑定冲突、分页后重新选择；断言调用路由唯一且不会落到默认 Store。
 
 ### RPC 服务契约
 
@@ -516,15 +532,17 @@ forkfs 服务持久化 `(调用主体, Store, operation_id)` 与请求摘要。�
 World CLI 沿用已实现的领域动词，增加组织、Network 和节点上下文。下例中的 Network 参数为 World 待实现扩展；init 一行要求当前选中的已认证节点与 CLI 同机，`./project` 是 CLI 工作目录下的本地源：
 
 ```sh
-world fs init ./project --network dev
-world fs fork --from S1 --network dev
-world fs inspect W1 --network dev
-world exec W1 --network dev -- make test
-world fs diff W1 --network dev
-world fs checkpoint W1 --name tested --network dev
-world fs discard W1 --network dev
-world fs restore W1 --network dev
-world fs gc --status --network dev
+world store list --network dev
+world context use --org acme --network dev --store sb_local
+world fs init ./project --network dev --store sb_local
+world fs fork --from S1 --network dev --store sb_local
+world fs inspect W1 --network dev --store sb_local
+world exec W1 --network dev --store sb_local -- make test
+world fs diff W1 --network dev --store sb_local
+world fs checkpoint W1 --name tested --network dev --store sb_local
+world fs discard W1 --network dev --store sb_local
+world fs restore W1 --network dev --store sb_local
+world fs gc --status --network dev --store sb_local
 ```
 
 `S1/W1` 简写要求上下文能唯一确定 Store；否则要求明确选择，不能任取同名对象。MCP 使用全局 Resource ID 和显式组织、Network，不直接接受裸 `W1` 作为完整身份。
