@@ -224,7 +224,7 @@ world operation inspect op_123
 | `POST /v1/orgs/{org}/networks/{network}/enrollments` | 管理员创建节点/Store 登记意图，只返回 Enrollment、状态与无授权能力的 handoff 引用 |
 | `GET /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}` | 查询登记阶段及需要的本机动作 |
 | `POST /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}/complete` | 提交节点证明，幂等完成激活与绑定发布 |
-| `POST /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}/abort` | 管理员请求中止未激活登记，返回可查询的中止阶段 |
+| `POST /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}/abort` | 管理员请求中止未激活登记，返回中止阶段及无授权能力的 abort handoff 引用 |
 | `POST /v1/orgs/{org}/networks/{network}/enrollments/{enrollment}/renew` | 管理员为原登记创建续期 handoff，只返回引用，固定原归属与已确认节点身份 |
 | `POST /v1/orgs/{org}/networks/{network}/workspaces/{workspace}/executions` | 异步启动受管执行，返回启动 Operation 与 Execution 引用 |
 | `GET /v1/orgs/{org}/networks/{network}/executions/{execution}` | 查询执行状态、退出码或信号与终止原因 |
@@ -438,17 +438,23 @@ handoff 引用只是随机关联 ID，不是 bearer credential，持有它不能
 
 节点随后通过 `/redeem` 证明持有获批私钥，取得仅对该节点密钥可解密的短期授权；领取协议绑定 handoff、候选和防重放挑战。凭证在任何 PrepareEnrollment 之前就绑定已批准节点，未获批的竞争候选不能替换该身份。重复领取只返回同一节点可解密的原交付结果，不延长有效期；过期则用原 Enrollment 发起新续期 handoff。候选提交、批准与领取都是独立身份校验端点，不开放为 MCP 工具；实际解密材料仅交给节点服务，不经过模型上下文、CLI stdout 或通用 MCP 结果序列化。
 
-MCP 对 create/renew 的输出 schema 采用字段白名单，仅允许 enrollment_id、handoff_id、状态和不含秘密的人工操作提示。即使底层响应意外附带 credential，也不得透传到 structuredContent、文本、错误或调试日志。CLI 的 JSON 输出遵循同一规则。验收应扫描全部模型可见内容，覆盖创建、续期、错误及重试，确认不包含凭证；泄露 handoff 引用不能领取授权，错误节点私钥和 Agent 调用 approve 均被拒绝。
+MCP 对 create/renew/abort 的输出 schema 采用字段白名单，仅允许 enrollment_id、handoff_id、状态和不含秘密的人工操作提示。即使底层响应意外附带 credential，也不得透传到 structuredContent、文本、错误或调试日志。CLI 的 JSON 输出遵循同一规则。验收应扫描全部模型可见内容，覆盖创建、续期、中止、错误及重试，确认不包含凭证；泄露 handoff 引用不能领取授权，错误节点私钥和 Agent 调用 approve 均被拒绝。
 
 节点管理员先通过上述 handoff 取得绑定该节点的授权，再在目标机器运行拟议 `forkfs enroll`，通过本机权限受限 socket 调用 `PrepareEnrollment`，提交授权、节点公钥及自己选择的允许路径，明确选择“新建空 Store”或“接管已有 Store”。节点验证 World 授权签名及目标，World 验证一次性授权与节点持钥证明并固定节点身份；远程请求不能仅凭一段路径触发接管。新建通过 forkfs 自身初始化逻辑分配 store_id，已有 Store 则读取并核实真实身份，两者均由 forkfs 执行，无需手工改库。
 
 forkfs 先取得 Store 独占所有权，确认无独立写入者，验证 schema、资源状态和路径范围，再安装受管访问限制。无法取得锁或限制无法落实时登记失败，不发布绑定。准备成功后持久化 `prepared` 和 Enrollment ID，返回签名证明，包含节点、store_id、组织/Network、资源清单摘要及当前阶段；Store 此时保持维护状态，尚不执行普通管理操作。
 
+准备证明同时包含不可变 inventory_id、schema 版本、规范编码版本、条目总数、按指标汇总和整个清单的摘要。bootstrap `GetEnrollmentInventory(enrollment_id, inventory_id, cursor, limit)` 允许经过认证的 World 登记 Worker 在未激活阶段分页读取该清单；服务验证签名授权限定原 Enrollment、节点与读取方法，不依赖 active StoreBinding，也不开放为 Agent 的任意 Store 列表。每页返回 inventory_id、连续位置、下一游标、末页标识和资源记录，至少覆盖 kind/local_id、状态、来源依赖和计量字段，不返回文件内容或凭证。
+
+forkfs 在维护状态下持久化规范排序的完整清单，分页游标只属于该清单，不随 GC 或重试变化。World complete 先将全部页放入不可见的登记暂存区，检查数量、连续位置、重复身份和依赖完整性，再按规定编码计算总摘要并匹配准备证明；自行计算可强制指标的额度增量，与签名汇总对照。缺页、过期或摘要不符时不得进行配额准入和激活，只报告需要重新准备或恢复。激活事务只引用已验证的完整 inventory_id/摘要，forkfs 激活前也核对其仍是当前保护的清单，避免使用不同版本的资源快照。
+
+GetEnrollmentInventory 的分页与续读跨服务重启保持稳定，直到登记进入终态并满足审计保留策略；访问权限每次重查。验收覆盖多页清单、缺页/重复页、篡改摘要、未知 schema、断线续读及清单失效，证明 World 无需提前激活就能正确建映射和预留额度。
+
 管理员或已授权的 World Worker 通过 complete API 提交证明。World 核验登记权限和 Network 状态，并在事务中独占认领 Store 身份、登记 Node 与处于 `activating` 的 StoreBinding 及其 generation（由 forkfs 的持久化绑定计数递增分配并纳入准备证明），根据受保护的资源清单计算导入给组织和 Network 带来的各项正增量，按第 5 节在同一事务内校验权益并原子预留额度，再写入待激活资源映射。已有文件不等于已占用 World 额度；任何管理员登记都不能豁免这次增长准入，新 Store 也需预留受限的 Store 数量等指标。清单在维护期间不能变化，其摘要绑定激活消息。额度不足时不进入 activating、不发送激活消息，Enrollment 保留可诊断的待准入状态，管理员可在额度可用后重试。
 
 随后 World 使用绑定节点和 Enrollment 的签名激活消息调用 forkfs `ActivateEnrollment`。forkfs 幂等确认原 prepared 状态、持有的 Store 所有权和归属后记录 active；World 收到对应证明后，在同一事务内幂等确认导入预留、发布资源映射并将绑定设为 active；响应丢失或激活结果未知时继续保留预留，只有确认未激活且无受管副作用后才可释放。普通受管 RPC 同时要求 active 绑定及操作授权，激活消息不能用于执行文件操作。跨节点重复或冲突的 Store 身份认领必须拒绝，不能把复制的 Store 当成独立身份导入。
 
-bootstrap RPC 集合为 `PrepareEnrollment`、`GetEnrollmentStatus`、`ActivateEnrollment`、`AbortEnrollment`，使用 Enrollment ID、一次性授权或已固定的节点身份认证；未登记阶段不要求普通 RPC 的 store_id/StoreBinding，身份分配后固定关联，不能修改归属。`GetCapabilities/GetHealth` 的未绑定探测仅返回协议与服务身份，不暴露 Store 目录；其他方法仍要求受管上下文。
+bootstrap RPC 集合为 `PrepareEnrollment`、`GetEnrollmentStatus`、`GetEnrollmentInventory`、`ActivateEnrollment`、`AbortEnrollment`，使用 Enrollment ID、一次性授权或已固定的节点身份认证；未登记阶段不要求普通 RPC 的 store_id/StoreBinding，身份分配后固定关联，不能修改归属。`GetCapabilities/GetHealth` 的未绑定探测仅返回协议与服务身份，不暴露 Store 目录；其他方法仍要求受管上下文。
 
 重试使用原 Enrollment，重复 prepare/activate 返回原结果；激活响应丢失时通过 `GetEnrollmentStatus` 对账，不能重新初始化或另建绑定。凭证过期后由同一有权管理员为原 Enrollment 重新签发并绑定已有节点身份；过期本身不解除已准备 Store 的限制。World 暂不可达或阶段不明时保留维护状态；首版允许继续登记、诊断或显式中止尚未激活的登记，不自动退管或删除用户数据。无权恢复时需组织管理员与节点管理员共同处理，不通过直接改库跳过流程。
 
@@ -456,11 +462,13 @@ bootstrap RPC 集合为 `PrepareEnrollment`、`GetEnrollmentStatus`、`ActivateE
 
 登记验收覆盖空节点、新 Store、已有 Store、并发导入超额、反复登记去重、激活响应丢失时保留预留、存活写入者、重复认领、授权过期、prepare/activate 各阶段断线及激活响应丢失；断言绑定只在握手完成后可用、重试不重复初始化、未知状态下不开放独立写入。
 
-登记被额度或权益拒绝后，管理员可通过 abort API、`world_enrollment_abort` 或 `world enrollment abort <id>` 请求恢复独立使用。World 在事务中将原 Enrollment 置为 `aborting` 并停止发送新的激活消息，签发绑定原节点、Store 和 Enrollment 的中止授权。节点管理员使用 `forkfs enroll abort` 经本机受限 socket 确认，forkfs 在同一登记锁下执行 `AbortEnrollment`，与 ActivateEnrollment 原子互斥。
+登记被额度或权益拒绝后，管理员可通过 abort API、`world_enrollment_abort` 或 `world enrollment abort <id>` 请求恢复独立使用。World 在事务中将原 Enrollment 置为 `aborting` 并停止发送新的激活消息，创建 purpose=abort、固定原节点公钥/Store/Enrollment 的 handoff。abort API/MCP/CLI 只返回引用与状态，实际中止授权经同一 handoff approve/redeem 交付；现有节点身份固定，禁止提交替代候选。节点管理员使用 `forkfs enroll abort` 经本机受限 socket 确认，forkfs 在同一登记锁下执行 `AbortEnrollment`，与 ActivateEnrollment 原子互斥。
 
 forkfs 只有在本地持久化记录证明该 Enrollment 从未激活时才能中止；先持久化不可逆的 abort 决定，使所有在途或重放的旧激活消息都被拒绝，再恢复此次 prepare 修改的访问限制、释放 Store 所有权并记录 `aborted` 证明。访问限制的原值和恢复进度在 prepare/abort 日志中保存，崩溃后沿原步骤继续，不能覆盖其他管理员后来改变的权限；出现差异时保持维护状态并报告需要节点管理员处理。恢复完成前不返回中止成功。
 
 若 activate 先完成，则 abort 返回已激活并附当前状态证明，World 恢复激活对账，不能解除限制或释放导入预留；这不是已激活 Store 的退管入口。若 abort 成功，World 验证证明后幂等撤销待发布映射、释放该登记的预留并标记 aborted，保留审计与去重记录。中止不会删除既有数据或新建的空 Store，后者可作为未受管 Store 留给本机管理员。
+
+handoff 和签名授权均固定 purpose（prepare、renew 或 abort）；redeem 重新检查 Enrollment 当前阶段，forkfs 拒绝将一种用途的凭证用于其他 RPC。aborting 时只交付 abort 用途；原 create/renew handoff 即使迟到批准或重放也不能领取 prepare 授权。中止凭证过期时，具备原权限的管理员再次调用 abort 可用新幂等键为同一 Enrollment 新建 abort handoff，不改变阶段或生成第二个 Store；重复相同键返回原引用。该流程不使用禁止在 aborting 阶段调用的通用 renew。验收补充额度拒绝后完整领取中止凭证并恢复本地使用、凭证过期重取、错误节点领取、用途混淆和模型输出中无秘密。
 
 中止响应丢失通过 `GetEnrollmentStatus` 重取证明；重复 abort 返回原结果，aborted Enrollment 不能再次 prepare/activate，重新登记须使用新意图。节点离线或激活结果未知时不能仅凭超时释放限制或额度。验收补充额度拒绝后成功恢复本地使用、abort/activate 两种先后顺序、旧激活消息重放、权限恢复中崩溃和证明响应丢失。
 
