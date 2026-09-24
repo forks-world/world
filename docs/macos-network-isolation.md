@@ -93,4 +93,4 @@ WORLD_SILO_INTEGRATION=1 python3 -m unittest discover -s tests -v
 
 原生测试使用没有 World 依赖的普通 Rust socket 程序。测试先确认宿主能连接，再验证 Seatbelt 权限拒绝，覆盖继承 fd、标准输入、子进程、HTTP/CONNECT/TLS、退出和超时。非特权测试也检查动态库实际注入及禁止宿主回退。
 
-silo 完整测试显式创建并清理两个真实 macOS loopback 别名；检查同端口监听、各自 localhost 连接、双栈/通配绑定、UDP、子进程继承、其他 World 地址拒绝、没有监听者时不回退宿主，以及停止 A 后 B 的同端口服务仍正常。没有管理员能力时这些用例明确标为未运行，不能冒充验证通过。CI 的 macOS job 必须开启完整测试；Linux 仅验证可移植逻辑和不支持平台时拒绝执行。
+silo 完整测试显式创建并清理两个真实 macOS loopback 别名；检查同端口监听、各自 localhost 连接、双栈/通配绑定、UDP、子进程继承、其他 World 地址拒绝、没有监听者时不回退宿主，以及停止 A 后 B 的同端口服务仍正常。没有管理员能力时这些用例明确标为未运行，不能冒充验证通过。CI 的 macOS job 必须开启完整测试；Linux 后端的测试见 [Linux 网络运行时](linux-network-isolation.md)。

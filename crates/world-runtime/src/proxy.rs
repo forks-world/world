@@ -39,8 +39,69 @@ struct Service {
     tasks: TaskTracker,
 }
 
+/// Resolved routes and credential, ready to serve on listeners created later,
+/// e.g. inside a workload network namespace.
+pub struct Prepared {
+    routes: HashMap<String, Vec<SocketAddr>>,
+    credential: String,
+}
+
+impl Prepared {
+    /// Contains an execution credential. Never log this value.
+    pub fn url(&self, port: u16) -> String {
+        format!("http://world:{}@127.0.0.1:{port}", self.credential)
+    }
+    pub fn serve(self, port: u16, listeners: Vec<std::net::TcpListener>) -> Result<Proxy> {
+        let listeners = listeners
+            .into_iter()
+            .map(|listener| {
+                listener.set_nonblocking(true)?;
+                TcpListener::from_std(listener)
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let authorization = format!(
+            "Basic {}",
+            STANDARD.encode(format!("world:{}", self.credential))
+        );
+        let cancel = CancellationToken::new();
+        let tasks = TaskTracker::new();
+        let service = Arc::new(Service {
+            routes: self.routes,
+            authorization,
+            cancel: cancel.clone(),
+            tasks: tasks.clone(),
+        });
+        let mut accepts = Vec::new();
+        for listener in listeners {
+            let service = service.clone();
+            accepts.push(tokio::spawn(async move {
+                loop {
+                    let accepted=tokio::select! { biased; _=service.cancel.cancelled()=>break, accepted=listener.accept()=>accepted };
+                    let Ok((stream,_))=accepted else {service.cancel.cancel();break};
+                    let state=service.clone();
+                    service.tasks.spawn(async move {
+                        let handler=state.clone();
+                        let connection=hyper::server::conn::http1::Builder::new()
+                            .max_buf_size(32*1024)
+                            .serve_connection(TokioIo::new(stream),service_fn(move |req|handler.clone().handle(req)))
+                            .with_upgrades();
+                        tokio::select! { _=state.cancel.cancelled()=>{}, _=connection=>{} }
+                    });
+                }
+            }));
+        }
+        Ok(Proxy {
+            port,
+            credential: self.credential,
+            cancel,
+            accepts,
+            tasks,
+        })
+    }
+}
+
 impl Proxy {
-    pub async fn start(policy: &Policy) -> Result<Self> {
+    pub async fn prepare(policy: &Policy) -> Result<Prepared> {
         policy.validate()?;
         let mut routes = HashMap::new();
         for endpoint in &policy.allow {
@@ -63,50 +124,20 @@ impl Proxy {
             };
             routes.insert(authority(&host, endpoint.port), addresses);
         }
-        let v4 = TcpListener::bind("127.0.0.1:0").await?;
-        let port = v4.local_addr()?.port();
-        let v6 = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).await?;
         let mut secret = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut secret);
         let credential = secret
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
-        let authorization = format!("Basic {}", STANDARD.encode(format!("world:{credential}")));
-        let cancel = CancellationToken::new();
-        let tasks = TaskTracker::new();
-        let service = Arc::new(Service {
-            routes,
-            authorization,
-            cancel: cancel.clone(),
-            tasks: tasks.clone(),
-        });
-        let mut accepts = Vec::new();
-        for listener in [v4, v6] {
-            let service = service.clone();
-            accepts.push(tokio::spawn(async move {
-                loop {
-                    let accepted=tokio::select! { biased; _=service.cancel.cancelled()=>break, accepted=listener.accept()=>accepted };
-                    let Ok((stream,_))=accepted else {service.cancel.cancel();break};
-                    let state=service.clone();
-                    service.tasks.spawn(async move {
-                        let handler=state.clone();
-                        let connection=hyper::server::conn::http1::Builder::new()
-                            .max_buf_size(32*1024)
-                            .serve_connection(TokioIo::new(stream),service_fn(move |req|handler.clone().handle(req)))
-                            .with_upgrades();
-                        tokio::select! { _=state.cancel.cancelled()=>{}, _=connection=>{} }
-                    });
-                }
-            }));
-        }
-        Ok(Self {
-            port,
-            credential,
-            cancel,
-            accepts,
-            tasks,
-        })
+        Ok(Prepared { routes, credential })
+    }
+    pub async fn start(policy: &Policy) -> Result<Self> {
+        let prepared = Self::prepare(policy).await?;
+        let v4 = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = v4.local_addr()?.port();
+        let v6 = std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port))?;
+        prepared.serve(port, vec![v4, v6])
     }
     pub fn port(&self) -> u16 {
         self.port

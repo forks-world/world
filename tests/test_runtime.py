@@ -1,4 +1,5 @@
-"""Real native-process checks. Silo tests require configured macOS loopback aliases.
+"""Real native-process checks. macOS silo tests require configured loopback
+aliases; Linux tests require unprivileged user namespaces.
 
 cargo build --workspace && cargo build --workspace --examples
 python3 -m unittest discover -s tests -v
@@ -23,6 +24,12 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORLD = ROOT / "target/debug/world"
 PROBE = ROOT / "target/debug/examples/socket_probe"
+MACOS = sys.platform == "darwin"
+LINUX = sys.platform.startswith("linux")
+SANDBOX = MACOS or LINUX
+# Seatbelt refuses denied operations (EPERM). A Linux network namespace has no
+# route to host listeners: TCP is refused, while seccomp refuses Unix sockets.
+DIAL_DENIED = 77 if MACOS else 78
 
 
 def run(*args, **kwargs):
@@ -65,7 +72,7 @@ class CLI(unittest.TestCase):
     def test_invalid_policy_and_platform(self):
         self.policy.write_text('{"network_id":"test","typo":true}')
         self.assertEqual(self.network("/bin/echo", "never").returncode, 125)
-        if sys.platform != "darwin":
+        if not SANDBOX:
             self.policy.write_text('{"network_id":"test"}')
             result = self.network("/bin/echo", "never")
             self.assertEqual(result.returncode, 125)
@@ -94,7 +101,7 @@ class CLI(unittest.TestCase):
             self.assertEqual(result.returncode, 77, result.stderr)
         self.assertEqual(self.network(PROBE, "serve", "127.0.0.1:0", "denied").returncode, 77)
 
-    @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
+    @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_exit_timeout_and_open_stdin(self):
         self.assertEqual(self.network("/bin/sh", "-c", "exit 42").returncode, 42)
         result = self.network("/bin/echo", "closed-stdin-ok", preexec_fn=lambda: os.close(0))
@@ -107,7 +114,7 @@ class CLI(unittest.TestCase):
             os.close(r)
             os.close(w)
 
-    @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
+    @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_fd_and_host_write_guards(self):
         first, second = socket.socketpair()
         with first as sock, second:
@@ -120,9 +127,10 @@ class CLI(unittest.TestCase):
         with tempfile.TemporaryDirectory() as outside:
             result = self.network(PROBE, "write", str(pathlib.Path(outside) / "escape"))
             self.assertEqual(result.returncode, 77, result.stderr)
-        self.assertNotEqual(self.network("/bin/launchctl", "list").returncode, 0)
+        if MACOS:
+            self.assertNotEqual(self.network("/bin/launchctl", "list").returncode, 0)
 
-    @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
+    @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_http_proxy_and_connect(self):
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
@@ -141,7 +149,7 @@ class CLI(unittest.TestCase):
                 for extra in [[], ["--proxytunnel"]]:
                     result = self.network("/usr/bin/curl", "-fsS", *extra, f"http://127.0.0.1:{port}")
                     self.assertEqual((result.returncode, result.stdout), (0, "allowed"), result.stderr)
-                self.assertEqual(self.network(PROBE, "dial", f"127.0.0.1:{port}").returncode, 77)
+                self.assertEqual(self.network(PROBE, "dial", f"127.0.0.1:{port}").returncode, DIAL_DENIED)
                 result = self.network("/usr/bin/curl", "-sS", "http://127.0.0.1:1")
                 self.assertIn("destination denied", result.stdout)
             finally:
@@ -346,7 +354,7 @@ class CLI(unittest.TestCase):
         result = run(PROBE, "raw-spawn", program, "fd", "999", env=env)
         self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
 
-    @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
+    @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_slow_output_consumer_does_not_lose_tail(self):
         for destination in ["stdout", "stderr"]:
             r, w = os.pipe()
@@ -380,7 +388,7 @@ class CLI(unittest.TestCase):
                 if w is not None:
                     os.close(w)
 
-    @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
+    @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_https_connect(self):
         config = self.dir / "openssl.cnf"
         config.write_text("[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=127.0.0.1\n[ext]\nsubjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:TRUE\n")
@@ -391,6 +399,8 @@ class CLI(unittest.TestCase):
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 self.send_response(200)
+                # Framed body: OpenSSL 3 curl rejects EOF without close_notify.
+                self.send_header("Content-Length", "6")
                 self.end_headers()
                 self.wfile.write(b"tls-ok")
             def log_message(self, *args):
@@ -542,6 +552,99 @@ class Silo(unittest.TestCase):
         result = run(*command)
         self.assertEqual(result.returncode, 125)
         self.assertNotIn("never", result.stdout)
+
+
+@unittest.skipUnless(LINUX, "Linux World namespaces")
+class LinuxSilo(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix="world-silo-test-")
+        cls.root = pathlib.Path(cls.temp.name)
+        cls.state = cls.root / "state"
+        for name in ["A", "B"]:
+            work = cls.root / name
+            work.mkdir()
+            for action in [["create", "--world", name, "--workdir", work], ["setup", "--world", name]]:
+                result = run(WORLD, "silo", "--state-dir", cls.state, *action)
+                if result.returncode:
+                    cls.tearDownClass()
+                    raise AssertionError(result.stderr)
+
+    @classmethod
+    def tearDownClass(cls):
+        for name in ["A", "B"]:
+            run(WORLD, "silo", "--state-dir", cls.state, "teardown", "--world", name)
+        cls.temp.cleanup()
+
+    def command(self, world, *args):
+        return [WORLD, "silo", "--state-dir", self.state, "exec", "--world", world, "--timeout", "30s", "--", PROBE, *args]
+
+    def test_same_port_localhost_and_lifecycle(self):
+        for host in ["127.0.0.1", "0.0.0.0", "[::1]", "[::]"]:
+            with self.subTest(host=host), serving(self.command("A", "serve", f"{host}:0", "A")) as (a, port):
+                with serving(self.command("B", "serve", f"{host}:{port}", "B")):
+                    localhost = "[::1]" if host.startswith("[") else "127.0.0.1"
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        futures = {name:pool.submit(run, *self.command(name, "get", f"{localhost}:{port}")) for name in ["A", "B"]}
+                        for name, future in futures.items():
+                            result = future.result()
+                            self.assertEqual((result.returncode, result.stdout), (0, name), result.stderr)
+                    result = run(*self.command("A", "child", "get", f"{localhost}:{port}"))
+                    self.assertEqual((result.returncode, result.stdout), (0, "A"), result.stderr)
+                    # Scripts and system binaries need no special handling.
+                    result = run(*self.command("B")[:-1], "/bin/sh", "-c", f'exec "$0" get {localhost}:{port}', PROBE)
+                    self.assertEqual((result.returncode, result.stdout), (0, "B"), result.stderr)
+                    self.assertNotIn(run(PROBE, "get", f"{localhost}:{port}").stdout, ["A", "B"])
+                    a.terminate()
+                    a.wait(timeout=5)
+                    result = run(*self.command("B", "get", f"{localhost}:{port}"))
+                    self.assertEqual((result.returncode, result.stdout), (0, "B"), result.stderr)
+
+    def test_udp(self):
+        with serving(self.command("A", "udp-serve", "127.0.0.1:0", "A")) as (_, port):
+            with serving(self.command("B", "udp-serve", f"127.0.0.1:{port}", "B")):
+                for name in ["A", "B"]:
+                    result = run(*self.command(name, "udp-get", f"127.0.0.1:{port}"))
+                    self.assertEqual((result.returncode, result.stdout), (0, name), result.stderr)
+
+    def test_no_host_fallback(self):
+        with serving([PROBE, "serve", "127.0.0.1:0", "HOST"]) as (_, port):
+            for name in ["A", "B"]:
+                result = run(*self.command(name, "get", f"127.0.0.1:{port}"))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("HOST", result.stdout)
+
+    def test_privileged_ports_and_descriptors(self):
+        with serving(self.command("A", "serve", "127.0.0.1:80", "A80")):
+            result = run(*self.command("A", "get", "127.0.0.1:80"))
+            self.assertEqual((result.returncode, result.stdout), (0, "A80"), result.stderr)
+        first, second = socket.socketpair()
+        with first as sock, second:
+            result = run(*self.command("A", "fd", sock.fileno()), pass_fds=(sock.fileno(),))
+            self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+    def test_setup_idempotent_and_teardown(self):
+        work = self.root / "C"
+        work.mkdir()
+        silo = [WORLD, "silo", "--state-dir", self.state]
+        self.assertEqual(run(*silo, "create", "--world", "C", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *silo, "teardown", "--world", "C")
+        result = run(*self.command("C", "fd", "999"))
+        self.assertEqual(result.returncode, 125)
+        self.assertIn("silo setup", result.stderr)
+        for _ in range(2):
+            self.assertEqual(run(*silo, "setup", "--world", "C").returncode, 0)
+        holders = json.loads((self.state / "holders.json").read_text())
+        with serving(self.command("C", "serve", "127.0.0.1:0", "C")) as (_, port):
+            result = run(*self.command("C", "get", f"127.0.0.1:{port}"))
+            self.assertEqual((result.returncode, result.stdout), (0, "C"), result.stderr)
+            self.assertEqual(json.loads((self.state / "holders.json").read_text()), holders)
+        self.assertEqual(run(*silo, "teardown", "--world", "C").returncode, 0)
+        with self.assertRaises(ProcessLookupError):
+            for _ in range(50):
+                os.kill(holders["C"]["pid"], 0)
+                time.sleep(0.1)
+        self.assertEqual(run(*self.command("C", "fd", "999")).returncode, 125)
 
 
 if __name__ == "__main__":

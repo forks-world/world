@@ -9,7 +9,8 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    process::Command,
+    process::{Child, Command},
+    task::JoinHandle,
     time::{Instant, sleep_until, timeout},
 };
 use tokio_util::sync::CancellationToken;
@@ -46,9 +47,23 @@ pub fn workdir(path: &Path) -> Result<PathBuf> {
 pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<i32> {
     options.policy.validate()?;
     validate_command(&options.command, options.timeout)?;
-    if !cfg!(target_os = "macos") {
-        bail!("network isolation backend requires macOS; refusing unsandboxed execution");
+    #[cfg(target_os = "macos")]
+    {
+        seatbelt(options, cancel).await
     }
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::run(options, cancel).await
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = cancel;
+        bail!("network isolation backend requires macOS or Linux; refusing unsandboxed execution");
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn seatbelt(options: RunOptions, cancel: CancellationToken) -> Result<i32> {
     let deadline = Instant::now() + options.timeout;
     let dir = workdir(&options.workdir)?;
     let temp = tempfile::Builder::new()
@@ -117,20 +132,25 @@ fn stdin_is_socket() -> Result<bool> {
     Ok(unsafe { stat.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFSOCK)
 }
 
-pub(crate) async fn supervise(
-    mut cmd: Command,
-    deadline: Instant,
-    cancel: CancellationToken,
-    proxy: &mut Option<Proxy>,
-    ack: Option<&Path>,
-) -> Result<i32> {
+pub(crate) fn check_stdin() -> Result<()> {
     #[cfg(unix)]
     if stdin_is_socket()? {
         bail!("socket stdin is not allowed; use a pipe");
     }
-    if cancel.is_cancelled() || Instant::now() >= deadline {
-        return Ok(124);
-    }
+    Ok(())
+}
+
+type Forward = JoinHandle<std::io::Result<u64>>;
+
+/// A started workload whose process group is killed when dropped.
+pub(crate) struct Workload {
+    child: Child,
+    guard: ProcessGroup,
+    out: Forward,
+    err: Forward,
+}
+
+pub(crate) fn spawn(mut cmd: Command) -> Result<Workload> {
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -146,6 +166,41 @@ pub(crate) async fn supervise(
         tokio::spawn(async move { tokio::io::copy(&mut stdout, &mut tokio::io::stdout()).await });
     let err =
         tokio::spawn(async move { tokio::io::copy(&mut stderr, &mut tokio::io::stderr()).await });
+    Ok(Workload {
+        child,
+        guard,
+        out,
+        err,
+    })
+}
+
+pub(crate) async fn supervise(
+    cmd: Command,
+    deadline: Instant,
+    cancel: CancellationToken,
+    proxy: &mut Option<Proxy>,
+    ack: Option<&Path>,
+) -> Result<i32> {
+    check_stdin()?;
+    if cancel.is_cancelled() || Instant::now() >= deadline {
+        return Ok(124);
+    }
+    wait(spawn(cmd)?, deadline, cancel, proxy, ack).await
+}
+
+pub(crate) async fn wait(
+    workload: Workload,
+    deadline: Instant,
+    cancel: CancellationToken,
+    proxy: &mut Option<Proxy>,
+    ack: Option<&Path>,
+) -> Result<i32> {
+    let Workload {
+        mut child,
+        guard,
+        out,
+        err,
+    } = workload;
     let injection_failure = async {
         if let Some(path) = ack {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -211,7 +266,7 @@ pub(crate) async fn supervise(
     })
 }
 
-struct ProcessGroup(u32);
+pub(crate) struct ProcessGroup(u32);
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         #[cfg(unix)]
@@ -222,6 +277,7 @@ impl Drop for ProcessGroup {
     }
 }
 
+#[cfg(target_os = "macos")]
 const CLOSE_DESCRIPTORS: &str = r#"
 for file in /dev/fd/*; do
  fd=${file##*/}
@@ -231,6 +287,7 @@ done
 exec "$@"
 "#;
 
+#[cfg(target_os = "macos")]
 fn seatbelt_profile(workdir: &Path, temp: &Path, port: Option<u16>) -> Result<String> {
     let quote = |p: &Path| -> Result<String> {
         Ok(serde_json::to_string(

@@ -56,6 +56,14 @@ enum Silo {
         #[arg(long)]
         world: String,
     },
+    /// Linux: stop the World namespace holder started by setup.
+    Teardown {
+        #[arg(long)]
+        world: String,
+    },
+    /// Internal: keeps a Linux World namespace alive.
+    #[command(hide = true)]
+    Hold,
     Exec {
         #[arg(long)]
         world: String,
@@ -76,6 +84,15 @@ async fn main() {
             std::process::exit(code);
         }
     };
+    // The namespace holder keeps default signal dispositions: plain kill stops it.
+    #[cfg(target_os = "linux")]
+    if let Commands::Silo {
+        command: Silo::Hold,
+        ..
+    } = cli.command
+    {
+        world_runtime::linux::hold();
+    }
     let cancel = CancellationToken::new();
     let signal = cancel.clone();
     tokio::spawn(async move {
@@ -143,14 +160,22 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                     Ok(0)
                 }
                 Silo::Setup { world } => {
-                    silo::setup(&silo::inspect(&state, &world)?)?;
+                    silo::setup(&state, &silo::inspect(&state, &world)?)?;
                     Ok(0)
                 }
+                Silo::Teardown { world } => {
+                    silo::teardown(&state, &silo::inspect(&state, &world)?)?;
+                    Ok(0)
+                }
+                Silo::Hold => anyhow::bail!("hold is internal to Linux silo setup"),
                 Silo::Exec {
                     world,
                     timeout,
                     command,
-                } => silo::exec(silo::inspect(&state, &world)?, command, timeout, cancel).await,
+                } => {
+                    let world = silo::inspect(&state, &world)?;
+                    silo::exec(&state, world, command, timeout, cancel).await
+                }
             }
         }
     }
