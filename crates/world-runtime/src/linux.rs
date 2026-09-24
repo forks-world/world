@@ -1221,24 +1221,10 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
 }
 
 /// After killing a holder, reap it if it became our child: a caller that
-/// is a child subreaper adopts the double-forked holder. For anyone else
-/// waitid fails with ECHILD and init (or the real subreaper) reaps it.
-fn reap_if_child(pidfd: &OwnedFd) {
-    const P_PIDFD: libc::idtype_t = 3;
-    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-    let fd = pidfd.as_raw_fd() as libc::id_t;
-    loop {
-        // SAFETY: info is a live siginfo_t; the pidfd is open.
-        let result = unsafe { libc::waitid(P_PIDFD, fd, info.as_mut_ptr(), libc::WEXITED) };
-        let error = std::io::Error::last_os_error();
-        if result == 0 || error.kind() != std::io::ErrorKind::Interrupted {
-            return;
-        }
-    }
-}
-
-/// reap_if_child without a pidfd (before Linux 5.3). Only our own child
-/// can be waited for by PID, so this cannot touch an unrelated process.
+/// is a child subreaper adopts the double-forked holder. Only our own
+/// child can be waited for by PID, and a killed child keeps its PID as a
+/// zombie until reaped, so this cannot touch an unrelated process; for
+/// anyone else it returns ECHILD and init (or the real subreaper) reaps.
 fn reap_pid_if_child(pid: libc::pid_t) {
     let mut status = 0;
     // SAFETY: status is a live int.
@@ -1275,10 +1261,7 @@ impl StartedHolder {
             }
         };
         check(result)?;
-        match &self.pidfd {
-            Some(fd) => reap_if_child(fd),
-            None => reap_pid_if_child(self.pid),
-        }
+        reap_pid_if_child(self.pid);
         Ok(())
     }
 }
@@ -1317,7 +1300,7 @@ pub(crate) fn stop_holder(holder: &Holder) -> Result<()> {
     if result != 0 {
         return Err(Error::last_os_error()).context("stop holder");
     }
-    reap_if_child(&pidfd);
+    reap_pid_if_child(holder.pid as libc::pid_t);
     Ok(())
 }
 
