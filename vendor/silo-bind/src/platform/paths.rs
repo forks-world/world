@@ -272,9 +272,13 @@ unsafe extern "C" fn getsockname_entry(
     addr: *mut sockaddr,
     len: *mut socklen_t,
 ) -> c_int {
+    // The kernel copies at most the caller's original capacity into `addr`
+    // but reports the untruncated length in `*len`; capture that capacity
+    // before the real call so a small buffer is never read or written past it.
+    let cap = if len.is_null() { 0 } else { unsafe { *len } };
     let result = unsafe { real_getsockname(fd, addr, len) };
     if result == 0 {
-        unsafe { unmap_unix(addr, len) };
+        unsafe { unmap_unix(fd, addr, cap, len, real_getsockname) };
     }
     result
 }
@@ -283,9 +287,10 @@ unsafe extern "C" fn getpeername_entry(
     addr: *mut sockaddr,
     len: *mut socklen_t,
 ) -> c_int {
+    let cap = if len.is_null() { 0 } else { unsafe { *len } };
     let result = unsafe { real_getpeername(fd, addr, len) };
     if result == 0 {
-        unsafe { unmap_unix(addr, len) };
+        unsafe { unmap_unix(fd, addr, cap, len, real_getpeername) };
     }
     result
 }

@@ -60,6 +60,7 @@ mkdir -p ~/world-a ~/world-b
 - Workspace 工作目录和 `HOME` 不能位于上述临时目录下，否则拒绝执行；私有目录必须在宿主临时目录之外，否则其自身路径会被再次重定向。
 - Unix socket 路径上限 104 字节，重定向后路径会加上私有目录前缀（例如 `/Users/me/.world/tmp/127.77.0.1/tmp/`）。超长时 `bind/connect` 返回 `ENAMETOOLONG`。
 - 已存在于 Workspace 之外、指向 `/tmp` 的符号链接由内核解析，不经过重定向；`fcntl(F_GETPATH)`、`accept/recvfrom` 返回的对端地址、原始系统调用和脚本 shebang 中位于 `/tmp` 的解释器不在覆盖范围内。
+- 判断是否重定向时对前缀中的 `..` 按字面解析，前缀里的符号链接（如 `/Users/me/link/../../tmp`）可能判断错误；重定向后的剩余路径原样交给内核解析。
 - 私有目录不会随 Workspace 自动清理，也不像宿主 `/tmp` 那样在重启时清空；需要时停止任务后手动删除。
 
 `world workspace show A` 查看配置。Workspace 本地 ID 是开发用稳定标识，尚未对接 forkfs 全局 Workspace Resource ID 或组织授权。`create` 成功只表示元信息登记，不表示已配置地址或通过隔离验收。重启后需要重新 `setup`。停止所有关联任务后可以按 show 返回的地址手工执行 `sudo ifconfig lo0 -alias IP` 清理别名；这不会删除工作目录或注册表。

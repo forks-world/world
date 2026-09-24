@@ -634,14 +634,31 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         self.assertEqual(report["cwd"], host)
         self.assertEqual(report["socket"], f"{host}/s.sock")
         self.assertTrue(report["mkstemp"].startswith(f"/tmp/{name}/mk."), report)
-        self.assertEqual((report["entries"], report["var"]), (5, "var"))
+        self.assertEqual((report["entries"], report["var"]), (6, "var"))
+        # "a/link/../x" is redirected only up to "a"; the kernel resolves the
+        # relative symlink and ".." from there, so it lands on "a/b/x", not
+        # a lexically-normalized (and nonexistent) "a/x".
+        self.assertEqual(report["symlink_parent"], "symlink-parent")
         for leaked in [f"/tmp/{name}", f"/var/tmp/{name}"]:
             self.assertFalse(os.path.lexists(leaked), leaked)
         physical = self.world_tmp / "tmp" / name
         self.assertEqual((physical / "file").read_text(), "data")
         # Link targets are stored at the World location and resolved there.
         self.assertEqual(os.readlink(physical / "link"), str(physical / "file"))
+        self.assertFalse((physical / "a" / "x").exists())
         self.assertEqual((self.world_tmp / "var/tmp" / name / "file").read_text(), "var")
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_short_getsockname_buffer_is_respected(self):
+        name = f"wt-{uuid.uuid4().hex[:8]}"
+        path = f"/tmp/{name}/s.sock"
+        result = run(PROBE, "getsockname-short", path, "20", env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        host = f"/private/tmp/{name}/s.sock"
+        self.assertTrue(report["guard_intact"], report)
+        self.assertEqual(report["prefix"], host[:18])
+        self.assertEqual(report["len"], 2 + len(host) + 1)
 
     @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
     def test_same_temp_lock_and_socket_names_do_not_conflict(self):

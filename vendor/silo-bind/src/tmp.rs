@@ -74,7 +74,10 @@ fn component_rest<'a>(path: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
 }
 
 /// Lexically normalize an absolute path: drop empty and `.` components and
-/// resolve `..`. Returns None when the result does not fit.
+/// resolve `..`. Returns None when the result does not fit. Test oracle only:
+/// production mapping must not resolve `..` lexically (see `map`), since a
+/// symlink earlier in the path can make that differ from kernel resolution.
+#[cfg(test)]
 fn normalize(path: &[u8], out: &mut [u8]) -> Option<usize> {
     let mut len = 0;
     for component in path.split(|&b| b == b'/') {
@@ -106,36 +109,135 @@ fn normalize(path: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(len)
 }
 
+/// Where a leading path prefix currently stands, relative to the three
+/// aliased directories that lead into a host temp root.
+#[derive(Clone, Copy)]
+enum Base {
+    Root,
+    Private,
+    PrivVar,
+}
+
+impl Base {
+    fn parent(self) -> Base {
+        match self {
+            Base::Root => Base::Root,
+            Base::Private => Base::Root,
+            Base::PrivVar => Base::Private,
+        }
+    }
+}
+
+/// Scan state while walking a path's components left to right. `Temp` tracks
+/// how many real components have been pushed below the matched temp root
+/// (`depth`) and where its remainder begins (`start`), so re-entering a temp
+/// root later only keeps the suffix after the latest match.
+enum Scan {
+    Base(Base),
+    Other {
+        base: Base,
+        depth: u32,
+    },
+    Temp {
+        sub: &'static [u8],
+        parent: Base,
+        start: usize,
+        depth: u32,
+    },
+}
+
 /// Write the World location for `path` into `out` as a NUL-terminated string.
-/// Ok(None) means the path is used unchanged.
+/// Ok(None) means the path is used unchanged. Only the leading components
+/// decide redirection, exactly as the kernel resolves them one at a time; the
+/// remainder is then copied verbatim, so a `..` that crosses a symlink (e.g.
+/// `/tmp/a/link/../x`) is left for the kernel to resolve rather than resolved
+/// lexically here.
 pub fn map(root: &[u8], path: &[u8], out: &mut [u8]) -> Result<Option<usize>, c_int> {
-    if !path.starts_with(b"/") {
+    // An overlong path is rejected by the kernel exactly as the caller wrote it.
+    if !path.starts_with(b"/") || path.len() >= PATH_MAX {
         return Ok(None);
     }
-    let mut scratch = [0u8; PATH_MAX];
-    // An overlong path is rejected by the kernel exactly as the caller wrote it.
-    let Some(len) = normalize(path, &mut scratch) else {
+    let mut state = Scan::Base(Base::Root);
+    let mut pos = 0;
+    for component in path.split(|&b| b == b'/') {
+        let end = pos + component.len();
+        pos = end + 1;
+        state = match (state, component) {
+            (s, b"" | b".") => s,
+            (Scan::Base(b), b"..") => Scan::Base(b.parent()),
+            (Scan::Base(Base::Root), b"private") => Scan::Base(Base::Private),
+            (Scan::Base(Base::Root | Base::Private), b"var") => Scan::Base(Base::PrivVar),
+            (Scan::Base(Base::Root | Base::Private), b"tmp") => Scan::Temp {
+                sub: b"/tmp",
+                parent: Base::Private,
+                start: end,
+                depth: 0,
+            },
+            (Scan::Base(Base::PrivVar), b"tmp") => Scan::Temp {
+                sub: b"/var/tmp",
+                parent: Base::PrivVar,
+                start: end,
+                depth: 0,
+            },
+            (Scan::Base(b), _) => Scan::Other { base: b, depth: 1 },
+            (Scan::Other { base, depth: 1 }, b"..") => Scan::Base(base),
+            (Scan::Other { base, depth }, b"..") => Scan::Other {
+                base,
+                depth: depth - 1,
+            },
+            (Scan::Other { base, depth }, _) => Scan::Other {
+                base,
+                depth: depth + 1,
+            },
+            (
+                Scan::Temp {
+                    parent, depth: 0, ..
+                },
+                b"..",
+            ) => Scan::Base(parent),
+            (
+                Scan::Temp {
+                    sub,
+                    parent,
+                    start,
+                    depth,
+                },
+                b"..",
+            ) => Scan::Temp {
+                sub,
+                parent,
+                start,
+                depth: depth - 1,
+            },
+            (
+                Scan::Temp {
+                    sub,
+                    parent,
+                    start,
+                    depth,
+                },
+                _,
+            ) => Scan::Temp {
+                sub,
+                parent,
+                start,
+                depth: depth + 1,
+            },
+        };
+    }
+    let Scan::Temp { sub, start, .. } = state else {
         return Ok(None);
     };
-    let path = &scratch[..len];
-    if component_rest(path, root).is_some() {
-        return Ok(None);
+    let rest = &path[start..];
+    let total = root.len() + sub.len() + rest.len();
+    if total >= out.len() {
+        return Err(libc::ENAMETOOLONG);
     }
-    for (host, sub) in HOST_ROOTS {
-        let Some(rest) = component_rest(path, host) else {
-            continue;
-        };
-        let total = root.len() + sub.len() + rest.len();
-        if total >= out.len() {
-            return Err(libc::ENAMETOOLONG);
-        }
-        out[..root.len()].copy_from_slice(root);
-        out[root.len()..root.len() + sub.len()].copy_from_slice(sub);
-        out[root.len() + sub.len()..total].copy_from_slice(rest);
-        out[total] = 0;
-        return Ok(Some(total));
-    }
-    Ok(None)
+    out[..root.len()].copy_from_slice(root);
+    out[root.len()..root.len() + sub.len()].copy_from_slice(sub);
+    out[root.len() + sub.len()..total].copy_from_slice(rest);
+    out[total] = 0;
+    Ok(Some(total))
 }
 
 /// Rewrite a physical World location back to its host name in place.
@@ -234,26 +336,105 @@ pub unsafe fn map_unix(
     ))
 }
 
-/// Report a returned `AF_UNIX` address by its host name.
+/// Offset of `sun_path` in `sockaddr_un`: the `sun_len` and `sun_family`
+/// bytes precede it on macOS.
+const SUN_PATH_OFFSET: usize = 2;
 #[cfg(target_os = "macos")]
-pub unsafe fn unmap_unix(addr: *mut libc::sockaddr, len: *mut libc::socklen_t) {
-    let offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+const _: () = assert!(SUN_PATH_OFFSET == std::mem::offset_of!(libc::sockaddr_un, sun_path));
+
+/// Rewrite a physical `AF_UNIX` address to its host name in place. `sa` holds
+/// raw `sockaddr_un` bytes in macOS layout (`sun_len`, `sun_family`, then
+/// `sun_path`) and `reported` is the kernel's address length, which must fit
+/// within `sa`. Returns the new total length; freed tail bytes are zeroed and
+/// the `sun_len` byte is updated. Pure and allocation-free, so it is
+/// unit-testable on any host without a live socket.
+fn unmap_sockaddr(root: &[u8], sa: &mut [u8], reported: usize) -> Option<usize> {
+    if reported <= SUN_PATH_OFFSET || reported > sa.len() || sa[1] as c_int != libc::AF_UNIX {
+        return None;
+    }
+    let region = reported - SUN_PATH_OFFSET;
+    let path_len = sa[SUN_PATH_OFFSET..reported]
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(region);
+    let new_len = unmap_in_place(root, &mut sa[SUN_PATH_OFFSET..], path_len)?;
+    sa[SUN_PATH_OFFSET + new_len..reported].fill(0);
+    let total = SUN_PATH_OFFSET + new_len + usize::from(new_len < region);
+    sa[0] = total as u8;
+    Some(total)
+}
+
+/// After a requery reports `storage[..reported]`, unmap it in place and copy
+/// at most `cap` bytes into `dst`, leaving `dst[cap..]` untouched. Returns the
+/// unmapped total length, which may exceed `cap` so callers can still detect
+/// truncation the way the kernel reports it.
+fn requeried_unix(
+    root: &[u8],
+    storage: &mut [u8],
+    reported: usize,
+    cap: usize,
+    dst: &mut [u8],
+) -> Option<usize> {
+    let total = unmap_sockaddr(root, storage, reported)?;
+    let n = cap.min(total).min(storage.len()).min(dst.len());
+    dst[..n].copy_from_slice(&storage[..n]);
+    Some(total)
+}
+
+/// Report a returned `AF_UNIX` address by its host name. `cap` is the
+/// caller's original buffer capacity (`*len` before the real call, 0 when
+/// `len` was null): the kernel copies at most `cap` bytes into `addr` but
+/// still sets `*len` to the untruncated address length, so bytes at or past
+/// `cap` in the caller's buffer must never be read or written. When
+/// truncated, `real` (the same libSystem entry point, called again for `fd`)
+/// requeries the untruncated address into a local buffer instead.
+#[cfg(target_os = "macos")]
+pub unsafe fn unmap_unix(
+    fd: c_int,
+    addr: *mut libc::sockaddr,
+    cap: libc::socklen_t,
+    len: *mut libc::socklen_t,
+    real: unsafe extern "C" fn(c_int, *mut libc::sockaddr, *mut libc::socklen_t) -> c_int,
+) {
     let Some(root) = root() else { return };
-    if addr.is_null() || len.is_null() || (unsafe { *len } as usize) <= offset {
+    if addr.is_null() || len.is_null() {
         return;
     }
-    if unsafe { (*addr).sa_family } as c_int != libc::AF_UNIX {
+    let reported = unsafe { *len } as usize;
+    let cap = cap as usize;
+    if reported <= SUN_PATH_OFFSET {
         return;
     }
-    let un = unsafe { &mut *(addr as *mut libc::sockaddr_un) };
-    let available = (unsafe { *len } as usize - offset).min(un.sun_path.len());
-    let buf =
-        unsafe { std::slice::from_raw_parts_mut(un.sun_path.as_mut_ptr().cast::<u8>(), available) };
-    let path_len = buf.iter().position(|&b| b == 0).unwrap_or(available);
-    if let Some(new_len) = unmap_in_place(root, buf, path_len) {
-        buf[new_len..path_len].fill(0);
-        let total = offset + new_len + usize::from(new_len < available);
-        un.sun_len = total as u8;
+    if reported <= cap {
+        let sa = unsafe { std::slice::from_raw_parts_mut(addr.cast::<u8>(), reported) };
+        if let Some(total) = unmap_sockaddr(root, sa, reported) {
+            unsafe { *len = total as libc::socklen_t };
+        }
+        return;
+    }
+    // The kernel copied only `cap` bytes into `addr` but reported the
+    // untruncated length: never touch `addr` past `cap`. Requery into a
+    // buffer large enough for any AF_UNIX address instead.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut storage_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    if unsafe {
+        real(
+            fd,
+            (&mut storage as *mut libc::sockaddr_storage).cast(),
+            &mut storage_len,
+        )
+    } != 0
+    {
+        return;
+    }
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            (&mut storage as *mut libc::sockaddr_storage).cast::<u8>(),
+            std::mem::size_of::<libc::sockaddr_storage>(),
+        )
+    };
+    let dst = unsafe { std::slice::from_raw_parts_mut(addr.cast::<u8>(), cap) };
+    if let Some(total) = requeried_unix(root, bytes, storage_len as usize, cap, dst) {
         unsafe { *len = total as libc::socklen_t };
     }
 }
@@ -276,13 +457,21 @@ mod tests {
         let root = std::str::from_utf8(ROOT).unwrap();
         for (path, expected) in [
             ("/tmp", "/tmp"),
-            ("/tmp/", "/tmp"),
+            ("/tmp/", "/tmp/"),
             ("/tmp/a.lock", "/tmp/a.lock"),
             ("/private/tmp/.s.PGSQL.5432", "/tmp/.s.PGSQL.5432"),
             ("/var/tmp/x", "/var/tmp/x"),
             ("/private/var/tmp", "/var/tmp"),
-            ("//tmp//a/./b/../c", "/tmp/a/c"),
+            ("//tmp//a/./b/../c", "/tmp//a/./b/../c"),
             ("/private/./tmp/x", "/tmp/x"),
+            // The remainder past the matched temp root is copied verbatim, so
+            // a `..` that crosses a symlink is left for the kernel to resolve.
+            ("/tmp/a/link/../x", "/tmp/a/link/../x"),
+            ("/private/../tmp/x", "/tmp/x"),
+            ("/var/../tmp/x", "/tmp/x"),
+            ("/var/../var/tmp/y", "/var/tmp/y"),
+            ("/tmp/a/../../tmp/x", "/tmp/x"),
+            ("/Users/../tmp/x", "/tmp/x"),
         ] {
             assert_eq!(mapped(path), Some(format!("{root}{expected}")), "{path}");
         }
@@ -302,6 +491,9 @@ mod tests {
             "/Users/me/.local/share/world/workspaces/tmp/127.77.0.1",
             "/Users/me/.local/share/world/workspaces/tmp/127.77.0.1/tmp/x",
             "/Users/me/.local/share/world/workspaces/tmp/../tmp/127.77.0.1/tmp/x",
+            "/tmp/..",
+            "/private/var/tmp/../../etc",
+            "/private/var/folders/../tmpx",
         ] {
             assert_eq!(mapped(path), None, "{path}");
         }
@@ -361,16 +553,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unmap_sockaddr_rejects_oversized_report() {
+        // The entry point only ever passes a slice at least as long as
+        // `reported`; this guards misuse from overrunning `sa` instead.
+        let mut sa = [0u8; 16];
+        assert_eq!(unmap_sockaddr(ROOT, &mut sa, 80), None);
+    }
+
+    #[test]
+    fn unmap_sockaddr_rewrites_host_name_and_zeroes_freed_tail() {
+        let physical = format!("{}/tmp/a", std::str::from_utf8(ROOT).unwrap());
+        let mut sa = [0xFFu8; 128];
+        sa[1] = libc::AF_UNIX as u8;
+        sa[2..2 + physical.len()].copy_from_slice(physical.as_bytes());
+        sa[2 + physical.len()] = 0; // trailing NUL, as the kernel would report
+        let reported = 2 + physical.len() + 1;
+        let total = unmap_sockaddr(ROOT, &mut sa, reported).unwrap();
+        let host = "/private/tmp/a";
+        assert_eq!(total, 2 + host.len() + 1);
+        assert_eq!(sa[0], total as u8);
+        assert_eq!(&sa[2..2 + host.len()], host.as_bytes());
+        // Freed tail bytes, including the old NUL slot, are zeroed rather
+        // than left as stale physical-path bytes.
+        assert!(sa[2 + host.len()..reported].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn requeried_unix_copies_only_up_to_the_caller_capacity() {
+        let physical = format!("{}/tmp/s.sock", std::str::from_utf8(ROOT).unwrap());
+        let mut storage = [0u8; 128];
+        storage[1] = libc::AF_UNIX as u8;
+        storage[2..2 + physical.len()].copy_from_slice(physical.as_bytes());
+        let reported = 2 + physical.len() + 1;
+
+        // Reference: what an untruncated in-place unmap produces.
+        let mut full = storage;
+        let total = unmap_sockaddr(ROOT, &mut full, reported).unwrap();
+        assert_eq!(total, 2 + "/private/tmp/s.sock".len() + 1);
+
+        // A caller with only a 20-byte buffer gets that same content up to
+        // its capacity and nothing written past it.
+        let cap = 20;
+        let mut dst = [0xAAu8; 32];
+        let reported_len =
+            requeried_unix(ROOT, &mut storage, reported, cap, &mut dst[..cap]).unwrap();
+        assert_eq!(reported_len, total);
+        assert_eq!(&dst[..cap], &full[..cap]);
+        assert!(dst[cap..].iter().all(|&b| b == 0xAA));
+    }
+
     proptest::proptest! {
         #[test]
         fn map_then_unmap_names_the_host_path(rest in "(/[a-z][a-z.]{0,7}){0,6}") {
+            let root = std::str::from_utf8(ROOT).unwrap();
             let mut out = [0u8; PATH_MAX];
             let path = format!("/tmp{rest}");
             if let Some(n) = map(ROOT, path.as_bytes(), &mut out).unwrap() {
+                let world = format!("{root}/tmp{rest}");
+                proptest::prop_assert_eq!(&out[..n], world.as_bytes());
                 let new_len = unmap_in_place(ROOT, &mut out, n).unwrap();
-                let mut normalized = [0u8; PATH_MAX];
-                let len = normalize(format!("/private/tmp{rest}").as_bytes(), &mut normalized).unwrap();
-                proptest::prop_assert_eq!(&out[..new_len], &normalized[..len]);
+                let host = format!("/private/tmp{rest}");
+                proptest::prop_assert_eq!(&out[..new_len], host.as_bytes());
+            }
+        }
+
+        #[test]
+        fn map_agrees_with_normalized_oracle(components in proptest::collection::vec(
+            proptest::prop_oneof![
+                "[a-z]{1,4}",
+                proptest::strategy::Just(".".to_string()),
+                proptest::strategy::Just("..".to_string()),
+                proptest::strategy::Just(String::new()),
+                proptest::strategy::Just("tmp".to_string()),
+                proptest::strategy::Just("private".to_string()),
+                proptest::strategy::Just("var".to_string()),
+            ],
+            1..8,
+        )) {
+            let path = format!("/{}", components.join("/"));
+            let mut normalized_buf = [0u8; PATH_MAX];
+            let normalized_len = normalize(path.as_bytes(), &mut normalized_buf).unwrap();
+            let normalized_path = normalized_buf[..normalized_len].to_vec();
+
+            let mut mapped_buf = [0u8; PATH_MAX];
+            let mapped = map(ROOT, path.as_bytes(), &mut mapped_buf).unwrap();
+            let mut mapped_norm_buf = [0u8; PATH_MAX];
+            let mapped_norm = map(ROOT, &normalized_path, &mut mapped_norm_buf).unwrap();
+
+            proptest::prop_assert_eq!(mapped.is_some(), mapped_norm.is_some());
+            if let (Some(a), Some(b)) = (mapped, mapped_norm) {
+                let mut norm_a_buf = [0u8; PATH_MAX];
+                let norm_a_len = normalize(&mapped_buf[..a], &mut norm_a_buf).unwrap();
+                let mut norm_b_buf = [0u8; PATH_MAX];
+                let norm_b_len = normalize(&mapped_norm_buf[..b], &mut norm_b_buf).unwrap();
+                proptest::prop_assert_eq!(&norm_a_buf[..norm_a_len], &norm_b_buf[..norm_b_len]);
             }
         }
     }

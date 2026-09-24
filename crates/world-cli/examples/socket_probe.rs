@@ -279,6 +279,12 @@ fn run() -> std::io::Result<()> {
             std::fs::write(dir.join("draft"), "data")?;
             std::fs::rename(dir.join("draft"), dir.join("file"))?;
             std::os::unix::fs::symlink(dir.join("file"), dir.join("link"))?;
+            // A relative symlink whose target's ".." must be resolved by the
+            // kernel against the symlink's own directory, not lexically
+            // against the redirected path text.
+            std::fs::create_dir_all(dir.join("a/b/c"))?;
+            std::os::unix::fs::symlink("b/c", dir.join("a/link"))?;
+            std::fs::write(dir.join("a/b/x"), "symlink-parent")?;
             let listener = UnixListener::bind(dir.join("s.sock"))?;
             UnixStream::connect(dir.join("s.sock"))?;
             let socket = listener.local_addr()?;
@@ -297,6 +303,9 @@ fn run() -> std::io::Result<()> {
             std::env::set_current_dir(&dir)?;
             let report = serde_json::json!({
                 "read": std::fs::read_to_string("/tmp/".to_owned() + &args[2] + "/link")?,
+                "symlink_parent": std::fs::read_to_string(
+                    "/tmp/".to_owned() + &args[2] + "/a/link/../x",
+                )?,
                 "readlink": std::fs::read_link(dir.join("link"))?,
                 "canonical": std::fs::canonicalize(dir.join("link"))?,
                 "cwd": std::env::current_dir()?,
@@ -337,6 +346,35 @@ fn run() -> std::io::Result<()> {
                 }
             }
             print!("descriptor-closed");
+        }
+        "getsockname-short" => {
+            // Exercise getsockname with a caller buffer smaller than the
+            // reported address, the way the kernel truncates but still
+            // reports the untruncated length.
+            use std::os::fd::AsRawFd;
+            let cap: libc::socklen_t = args[3].parse().unwrap();
+            let path = std::path::Path::new(&args[2]);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let _ = std::fs::remove_file(path);
+            let listener = std::os::unix::net::UnixListener::bind(path)?;
+            let mut buf = [0xAAu8; 128];
+            let mut len = cap;
+            if unsafe { libc::getsockname(listener.as_raw_fd(), buf.as_mut_ptr().cast(), &mut len) }
+                != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let cap = (cap as usize).min(buf.len());
+            let region = &buf[2.min(cap)..cap];
+            let prefix = region.split(|&b| b == 0).next().unwrap_or(&[]);
+            let report = serde_json::json!({
+                "len": len,
+                "prefix": String::from_utf8_lossy(prefix),
+                "guard_intact": buf[cap..].iter().all(|&b| b == 0xAA),
+            });
+            print!("{report}");
         }
         _ => panic!("unknown probe"),
     }
