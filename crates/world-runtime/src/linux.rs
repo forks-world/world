@@ -1358,6 +1358,34 @@ fn reap_if_child(pidfd: Option<&OwnedFd>) {
     }
 }
 
+/// Reap a recorded holder that died (e.g. killed externally) and became
+/// our zombie because this process is a child subreaper. A zombie keeps
+/// its PID, so pidfd_open pins it; the recorded start time then confirms
+/// the identity before waitid(P_PIDFD) reaps it without blocking. A
+/// reused PID fails the start-time check and nothing is reaped.
+pub(crate) fn reap_stale_holder(holder: &Holder) {
+    // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, holder.pid as libc::pid_t, 0u32) };
+    if fd < 0 {
+        return;
+    }
+    // SAFETY: the kernel returned a new descriptor we exclusively own.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+    if start_time(holder.pid).ok() != Some(holder.start_time) {
+        return;
+    }
+    const P_PIDFD: libc::idtype_t = 3;
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    let id = pidfd.as_raw_fd() as libc::id_t;
+    let flags = libc::WEXITED | libc::WNOHANG;
+    // SAFETY: info is a live siginfo_t; the pidfd is open.
+    while unsafe { libc::waitid(P_PIDFD, id, info.as_mut_ptr(), flags) } < 0 {
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return;
+        }
+    }
+}
+
 /// A holder this process just started, pinned by pidfd when available.
 pub(crate) struct StartedHolder {
     pub holder: Holder,

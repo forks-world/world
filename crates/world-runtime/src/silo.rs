@@ -143,6 +143,7 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
             if holder.verify()?.is_some() {
                 return Ok(());
             }
+            crate::linux::reap_stale_holder(holder);
         }
         let started = crate::linux::start_holder()?;
         holders.insert(world.id.clone(), started.holder);
@@ -191,6 +192,8 @@ pub fn teardown(state: &Path, world: &World) -> Result<()> {
             // a transient verification error keeps it for a retry.
             if holder.verify()?.is_some() {
                 crate::linux::stop_holder(&holder)?;
+            } else {
+                crate::linux::reap_stale_holder(&holder);
             }
             persist(state, "holders.json", &holders)?;
         }
@@ -432,6 +435,31 @@ mod tests {
         assert!(
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "holder left as a zombie"
+        );
+    }
+
+    /// A holder killed externally stays a zombie of a subreaper caller;
+    /// replacing its stale record must reap it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_reaps_externally_killed_holder_of_subreaper() {
+        // SAFETY: prctl with integer arguments on this test process.
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let world = create(state.path(), "killed", work.path()).unwrap();
+        setup(state.path(), &world).unwrap();
+        let old = holder(state.path(), "killed").unwrap().pid;
+        // SAFETY: kill with integer arguments.
+        unsafe { libc::kill(old as libc::pid_t, libc::SIGKILL) };
+        std::thread::sleep(Duration::from_millis(100));
+        setup(state.path(), &world).unwrap();
+        teardown(state.path(), &world).unwrap();
+        // SAFETY: as above.
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0) };
+        assert!(
+            !std::path::Path::new(&format!("/proc/{old}")).exists(),
+            "killed holder left as a zombie"
         );
     }
 
