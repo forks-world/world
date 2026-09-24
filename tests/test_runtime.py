@@ -158,6 +158,32 @@ class CLI(unittest.TestCase):
         result = self.network("/bin/sh", "-c", "tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' '")
         self.assertEqual((result.returncode, result.stdout), (0, "lo\n"), result.stderr)
 
+    @unittest.skipUnless(LINUX, "Landlock ptrace restriction requires Linux")
+    def test_cannot_steal_host_descriptors(self):
+        # The host process allows any tracer, as with Yama disabled; only
+        # Landlock's ptrace restriction (all ABIs) stands in the way.
+        target = subprocess.Popen([sys.executable, "-c", """
+import ctypes, socket, time
+ctypes.CDLL(None).prctl(0x59616d61, ctypes.c_ulong(2**64 - 1), 0, 0, 0)
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen()
+print(s.fileno(), flush=True); time.sleep(30)
+"""], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(target.wait)
+        self.addCleanup(target.kill)
+        fd = target.stdout.readline().strip()
+        (self.dir / "steal.py").write_text("""
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+pidfd = libc.syscall(434, int(sys.argv[1]), 0)
+got = libc.syscall(438, pidfd, int(sys.argv[2]), 0) if pidfd >= 0 else -1
+print("stolen" if got >= 0 else os.strerror(ctypes.get_errno()))
+""")
+        control = run(sys.executable, self.dir / "steal.py", target.pid, fd)
+        if pathlib.Path("/proc/sys/kernel/yama/ptrace_scope").read_text().strip() in ("0", "1"):
+            self.assertEqual(control.stdout.strip(), "stolen", control.stderr)
+        result = self.network("/usr/bin/python3", "steal.py", target.pid, fd)
+        self.assertEqual(result.stdout.strip(), os.strerror(1), result.stderr)
+
     @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_writable_file_stdin_is_refused(self):
         with tempfile.TemporaryDirectory() as outside:

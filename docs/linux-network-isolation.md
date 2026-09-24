@@ -29,7 +29,7 @@ Linux 与 macOS 使用同一个 CLI（`world network exec`、`world silo ...`）
 
 - **本地监听**：macOS 的 Seatbelt 禁止监听；Linux 允许任务在自己的私有 loopback 上监听。其他执行和宿主都访问不到它。
 - **错误码**：连接宿主监听端口时，得到的是 namespace 内的 `ECONNREFUSED`，而不是 `EPERM`；Unix socket 返回 `EACCES`。
-- **进程信息**：Landlock 会阻止 ptrace 及 ptrace 保护的 `/proc/<pid>` 数据，但任务仍能列出宿主进程和它们的命令行。Linux 6.12 以前，同一 uid 的宿主进程也可能收到任务发出的信号。
+- **进程信息**：所有支持的 Landlock ABI 都会阻止对沙箱外进程的 ptrace 及相关访问（`pidfd_getfd`、`process_vm_readv`、受保护的 `/proc/<pid>` 数据），因此任务无法借用宿主进程的 socket；但任务仍能列出宿主进程和它们的命令行。Linux 6.12 以前，同一 uid 的宿主进程也可能收到任务发出的信号。
 - **读取**：与 macOS 一样，不限制读取宿主文件。
 
 ## 同端口 localhost（silo）
