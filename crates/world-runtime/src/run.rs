@@ -312,8 +312,10 @@ pub(crate) fn spawn(mut cmd: Command, relay_stdin: bool) -> Result<Workload> {
     cmd.as_std_mut().process_group(0);
     let mut child = cmd.spawn().context("start workload")?;
     let pid = child.id().context("child PID unavailable")?;
-    let relay = child.stdin.take().map(StdinRelay::start).transpose()?;
+    // Armed first: any later error kills the whole group, including the
+    // PID-namespace init and workload behind the spawned wrapper.
     let guard = ProcessGroup(pid);
+    let relay = child.stdin.take().map(StdinRelay::start).transpose()?;
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let out =
