@@ -225,9 +225,9 @@ pub(crate) struct Workload {
 
 pub(crate) fn spawn(mut cmd: Command) -> Result<Workload> {
     cmd.stdin(Stdio::inherit())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .kill_on_drop(true);
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     #[cfg(unix)]
     cmd.as_std_mut().process_group(0);
     let mut child = cmd.spawn().context("start workload")?;
