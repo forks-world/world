@@ -900,6 +900,51 @@ class Silo(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout), [requested, "caller-argument"])
 
+    def test_main_executable_below_temp_uses_workspace_root(self):
+        n = f"wt-{uuid.uuid4().hex[:8]}"
+        root = pathlib.Path.home() / ".world/tmp" / self.worlds["A"]["ip"]
+        # An exec must have run at least once for the workspace root to exist.
+        result = run(*self.command("A", "fd", "999"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        private_dir = root / "tmp" / n
+        private_dir.mkdir(parents=True)
+        (private_dir / "probe").symlink_to(PROBE)
+        # The probe echoes argv as JSON only under an interpreter-like name.
+        (private_dir / "python3").symlink_to(PROBE)
+        self.addCleanup(shutil.rmtree, private_dir, ignore_errors=True)
+
+        # A decoy at the same name on the host, so a bug that left host paths
+        # unmapped would run /bin/echo instead of failing loudly.
+        host_dir = pathlib.Path("/tmp") / n
+        host_dir.mkdir()
+        (host_dir / "probe").symlink_to("/bin/echo")
+        self.addCleanup(shutil.rmtree, host_dir, ignore_errors=True)
+
+        for requested in [f"/tmp/{n}/probe", f"/private/tmp/{n}/probe"]:
+            command = self.command("A", "fd", "999")
+            command[-3] = requested
+            result = run(*command)
+            self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+        command = self.command("A", "fd", "999")
+        command[-3] = "probe"
+        result = run(*command, env=dict(os.environ, PATH=f"/tmp/{n}"))
+        self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+        requested = f"/tmp/{n}/python3"
+        command = self.command("A", "caller-argument")
+        command[-2] = requested
+        result = run(*command)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [requested, "caller-argument"])
+
+        # World B's own root has no such entry point below its temp root.
+        command = self.command("B", "fd", "999")
+        command[-3] = f"/tmp/{n}/probe"
+        result = run(*command)
+        self.assertNotEqual(result.returncode, 0)
+
     def test_main_privileged_mode_is_rejected(self):
         program = self.root / "privileged"
         program.write_bytes(PROBE.read_bytes())

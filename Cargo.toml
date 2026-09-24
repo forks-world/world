@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/world-cli", "crates/world-runtime", "vendor/silo-bind"]
+members = [
+    "crates/world-cli",
+    "crates/world-runtime",
+    "crates/world-tmp-path",
+    "vendor/silo-bind",
+]
 resolver = "2"
 
 [workspace.package]

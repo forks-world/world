@@ -8,10 +8,12 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    ffi::OsString,
+    ffi::{CString, OsString},
     fs::{File, OpenOptions},
     io::Write,
     net::{Ipv4Addr, SocketAddrV4, TcpListener},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -136,31 +138,243 @@ fn reject_shared_temp(path: &Path, what: &str) -> Result<()> {
 /// path would be redirected. Keyed by the loopback address, which is already
 /// host-global, and kept short: Unix socket names are limited to 104 bytes.
 pub fn temp_root(world: &World) -> Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is required")?)
         .canonicalize()
         .context("HOME")?;
     reject_shared_temp(&home, "HOME")?;
-    let root = home.join(".world/tmp").join(world.ip.to_string());
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&root)?;
-    let metadata = std::fs::symlink_metadata(&root)?;
-    if !metadata.is_dir() || metadata.uid() != unsafe { libc::getuid() } {
-        bail!("workspace temp directory is not a directory owned by this user");
+    temp_root_in(&home, world.ip)
+}
+
+/// Open (creating if absent) a single path component below `parent`, never
+/// following a symlink placed at that name: `mkdirat` accepts an existing
+/// directory but fails otherwise, then the child is reopened with
+/// `O_NOFOLLOW` so a symlink swapped in for it (before or after the mkdirat)
+/// is rejected rather than traversed, and its owner is checked before any of
+/// its permissions are trusted. `create_mode` only applies when the entry is
+/// freshly created; an existing directory's mode is judged or fixed by the
+/// caller afterward.
+fn step(parent: &OwnedFd, name: &str, create_mode: u32, label: &str) -> Result<OwnedFd> {
+    let cname = CString::new(name).context("path contains NUL")?;
+    // SAFETY: `parent` is a valid, open directory descriptor and `cname` is
+    // NUL-terminated; `mkdirat` writes no memory through either pointer.
+    let created = unsafe {
+        libc::mkdirat(
+            parent.as_raw_fd(),
+            cname.as_ptr(),
+            create_mode as libc::mode_t,
+        )
+    };
+    if created != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EEXIST) {
+            return Err(err).with_context(|| format!("create {label}"));
+        }
     }
-    for sub in ["tmp", "var/tmp"] {
-        let dir = root.join(sub);
-        std::fs::DirBuilder::new().recursive(true).create(&dir)?;
-        // Match host temp directory permissions; the parent keeps it private.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777))?;
+    // SAFETY: same preconditions as above; O_NOFOLLOW makes the kernel
+    // reject a symlink at this name instead of resolving it.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            cname.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        if matches!(err.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) {
+            bail!("{label} must be a real directory, not a symlink");
+        }
+        return Err(err).with_context(|| format!("open {label}"));
     }
+    // SAFETY: `fd` was just returned by `openat` above and is owned here.
+    let child = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `child` is a valid, open descriptor and `st` is a valid
+    // out-pointer sized for `libc::stat`.
+    if unsafe { libc::fstat(child.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("stat {label}"));
+    }
+    // SAFETY: getuid takes no arguments and always succeeds.
+    if st.st_uid != unsafe { libc::getuid() } {
+        bail!("{label} is not owned by this user");
+    }
+    Ok(child)
+}
+
+/// Reject a directory writable by group or other, without altering it.
+fn require_private(fd: &OwnedFd, label: &str) -> Result<()> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is a valid, open descriptor and `st` is a valid out-pointer.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("stat {label}"));
+    }
+    if st.st_mode & 0o022 != 0 {
+        bail!("{label} must not be writable by group or other");
+    }
+    Ok(())
+}
+
+/// Force a directory this function owns end to end to the given mode.
+fn chmod_dir(fd: &OwnedFd, mode: u32, label: &str) -> Result<()> {
+    // SAFETY: `fd` is a valid, open directory descriptor.
+    if unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("chmod {label}"));
+    }
+    Ok(())
+}
+
+/// Build (or reuse) `home/.world/tmp/<ip>` and its `tmp`/`var`/`var/tmp`
+/// children by descriptor, so a symlink swapped in at any level -- before
+/// this runs or between our own checks -- is rejected rather than followed.
+/// `create_dir_all` plus path-based `set_permissions` do not have this
+/// property: both accept and follow a pre-existing symlink. `.world` and
+/// `.world/tmp` are shared by every workspace, so their permissions are only
+/// checked, never fixed; everything below the per-workspace `<ip>` directory
+/// is owned end to end by this function and is hardened to the exact mode it
+/// needs on every call.
+fn temp_root_in(home: &Path, ip: Ipv4Addr) -> Result<PathBuf> {
+    let home_cstr = CString::new(home.as_os_str().as_bytes()).context("HOME contains NUL")?;
+    // SAFETY: `home_cstr` is NUL-terminated; the returned fd is owned below.
+    let home_fd = unsafe {
+        libc::open(
+            home_cstr.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if home_fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open HOME");
+    }
+    // SAFETY: `home_fd` was just returned by `open` above.
+    let home_fd = unsafe { OwnedFd::from_raw_fd(home_fd) };
+
+    let world_fd = step(&home_fd, ".world", 0o700, "~/.world")?;
+    require_private(&world_fd, "~/.world")?;
+    let tmp_root_fd = step(&world_fd, "tmp", 0o700, "~/.world/tmp")?;
+    require_private(&tmp_root_fd, "~/.world/tmp")?;
+
+    let ip_name = ip.to_string();
+    let ip_fd = step(&tmp_root_fd, &ip_name, 0o700, "workspace temp root")?;
+    chmod_dir(&ip_fd, 0o700, "workspace temp root")?;
+    let tmp_fd = step(&ip_fd, "tmp", 0o700, "workspace temp root/tmp")?;
+    chmod_dir(&tmp_fd, 0o1777, "workspace temp root/tmp")?;
+    let var_fd = step(&ip_fd, "var", 0o700, "workspace temp root/var")?;
+    chmod_dir(&var_fd, 0o700, "workspace temp root/var")?;
+    let var_tmp_fd = step(&var_fd, "tmp", 0o700, "workspace temp root/var/tmp")?;
+    chmod_dir(&var_tmp_fd, 0o1777, "workspace temp root/var/tmp")?;
+
     // silo-bind's `..`-escape handling asks the kernel where a physical
     // prefix resolves and compares that against WORLD_TMP textually, so the
-    // root it is given must already be canonical (HOME is canonicalized
-    // above, but a symlink could still be introduced under `.world/tmp`).
-    root.canonicalize().context("temp root")
+    // root must already be exactly canonical: nothing above rewrites it.
+    let root = home.join(".world/tmp").join(&ip_name);
+    let canonical = root.canonicalize().context("temp root")?;
+    if canonical != root {
+        bail!("workspace temp root resolved to an unexpected location");
+    }
+    Ok(root)
+}
+
+#[cfg(all(test, unix))]
+mod temp_root_tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    fn ip() -> Ipv4Addr {
+        Ipv4Addr::new(127, 77, 0, 1)
+    }
+
+    // tempdir() on macOS lands under /var/folders, itself a host temp
+    // directory in disguise via /private; canonicalizing first gives
+    // temp_root_in a HOME it would actually accept.
+    fn home() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        (dir, home)
+    }
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    #[test]
+    fn hardens_a_fresh_tree_and_is_idempotent() {
+        let (_dir, home) = home();
+        let root = temp_root_in(&home, ip()).unwrap();
+        assert_eq!(root, home.join(".world/tmp").join(ip().to_string()));
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&root.join("tmp")), 0o1777);
+        assert_eq!(mode(&root.join("var")), 0o700);
+        assert_eq!(mode(&root.join("var/tmp")), 0o1777);
+        assert_eq!(temp_root_in(&home, ip()).unwrap(), root);
+    }
+
+    #[test]
+    fn rejects_a_symlinked_tmp_without_touching_its_target() {
+        let (_dir, home) = home();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(outside.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ip_dir = home.join(".world/tmp").join(ip().to_string());
+        std::fs::create_dir_all(&ip_dir).unwrap();
+        symlink(outside.path(), ip_dir.join("tmp")).unwrap();
+        let err = temp_root_in(&home, ip()).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert_eq!(mode(outside.path()), 0o755);
+    }
+
+    #[test]
+    fn rejects_a_symlinked_var() {
+        let (_dir, home) = home();
+        let outside = tempfile::tempdir().unwrap();
+        let ip_dir = home.join(".world/tmp").join(ip().to_string());
+        std::fs::create_dir_all(&ip_dir).unwrap();
+        symlink(outside.path(), ip_dir.join("var")).unwrap();
+        let err = temp_root_in(&home, ip()).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_symlinked_var_tmp() {
+        let (_dir, home) = home();
+        let outside = tempfile::tempdir().unwrap();
+        let ip_dir = home.join(".world/tmp").join(ip().to_string());
+        std::fs::create_dir_all(ip_dir.join("var")).unwrap();
+        symlink(outside.path(), ip_dir.join("var").join("tmp")).unwrap();
+        let err = temp_root_in(&home, ip()).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_symlinked_dot_world() {
+        let (_dir, home) = home();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), home.join(".world")).unwrap();
+        let err = temp_root_in(&home, ip()).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_regular_file_in_place_of_tmp() {
+        let (_dir, home) = home();
+        let ip_dir = home.join(".world/tmp").join(ip().to_string());
+        std::fs::create_dir_all(&ip_dir).unwrap();
+        std::fs::File::create(ip_dir.join("tmp")).unwrap();
+        let err = temp_root_in(&home, ip()).unwrap_err();
+        assert!(err.to_string().contains("real directory"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_group_writable_dot_world_without_fixing_it() {
+        let (_dir, home) = home();
+        let world_dir = home.join(".world");
+        std::fs::create_dir_all(&world_dir).unwrap();
+        std::fs::set_permissions(&world_dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let err = temp_root_in(&home, ip()).unwrap_err();
+        assert!(err.to_string().contains("group or other"), "{err}");
+        assert_eq!(mode(&world_dir), 0o770);
+    }
 }
 
 pub fn alias_ready(ip: Ipv4Addr) -> bool {
@@ -353,7 +567,7 @@ async fn macos_exec(
     let dir = run::workdir(&world.workdir)?;
     reject_shared_temp(&dir, "workdir")?;
     let temp = temp_root(&world)?;
-    let executable = resolve_executable(&command[0], &dir)?;
+    let executable = resolve_executable(&command[0], &dir, &temp)?;
     let library = std::env::current_exe()?
         .parent()
         .context("executable directory")?
@@ -415,22 +629,69 @@ async fn macos_exec(
 
 #[cfg(target_os = "macos")]
 fn executable_file(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
     path.is_file()
         && std::ffi::CString::new(path.as_os_str().as_bytes())
             .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 })
 }
 
+/// Map a candidate executable path the same way its containing workspace's
+/// temp directories are redirected at exec time, so an entry point below the
+/// host's `/tmp` resolves to the workspace's private copy instead. `Ok(None)`
+/// means the candidate does not exist and the caller should keep searching;
+/// any other error (a malformed root, an overlong result) is not a "try the
+/// next candidate" situation and is propagated instead.
 #[cfg(target_os = "macos")]
-fn resolve_executable(name: &std::ffi::OsStr, workdir: &Path) -> Result<PathBuf> {
+fn map_candidate(temp: &Path, candidate: &Path) -> Result<Option<PathBuf>> {
+    match world_tmp_path::map_under(temp, candidate) {
+        Ok(mapped) => Ok(Some(mapped)),
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::ENOENT | libc::ENOTDIR | libc::EACCES)
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e).with_context(|| format!("resolve {}", candidate.display())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_executable(name: &std::ffi::OsStr, workdir: &Path, temp: &Path) -> Result<PathBuf> {
+    resolve_executable_with_path(
+        name,
+        workdir,
+        temp,
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )
+}
+
+/// `path_var` is taken as a parameter, rather than read from the
+/// environment, so tests can exercise PATH search without mutating global
+/// process state.
+#[cfg(target_os = "macos")]
+fn resolve_executable_with_path(
+    name: &std::ffi::OsStr,
+    workdir: &Path,
+    temp: &Path,
+    path_var: &std::ffi::OsStr,
+) -> Result<PathBuf> {
     let path = Path::new(name);
     let path = if path.components().count() > 1 || path.is_absolute() {
-        workdir.join(path)
+        map_candidate(temp, &workdir.join(path))?.context("executable not found")?
     } else {
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|p| workdir.join(p).join(name))
-            .find(|p| executable_file(p))
-            .context("executable not found in PATH")?
+        let mut found = None;
+        for entry in std::env::split_paths(path_var) {
+            let candidate = workdir.join(entry).join(name);
+            let Some(mapped) = map_candidate(temp, &candidate)? else {
+                continue;
+            };
+            if executable_file(&mapped) {
+                found = Some(mapped);
+                break;
+            }
+        }
+        found.context("executable not found in PATH")?
     }
     .canonicalize()?;
     if ["/bin", "/sbin", "/usr/bin", "/usr/sbin", "/System"]
@@ -553,5 +814,67 @@ mod tests {
         assert_ne!(other.ip, ips[0]);
         let another = tempfile::tempdir().unwrap();
         assert!(create(state.path(), "A", another.path()).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn unique_name() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "wrt-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    // A copy of the running test binary: a real, native, non-SIP Mach-O
+    // executable that resolve_executable's SIP/setuid/magic checks accept.
+    fn place_copy(temp: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp.join("tmp").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("x");
+        std::fs::copy(std::env::current_exe().unwrap(), &bin).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_executable_maps_an_absolute_entry_point_below_host_tmp() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp = temp_dir.path().canonicalize().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let name = unique_name();
+        let bin = place_copy(&temp, &name);
+        let requested = format!("/tmp/{name}/x");
+        let resolved = resolve_executable_with_path(
+            std::ffi::OsStr::new(&requested),
+            workdir.path(),
+            &temp,
+            std::ffi::OsStr::new(""),
+        )
+        .unwrap();
+        assert_eq!(resolved, bin.canonicalize().unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_executable_maps_a_path_search_entry_point_below_host_tmp() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp = temp_dir.path().canonicalize().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let name = unique_name();
+        let bin = place_copy(&temp, &name);
+        let path_var = format!("/tmp/{name}");
+        let resolved = resolve_executable_with_path(
+            std::ffi::OsStr::new("x"),
+            workdir.path(),
+            &temp,
+            std::ffi::OsStr::new(&path_var),
+        )
+        .unwrap();
+        assert_eq!(resolved, bin.canonicalize().unwrap());
     }
 }

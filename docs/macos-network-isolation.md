@@ -62,6 +62,8 @@ mkdir -p ~/world-a ~/world-b
 - 已存在于 Workspace 之外、指向 `/tmp` 的符号链接由内核解析，不经过重定向；`fcntl(F_GETPATH)`、`accept/recvfrom` 返回的对端地址、原始系统调用和脚本 shebang 中位于 `/tmp` 的解释器不在覆盖范围内。
 - 从临时目录向上的 `..` 若前面有具名路径分量，会由内核在私有目录中解析实际位置后再判断；仍按字面处理的是临时目录之前宿主路径中的 `..`（如 `/Users/me/link/../../tmp`）以及私有目录内向上越出的相对符号链接（如 `/tmp/l -> ../etc`）。
 - 私有目录不会随 Workspace 自动清理，也不像宿主 `/tmp` 那样在重启时清空；需要时停止任务后手动删除。
+- `~/.world`、`~/.world/tmp`、`<地址>`、`tmp`、`var`、`var/tmp` 必须是当前用户拥有的真实目录（非符号链接），前两级不可被组/其他用户写；否则拒绝执行且不修改任何权限。
+- `world exec` 的入口程序（绝对/相对路径或经 PATH 查找）同样先按该 Workspace 的临时目录重定向，再做 SIP/setuid/脚本校验并启动；argv[0] 保持用户写法。
 
 `world workspace show A` 查看配置。Workspace 本地 ID 是开发用稳定标识，尚未对接 forkfs 全局 Workspace Resource ID 或组织授权。`create` 成功只表示元信息登记，不表示已配置地址或通过隔离验收。重启后需要重新 `setup`。停止所有关联任务后可以按 show 返回的地址手工执行 `sudo ifconfig lo0 -alias IP` 清理别名；这不会删除工作目录或注册表。
 

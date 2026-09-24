@@ -1,7 +1,10 @@
 #![allow(unsafe_code)]
 
 pub mod rewrite;
-#[cfg(any(target_os = "macos", test))]
+// The pure mapper's own tests live in `world-tmp-path`, exercised there
+// unconditionally; this module is now only the macOS libSystem-facing glue
+// around `WORLD_TMP`, so it need not compile at all elsewhere.
+#[cfg(target_os = "macos")]
 pub(crate) mod tmp;
 #[cfg(target_os = "macos")]
 mod world;

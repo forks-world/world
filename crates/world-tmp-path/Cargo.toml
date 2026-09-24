@@ -1,18 +1,12 @@
 [package]
-name = "world-silo-bind"
+name = "world-tmp-path"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license = "MIT"
 
-[lib]
-name = "world_silo_bind"
-crate-type = ["cdylib", "lib"]
-
 [dependencies]
 libc.workspace = true
-world-tmp-path = { path = "../../crates/world-tmp-path" }
 
 [dev-dependencies]
 proptest = "1"
-tempfile.workspace = true
