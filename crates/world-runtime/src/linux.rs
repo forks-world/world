@@ -1296,6 +1296,15 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
     // acknowledgment below, so it is alive and its PID cannot be reused.
     // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+    if pidfd < 0 {
+        let error = Error::last_os_error();
+        // Only a kernel without pidfds (before 5.3) may go on unpinned, as
+        // teardown then does too. On any other failure, return without the
+        // acknowledgment: the holder sees EOF and exits before setup.
+        if error.raw_os_error() != Some(libc::ENOSYS) {
+            return Err(error).context("pin World namespace holder");
+        }
+    }
     // SAFETY: a non-negative result is a new descriptor we exclusively own.
     let pidfd = (pidfd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) });
     // Let the holder continue only now that it is pinned.
