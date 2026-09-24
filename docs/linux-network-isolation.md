@@ -24,7 +24,7 @@ Linux 与 macOS 使用同一个 CLI（`world network exec`、`world silo ...`）
 3. 在私有 mount namespace 中把所有挂载递归设为只读和 `nodev`，只把工作目录和私有临时目录重新绑定为可写（仍为 `nodev`，其中的设备节点无法使用）。`/dev` 换成最小 tmpfs：只从宿主绑定 `null`、`zero`、`full`、`random`、`urandom`，另有 `fd`/`stdin`/`stdout`/`stderr` 符号链接和私有的 `/dev/shm`（64 MiB）。没有 `/dev/tty` 和 `/dev/pts`，任务无法打开宿主终端或其他设备节点并对其执行 ioctl。Landlock ABI 5+（Linux 6.10+）还会额外限制设备 ioctl。只读挂载会拒绝修改文件元数据（`chmod`、`chown`、时间戳、xattr），这些是 Landlock 管不到的。然后设置 `no_new_privs`，并清空能力（锁定 `SECBIT_NOROOT`、清除 ambient 能力、清空 bounding set），这样即使调用者是 root、在 namespace 内映射为 UID 0，任务也没有任何能力，无法重新挂载为可写；再用 Landlock 禁止工作目录、私有临时目录和 `/dev/null` 之外的写入，作为第二层限制。内核支持 Landlock ABI 6（Linux 6.12+）时，还禁止向沙箱外发送信号和连接沙箱外的抽象 Unix socket。
 4. 用 seccomp 拒绝 `AF_INET`、`AF_INET6`、`AF_NETLINK` 之外的 `socket()`、数据报类型的 `socketpair()`、`io_uring_setup`，以及密钥管理调用（`keyctl`、`add_key`、`request_key`，因为调用者的 session keyring 会被继承）。network namespace 管不到文件系统 Unix socket（例如 Docker、D-Bus），这一步就是阻止借用它们出网。数据报 socket 对的一端可以被 `connect` 或 `sendto` 重新指向宿主 Unix socket，所以只允许 stream 和 seqpacket 类型的 `socketpair`，用于进程内部通信。
 5. 在新的 PID namespace 中运行任务：由一个最小 init 担任 PID 1 并回收孤儿进程，任务是 PID 2，信号语义不变。任务退出、超时或被取消时，init 随之退出，内核会杀死该 namespace 中剩余的所有进程，包括用 `setsid`/`setpgid` 脱离进程组的后代。macOS 没有这项保证。
-6. 清空环境变量；拒绝 socket 标准输入，以及以可写方式打开的普通文件或块设备标准输入（Landlock 不限制沙箱建立前已打开的描述符）；关闭 0/1/2 之外继承的描述符。
+6. 清空环境变量；标准输入只接受匿名管道、`/dev/null` 或已关闭（见下文）；关闭 0/1/2 之外继承的描述符。
 
 与 macOS 的差异：
 
@@ -33,7 +33,7 @@ Linux 与 macOS 使用同一个 CLI（`world network exec`、`world silo ...`）
 - **进程信息**：所有支持的 Landlock ABI 都会阻止对沙箱外进程的 ptrace 及相关访问（`pidfd_getfd`、`process_vm_readv`、受保护的 `/proc/<pid>` 数据），因此任务无法借用宿主进程的 socket；但任务仍能列出宿主进程和它们的命令行。Linux 6.12 以前，同一 uid 的宿主进程也可能收到任务发出的信号。
 - **路径**：私有 `/dev` 会遮住宿主 `/dev` 下的路径，因此不支持位于 `/dev` 下的工作目录（例如 `/dev/shm/...`）；`TMPDIR` 指向 `/dev` 下时，私有临时目录改建在 `/tmp`。
 - **进程回收**：Linux 的两种模式都在 PID namespace 中运行任务，脱离进程组的后代也会被回收；任务内看到的 PID 是 namespace 内的编号。
-- **标准输入**：除匿名管道外（socket 会被拒绝），普通文件、目录、命名 FIFO、终端和其他设备作为标准输入时，都经管道转发给任务。即使是只读描述符，也能对其 inode 执行 `fchmod`、`fchown`、`futimens`、`fsetxattr`，所以任务不持有这些 inode 的描述符。因此在 Linux 上，任务的标准输入也不是终端（标准输出和标准错误本来就是管道）。文件作为标准输入时，从调用者当前的偏移处开始转发，但不移动调用者的偏移。
+- **标准输入**：Linux 的 `network exec` 只接受匿名管道、`/dev/null` 或已关闭的标准输入。其他文件、目录、命名 FIFO、终端和设备都会被拒绝，因为即使是只读描述符，也能对其 inode 执行 `fchmod`、`fchown`、`futimens`、`fsetxattr` 或终端 ioctl。需要输入文件时改用管道，例如 `cat FILE | world network exec ...`。`/dev/null` 会在沙箱内从只读的私有 `/dev` 重新打开，因此任务不持有宿主的设备节点。
 - **硬链接**：与 macOS 一样，写入边界基于路径。调用者事先放进工作目录、指向外部文件的硬链接会共享同一个 inode，任务可以通过它写入。任务自己无法创建这类别名：硬链接跨挂载会返回 `EXDEV`，经符号链接写入会落在只读视图上。forkfs Workspace 用 clonefile/reflink 创建独立 inode，不会产生这种别名；自行指定工作目录时，不要放入指向需保护文件的硬链接。
 - **读取**：与 macOS 一样，不限制读取宿主文件。
 
@@ -66,4 +66,4 @@ cargo build --workspace --locked && cargo build --workspace --examples --locked
 python3 -m unittest discover -s tests -v < /dev/null
 ```
 
-Linux 验收默认运行，不需要额外环境变量。CI 的 Ubuntu job 会先关闭 AppArmor 对非特权 user namespace 的限制。标准输入必须不是 socket（例如某些 Agent 终端），否则 `world` 会按设计拒绝执行。
+Linux 验收默认运行，不需要额外环境变量。CI 的 Ubuntu job 会先关闭 AppArmor 对非特权 user namespace 的限制。测试会显式把 `/dev/null` 作为 `world` 的标准输入，因此与运行测试的终端无关。

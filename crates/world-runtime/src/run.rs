@@ -122,23 +122,24 @@ async fn seatbelt(options: RunOptions, cancel: CancellationToken) -> Result<i32>
     result
 }
 
-/// Whether stdin must be relayed: anything but an anonymous pipe (or a
-/// socket, refused elsewhere) is a filesystem or device inode, and even a
-/// read-only descriptor allows fchmod, fchown, futimens and fsetxattr on it.
+/// Linux network exec accepts stdin only as an anonymous pipe, the null
+/// device (replaced inside the sandbox) or closed. Any other file, FIFO,
+/// terminal or device is an inode the workload could modify through the
+/// inherited descriptor (fchmod, fchown, futimens, fsetxattr, ioctl).
 #[cfg(target_os = "linux")]
-pub(crate) fn stdin_needs_relay() -> Result<bool> {
+pub(crate) fn check_linux_stdin() -> Result<()> {
     const PIPEFS_MAGIC: u32 = 0x5049_5045;
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: fstat initializes the provided stat structure only on success.
     if unsafe { libc::fstat(libc::STDIN_FILENO, stat.as_mut_ptr()) } != 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::EBADF) {
-            return Ok(false);
+            return Ok(());
         }
         return Err(error.into());
     }
-    match unsafe { stat.assume_init() }.st_mode & libc::S_IFMT {
-        libc::S_IFSOCK => Ok(false),
+    let stat = unsafe { stat.assume_init() };
+    let accepted = match stat.st_mode & libc::S_IFMT {
         libc::S_IFIFO => {
             let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
             // SAFETY: fstatfs initializes the structure only on success.
@@ -146,10 +147,23 @@ pub(crate) fn stdin_needs_relay() -> Result<bool> {
                 return Err(std::io::Error::last_os_error().into());
             }
             // f_type's integer type differs between C libraries.
-            Ok(unsafe { fs.assume_init() }.f_type as u32 != PIPEFS_MAGIC)
+            unsafe { fs.assume_init() }.f_type as u32 == PIPEFS_MAGIC
         }
-        _ => Ok(true),
+        libc::S_IFCHR => is_null_device(stat.st_rdev),
+        _ => false,
+    };
+    if !accepted {
+        bail!(
+            "stdin must be a pipe or /dev/null for Linux network exec; \
+             e.g. `cat FILE | world network exec ...`"
+        );
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn is_null_device(rdev: libc::dev_t) -> bool {
+    libc::major(rdev) == 1 && libc::minor(rdev) == 3
 }
 
 /// An inherited descriptor keeps its access mode inside the sandbox, so a
@@ -207,177 +221,10 @@ pub(crate) struct Workload {
     guard: ProcessGroup,
     out: Forward,
     err: Forward,
-    relay: Option<StdinRelay>,
 }
 
-/// Copies the caller's stdin into the workload's stdin pipe on a thread
-/// that reads only when poll reports input, so cancelling it never leaves
-/// a read pending that would consume input meant for someone else.
-#[cfg(unix)]
-struct StdinRelay {
-    cancel: std::os::fd::OwnedFd,
-    /// Held across "check cancelled, then read": once drop sets it, no
-    /// further read of the caller's stdin can start.
-    cancelled: std::sync::Arc<std::sync::Mutex<bool>>,
-}
-
-#[cfg(unix)]
-impl StdinRelay {
-    fn start(input: tokio::process::ChildStdin) -> Result<Self> {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        let (source, mut offset) = relay_source()?;
-        let target = input.into_owned_fd()?;
-        // Our own pipe end: block on writes instead of spinning.
-        // SAFETY: fcntl on an owned descriptor with integer arguments.
-        unsafe {
-            let flags = libc::fcntl(target.as_raw_fd(), libc::F_GETFL);
-            libc::fcntl(target.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
-        }
-        let mut fds = [0; 2];
-        // SAFETY: pipe writes two new descriptors into fds on success.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        // SAFETY: both descriptors are new and exclusively owned here.
-        let wake = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        let cancel = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        for fd in [&wake, &cancel] {
-            // SAFETY: fcntl on an owned descriptor with integer arguments.
-            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
-        }
-        let cancelled = std::sync::Arc::new(std::sync::Mutex::new(false));
-        let flag = cancelled.clone();
-        std::thread::spawn(move || {
-            use std::io::Write;
-            let mut target = std::fs::File::from(target);
-            let mut buf = [0u8; 16384];
-            let stopped = || *flag.lock().unwrap_or_else(|e| e.into_inner());
-            // Files: positional reads, outside the lock (they may block).
-            while let Some(at) = offset.as_mut() {
-                if stopped() {
-                    return;
-                }
-                let (fd, len) = (source.as_raw_fd(), buf.len());
-                // SAFETY: buf is a live, writable buffer of the given length.
-                let n = unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), len, *at) };
-                let error = std::io::Error::last_os_error();
-                if n < 0 && error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                // EOF, error, or the workload stopped reading (EPIPE).
-                if n <= 0 || target.write_all(&buf[..n as usize]).is_err() {
-                    return;
-                }
-                *at += n as libc::off_t;
-            }
-            loop {
-                let mut polls = [
-                    libc::pollfd {
-                        fd: source.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                    libc::pollfd {
-                        fd: wake.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                ];
-                // SAFETY: polls is a live array of two pollfd structures.
-                if unsafe { libc::poll(polls.as_mut_ptr(), 2, -1) } < 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return;
-                }
-                if polls[1].revents != 0 {
-                    return;
-                }
-                let (fd, len) = (source.as_raw_fd(), buf.len());
-                let n = {
-                    let stop = flag.lock().unwrap_or_else(|e| e.into_inner());
-                    if *stop {
-                        return;
-                    }
-                    // Never blocks: see relay_source.
-                    // SAFETY: buf is a live, writable buffer of the given length.
-                    unsafe { libc::read(fd, buf.as_mut_ptr().cast(), len) }
-                };
-                if n < 0 {
-                    let error = std::io::Error::last_os_error();
-                    // Another reader took the input first; wait again.
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                    ) {
-                        continue;
-                    }
-                    return;
-                }
-                // EOF, or the workload stopped reading (EPIPE).
-                if n == 0 || target.write_all(&buf[..n as usize]).is_err() {
-                    return;
-                }
-            }
-        });
-        Ok(Self { cancel, cancelled })
-    }
-}
-
-/// The relay's own descriptor for stdin, and for files the offset to read
-/// from. Terminals and FIFOs may be shared with another reader that
-/// consumes input between poll and read, so they are reopened as a
-/// separate, non-blocking open file description: a read (held under the
-/// cancellation lock) never blocks, and the caller's stdin flags stay
-/// untouched. Files, directories and block devices are read with pread at
-/// the relay's own offset: such reads can block (FUSE, NFS), so they are
-/// not done under the lock, and one finishing after cancellation consumes
-/// nothing that anyone else would read.
-#[cfg(unix)]
-fn relay_source() -> Result<(std::os::fd::OwnedFd, Option<libc::off_t>)> {
-    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
-    let stdin = std::io::stdin().as_fd().try_clone_to_owned()?;
-    let kind = std::fs::File::from(stdin.try_clone()?)
-        .metadata()?
-        .file_type();
-    use std::os::unix::fs::FileTypeExt;
-    if !(kind.is_fifo() || kind.is_char_device()) {
-        // SAFETY: lseek on an owned descriptor with integer arguments.
-        let offset = unsafe { libc::lseek(stdin.as_raw_fd(), 0, libc::SEEK_CUR) };
-        return Ok((stdin, Some(offset.max(0))));
-    }
-    let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
-    // SAFETY: a NUL-terminated literal path and integer flags.
-    let fd = unsafe { libc::open(c"/proc/self/fd/0".as_ptr(), flags) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("reopen stdin for relaying");
-    }
-    // SAFETY: open returned a new descriptor we exclusively own.
-    Ok((unsafe { OwnedFd::from_raw_fd(fd) }, None))
-}
-
-#[cfg(unix)]
-impl Drop for StdinRelay {
-    fn drop(&mut self) {
-        use std::os::fd::AsRawFd;
-        // Waits out a read already in progress, then forbids new ones.
-        *self.cancelled.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        // Wakes the relay's poll. A write blocked on a full pipe ends with
-        // EPIPE once the workload, which holds the other end, is killed.
-        // SAFETY: writes one byte from a static buffer to an owned pipe.
-        unsafe { libc::write(self.cancel.as_raw_fd(), b"x".as_ptr().cast(), 1) };
-    }
-}
-
-/// `relay_stdin`: pass stdin through a pipe instead of the inherited
-/// descriptor, so the workload holds no descriptor for the underlying file.
-pub(crate) fn spawn(mut cmd: Command, relay_stdin: bool) -> Result<Workload> {
-    cmd.stdin(if relay_stdin {
-        Stdio::piped()
-    } else {
-        Stdio::inherit()
-    })
+pub(crate) fn spawn(mut cmd: Command) -> Result<Workload> {
+    cmd.stdin(Stdio::inherit())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .kill_on_drop(true);
@@ -388,7 +235,6 @@ pub(crate) fn spawn(mut cmd: Command, relay_stdin: bool) -> Result<Workload> {
     // Armed first: any later error kills the whole group, including the
     // PID-namespace init and workload behind the spawned wrapper.
     let guard = ProcessGroup(pid);
-    let relay = child.stdin.take().map(StdinRelay::start).transpose()?;
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let out =
@@ -400,7 +246,6 @@ pub(crate) fn spawn(mut cmd: Command, relay_stdin: bool) -> Result<Workload> {
         guard,
         out,
         err,
-        relay,
     })
 }
 
@@ -415,7 +260,7 @@ pub(crate) async fn supervise(
     if cancel.is_cancelled() || Instant::now() >= deadline {
         return Ok(124);
     }
-    wait(spawn(cmd, false)?, deadline, cancel, proxy, ack).await
+    wait(spawn(cmd)?, deadline, cancel, proxy, ack).await
 }
 
 pub(crate) async fn wait(
@@ -430,7 +275,6 @@ pub(crate) async fn wait(
         guard,
         out,
         err,
-        relay,
     } = workload;
     let injection_failure = async {
         if let Some(path) = ack {
@@ -451,7 +295,6 @@ pub(crate) async fn wait(
         proxy.close().await;
     }
     drop(guard);
-    drop(relay);
     if status.is_none() {
         let _ = child.kill().await;
         let _ = child.wait().await;

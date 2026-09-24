@@ -33,6 +33,9 @@ DIAL_DENIED = 77 if MACOS else 78
 
 
 def run(*args, **kwargs):
+    # Independent of the runner's own stdin, which Linux network exec checks.
+    if "stdin" not in kwargs and "input" not in kwargs:
+        kwargs["stdin"] = subprocess.DEVNULL
     return subprocess.run([str(x) for x in args], capture_output=True, text=True, timeout=15, **kwargs)
 
 
@@ -279,28 +282,34 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
                 time.sleep(3)
                 self.assertFalse((self.dir / "marker").exists())
 
-    @unittest.skipUnless(LINUX, "stdin relay is Linux-specific")
-    def test_file_stdin_is_relayed_through_a_pipe(self):
+    @unittest.skipUnless(LINUX, "Linux stdin policy")
+    def test_stdin_must_be_a_pipe_or_null(self):
+        # Any other inode could be modified through the inherited descriptor
+        # (fchmod, futimens, fsetxattr, terminal ioctls).
         with tempfile.TemporaryDirectory() as outside:
             target = pathlib.Path(outside) / "target"
             target.write_text("content")
-            target.chmod(0o644)
-            script = "import os, stat, sys\ntry: os.fchmod(0, 0o600)\nexcept OSError: pass\nprint(stat.S_ISFIFO(os.fstat(0).st_mode), sys.stdin.read())"
-            with open(target) as stdin:
-                result = self.network("/usr/bin/python3", "-c", script, stdin=stdin)
-            self.assertEqual((result.returncode, result.stdout), (0, "True content\n"), result.stderr)
-            self.assertEqual(target.stat().st_mode & 0o777, 0o644)
             fifo = pathlib.Path(outside) / "fifo"
-            os.mkfifo(fifo, 0o644)
+            os.mkfifo(fifo)
             fd = os.open(fifo, os.O_RDWR)
             try:
-                os.write(fd, b"fifo")
-                check = "import os, stat\ntry: os.fchmod(0, 0o600)\nexcept OSError: pass\nprint(stat.S_ISFIFO(os.fstat(0).st_mode), os.read(0, 4).decode())"
-                result = self.network("/usr/bin/python3", "-c", check, stdin=fd)
+                with open(target) as file:
+                    for stdin in [file, fd]:
+                        result = self.network("/bin/cat", stdin=stdin)
+                        self.assertEqual(result.returncode, 125, result.stderr)
+                        self.assertIn("stdin must be a pipe or /dev/null", result.stderr)
             finally:
                 os.close(fd)
-            self.assertEqual((result.returncode, result.stdout), (0, "True fifo\n"), result.stderr)
-            self.assertEqual(fifo.stat().st_mode & 0o777, 0o644)
+        result = self.network("/bin/cat", input="piped")
+        self.assertEqual((result.returncode, result.stdout), (0, "piped"), result.stderr)
+        check = "import os\nst = os.fstat(0)\nprint(os.major(st.st_rdev), os.minor(st.st_rdev), os.read(0, 1) == b'')"
+        result = self.network("/usr/bin/python3", "-c", check, stdin=subprocess.DEVNULL)
+        self.assertEqual((result.returncode, result.stdout), (0, "1 3 True\n"), result.stderr)
+        # The null device comes from the private read-only /dev.
+        result = run("unshare", "-r", WORLD, "network", "exec", "--policy", self.policy, "--workdir", self.dir,
+                     "--", "/usr/bin/python3", "-c", "import os; os.fchmod(0, 0o600)", stdin=subprocess.DEVNULL)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Read-only file system", result.stderr)
 
     @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_writable_file_stdin_is_refused(self):
@@ -314,7 +323,10 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
             self.assertEqual(target.read_text(), "original")
             with open(target) as stdin:
                 result = self.network("/bin/cat", stdin=stdin)
-            self.assertEqual((result.returncode, result.stdout), (0, "original"), result.stderr)
+            if MACOS:
+                self.assertEqual((result.returncode, result.stdout), (0, "original"), result.stderr)
+            else:
+                self.assertEqual(result.returncode, 125, result.stderr)
 
     @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_exit_timeout_and_open_stdin(self):
@@ -587,7 +599,8 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
                 streams = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
                 streams[destination] = w
                 with subprocess.Popen([str(WORLD), "network", "exec", "--policy", str(self.policy),
-                        "--workdir", str(self.dir), "--timeout", "10s", "--", str(PROBE), "burst", destination], **streams) as process:
+                        "--workdir", str(self.dir), "--timeout", "10s", "--", str(PROBE), "burst", destination],
+                        stdin=subprocess.DEVNULL, **streams) as process:
                     os.close(w)
                     w = None
                     time.sleep(2)

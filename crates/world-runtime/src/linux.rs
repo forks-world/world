@@ -197,6 +197,17 @@ pub(crate) unsafe fn enter_read_only_view(view: &WritableView) -> IoResult<()> {
             result?;
         }
         private_dev()?;
+        // A null-device stdin is reopened from the private, read-only
+        // /dev, so not even a root caller's workload holds the host node.
+        let mut stat = std::mem::zeroed::<libc::stat>();
+        if libc::fstat(0, &mut stat) == 0
+            && stat.st_mode & libc::S_IFMT == libc::S_IFCHR
+            && crate::run::is_null_device(stat.st_rdev)
+        {
+            let null = check(libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY))?;
+            check(libc::dup2(null, 0))?;
+            libc::close(null);
+        }
         check(libc::chdir(view.workdir.as_ptr()))?;
     }
     Ok(())
@@ -1045,10 +1056,11 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
         });
     }
     run::check_stdin()?;
+    run::check_linux_stdin()?;
     if cancel.is_cancelled() || Instant::now() >= deadline {
         return Ok(124);
     }
-    let workload = run::spawn(cmd, run::stdin_needs_relay()?)?;
+    let workload = run::spawn(cmd)?;
     drop(ruleset);
     let mut proxy = match (prepared, channel) {
         (Some(prepared), Some((parent, child))) => {
