@@ -1099,19 +1099,38 @@ impl Holder {
 
     /// Open the held namespaces, verifying they still belong to this holder.
     pub(crate) fn open(&self) -> Result<(OwnedFd, OwnedFd)> {
-        let open = |kind: &str, expected: u64| -> Result<OwnedFd> {
-            let file = std::fs::File::open(format!("/proc/{}/ns/{kind}", self.pid))?;
-            if file.metadata()?.ino() != expected {
-                bail!("namespace changed");
-            }
-            Ok(file.into())
+        self.verify()?.context("World namespace holder is no longer running")
+    }
+
+    /// `Ok(None)` only when the holder is definitely gone: the process no
+    /// longer exists, or its namespaces or start time differ from the
+    /// record. Anything else (e.g. EMFILE) is an error, so callers keep the
+    /// record instead of forgetting a live holder.
+    pub(crate) fn verify(&self) -> Result<Option<(OwnedFd, OwnedFd)>> {
+        let gone = |err: &std::io::Error| {
+            err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ESRCH)
         };
-        let (user, net) = (open("user", self.user_ns)?, open("net", self.net_ns)?);
+        let open = |kind: &str, expected: u64| -> Result<Option<OwnedFd>> {
+            let file = match std::fs::File::open(format!("/proc/{}/ns/{kind}", self.pid)) {
+                Ok(file) => file,
+                Err(err) if gone(&err) => return Ok(None),
+                Err(err) => return Err(err.into()),
+            };
+            Ok((file.metadata()?.ino() == expected).then(|| file.into()))
+        };
+        let Some(user) = open("user", self.user_ns)? else {
+            return Ok(None);
+        };
+        let Some(net) = open("net", self.net_ns)? else {
+            return Ok(None);
+        };
         // Checked after opening: descriptors keep the namespaces alive.
-        if start_time(self.pid)? != self.start_time {
-            bail!("holder process replaced");
+        match start_time(self.pid) {
+            Ok(time) if time == self.start_time => Ok(Some((user, net))),
+            Ok(_) => Ok(None),
+            Err(err) if err.downcast_ref::<std::io::Error>().is_some_and(gone) => Ok(None),
+            Err(err) => Err(err),
         }
-        Ok((user, net))
     }
 }
 

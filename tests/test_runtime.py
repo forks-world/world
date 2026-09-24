@@ -867,6 +867,29 @@ class LinuxSilo(unittest.TestCase):
         time.sleep(0.3)
         self.assertEqual(self.holders() - before, set())
 
+    def test_stale_holder_is_replaced_and_forgotten(self):
+        work = self.root / "E"
+        work.mkdir()
+        silo = [WORLD, "silo", "--state-dir", self.state]
+        self.assertEqual(run(*silo, "create", "--world", "E", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *silo, "teardown", "--world", "E")
+        for _ in range(2):
+            self.assertEqual(run(*silo, "setup", "--world", "E").returncode, 0)
+            pid = json.loads((self.state / "holders.json").read_text())["E"]["pid"]
+            os.kill(pid, 9)
+            for _ in range(50):
+                if not os.path.exists(f"/proc/{pid}"):
+                    break
+                time.sleep(0.1)
+        # A dead holder is replaced by setup; teardown forgets a dead one.
+        self.assertEqual(run(*silo, "setup", "--world", "E").returncode, 0)
+        self.assertEqual(run(*self.command("E", "fd", "999")).returncode, 0)
+        pid = json.loads((self.state / "holders.json").read_text())["E"]["pid"]
+        os.kill(pid, 9)
+        time.sleep(0.3)
+        self.assertEqual(run(*silo, "teardown", "--world", "E").returncode, 0)
+        self.assertNotIn("E", json.loads((self.state / "holders.json").read_text()))
+
     def test_escaped_descendants_are_killed(self):
         work = self.root / "A"
         command = [WORLD, "silo", "--state-dir", self.state, "exec", "--world", "A", "--", "/bin/sh", "-c",

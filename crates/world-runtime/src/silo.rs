@@ -138,8 +138,11 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
     {
         let _lock = lock(state)?;
         let mut holders = read_map::<crate::linux::Holder>(state, "holders.json")?;
-        if holders.get(&world.id).is_some_and(|h| h.open().is_ok()) {
-            return Ok(());
+        if let Some(holder) = holders.get(&world.id) {
+            // A transient verification error must not orphan a live holder.
+            if holder.verify()?.is_some() {
+                return Ok(());
+            }
         }
         let holder = crate::linux::start_holder()?;
         holders.insert(world.id.clone(), holder);
@@ -181,7 +184,9 @@ pub fn teardown(state: &Path, world: &World) -> Result<()> {
         let _lock = lock(state)?;
         let mut holders = read_map::<crate::linux::Holder>(state, "holders.json")?;
         if let Some(holder) = holders.remove(&world.id) {
-            if holder.open().is_ok() {
+            // Forget the record only once the holder is stopped or gone;
+            // a transient verification error keeps it for a retry.
+            if holder.verify()?.is_some() {
                 crate::linux::stop_holder(&holder)?;
             }
             persist(state, "holders.json", &holders)?;
