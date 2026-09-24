@@ -225,10 +225,7 @@ struct StdinRelay {
 impl StdinRelay {
     fn start(input: tokio::process::ChildStdin) -> Result<Self> {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        let source = {
-            use std::os::fd::AsFd;
-            std::io::stdin().as_fd().try_clone_to_owned()?
-        };
+        let source = relay_source()?;
         let target = input.into_owned_fd()?;
         // Our own pipe end: block on writes instead of spinning.
         // SAFETY: fcntl on an owned descriptor with integer arguments.
@@ -284,19 +281,54 @@ impl StdinRelay {
                     if *stop {
                         return;
                     }
-                    // Poll reported input, so this read does not block while
-                    // the lock is held.
+                    // Never blocks: see relay_source.
                     // SAFETY: buf is a live, writable buffer of the given length.
                     unsafe { libc::read(fd, buf.as_mut_ptr().cast(), len) }
                 };
-                // EOF, error, or the workload stopped reading (EPIPE).
-                if n <= 0 || target.write_all(&buf[..n as usize]).is_err() {
+                if n < 0 {
+                    let error = std::io::Error::last_os_error();
+                    // Another reader took the input first; wait again.
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) {
+                        continue;
+                    }
+                    return;
+                }
+                // EOF, or the workload stopped reading (EPIPE).
+                if n == 0 || target.write_all(&buf[..n as usize]).is_err() {
                     return;
                 }
             }
         });
         Ok(Self { cancel, cancelled })
     }
+}
+
+/// The relay's own descriptor for stdin. Terminals and FIFOs may be
+/// shared with another reader that consumes input between poll and read,
+/// so they are reopened as a separate, non-blocking open file description:
+/// the read (held under the cancellation lock) never blocks, and the
+/// caller's own stdin flags stay untouched. Reads from regular files,
+/// directories and block devices never block, so those are duplicated.
+#[cfg(unix)]
+fn relay_source() -> Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+    let stdin = std::io::stdin().as_fd().try_clone_to_owned()?;
+    let kind = std::fs::File::from(stdin.try_clone()?).metadata()?.file_type();
+    use std::os::unix::fs::FileTypeExt;
+    if !(kind.is_fifo() || kind.is_char_device()) {
+        return Ok(stdin);
+    }
+    let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: a NUL-terminated literal path and integer flags.
+    let fd = unsafe { libc::open(c"/proc/self/fd/0".as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("reopen stdin for relaying");
+    }
+    // SAFETY: open returned a new descriptor we exclusively own.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 #[cfg(unix)]

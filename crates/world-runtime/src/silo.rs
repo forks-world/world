@@ -408,6 +408,29 @@ mod tests {
         panic!("holder still running after teardown");
     }
 
+    /// A caller that is a child subreaper adopts the double-forked holder;
+    /// teardown must reap it rather than leave a zombie behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn teardown_reaps_holder_adopted_by_subreaper() {
+        // SAFETY: prctl with integer arguments on this test process.
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let world = create(state.path(), "adopted", work.path()).unwrap();
+        setup(state.path(), &world).unwrap();
+        let pid = holder(state.path(), "adopted").unwrap().pid;
+        let parent = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        assert!(parent.contains(&format!("PPid:\t{}\n", std::process::id())));
+        teardown(state.path(), &world).unwrap();
+        // SAFETY: as above.
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0) };
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "holder left as a zombie"
+        );
+    }
+
     #[test]
     fn allocation_serializes_world_identity() {
         let state = tempfile::tempdir().unwrap();
