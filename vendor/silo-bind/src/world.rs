@@ -1,7 +1,15 @@
 //! World-specific restrictions on silo's cooperative address translation.
-use std::{ffi::CStr, net::Ipv4Addr, path::Path};
+use std::{
+    ffi::{CStr, OsStr},
+    net::Ipv4Addr,
+    os::raw::c_int,
+    path::{Path, PathBuf},
+};
 
-static INJECTION: std::sync::OnceLock<Option<(String, String)>> = std::sync::OnceLock::new();
+/// The `DYLD_INSERT_LIBRARIES` and `SILO_IP` values this process was itself
+/// launched with, as raw bytes (see `injection_matches`).
+type Injection = (Box<[u8]>, Box<[u8]>);
+static INJECTION: std::sync::OnceLock<Option<Injection>> = std::sync::OnceLock::new();
 
 pub unsafe fn address_allowed(
     addr: *const libc::sockaddr,
@@ -63,23 +71,52 @@ fn executable_file(path: &Path) -> bool {
             .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 })
 }
 
+/// Walk `path_var` like `execvp`, joining each entry against `cwd` (an empty
+/// entry means `cwd` itself, matching `posix_spawnp`) before asking `map` to
+/// redirect the candidate below a temp root. A `map` error that just means
+/// "this entry does not exist" (`skippable`) moves on to the next entry; any
+/// other error aborts the whole search. Pure and allocation-only, so it is
+/// unit-testable without touching the filesystem.
+fn search_path(
+    name: &OsStr,
+    cwd: &Path,
+    path_var: &OsStr,
+    map: impl Fn(&Path) -> Result<PathBuf, c_int>,
+    exec: impl Fn(&Path) -> bool,
+) -> Result<PathBuf, c_int> {
+    for entry in std::env::split_paths(path_var) {
+        let candidate = cwd.join(&entry).join(name);
+        let mapped = match map(&candidate) {
+            Ok(p) => p,
+            Err(e) if world_tmp_path::skippable(e) => continue,
+            Err(e) => return Err(e),
+        };
+        if exec(&mapped) {
+            return Ok(mapped);
+        }
+    }
+    Err(libc::EACCES)
+}
+
 /// Resolve a spawnp candidate once so policy checks, shebang inspection and
 /// the actual spawn all refer to the same file. argv itself remains untouched.
-pub unsafe fn path_candidate(path: *const libc::c_char) -> Option<std::ffi::CString> {
+/// The returned pathname (including a symlink) is absolute, since it is used
+/// both as the exec target and, for a shebang script, as the script's own
+/// argv entry (see `resolve_sip_exec`).
+pub unsafe fn path_candidate(path: *const libc::c_char) -> Result<std::ffi::CString, c_int> {
     use std::os::unix::ffi::OsStrExt;
     if path.is_null() {
-        return None;
+        return Err(libc::EACCES);
     }
     let name = std::ffi::OsStr::from_bytes(unsafe { CStr::from_ptr(path) }.to_bytes());
     if name.as_bytes().contains(&b'/') {
-        return Some(unsafe { CStr::from_ptr(path) }.to_owned());
+        return Ok(unsafe { CStr::from_ptr(path) }.to_owned());
     }
-    let candidate = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|p| crate::tmp::map_path(&p.join(name)))
-        .find(|p| executable_file(p))?;
-    // Keep the selected pathname (including a symlink) as the script argv entry.
-    let candidate = std::env::current_dir().ok()?.join(candidate);
-    std::ffi::CString::new(candidate.as_os_str().as_bytes()).ok()
+    // Our own image's calls are not interposed, so this is the physical cwd.
+    let cwd = std::env::current_dir().map_err(|_| libc::EACCES)?;
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let found = search_path(name, &cwd, &path_var, crate::tmp::map_path, executable_file)?;
+    std::ffi::CString::new(found.as_os_str().as_bytes()).map_err(|_| libc::EACCES)
 }
 
 /// The final exec target must be a native binary, never an unresolved script.
@@ -132,6 +169,47 @@ pub unsafe fn native_target(path: *const libc::c_char) -> bool {
     valid
 }
 
+/// True when every `DYLD_INSERT_LIBRARIES=`/`SILO_IP=`/`WORLD_TMP=` entry in
+/// `entries` carries exactly the expected bytes (duplicates are all checked,
+/// so a later, conflicting occurrence cannot slip past an earlier matching
+/// one), `library`/`ip` were both seen and are non-empty, and `WORLD_TMP`
+/// was seen exactly when `tmp` expects one. Comparison is byte-for-byte
+/// rather than through any lossy text conversion: a replacement character
+/// can make two different invalid byte sequences compare equal as strings,
+/// which would let a forged value slip past a lossy comparison.
+fn injection_matches<'a>(
+    entries: impl IntoIterator<Item = &'a [u8]>,
+    library: &[u8],
+    ip: &[u8],
+    tmp: Option<&[u8]>,
+) -> bool {
+    let mut has_library = false;
+    let mut has_ip = false;
+    let mut has_tmp = false;
+    for entry in entries {
+        if let Some(value) = entry.strip_prefix(b"DYLD_INSERT_LIBRARIES=") {
+            if value != library {
+                return false;
+            }
+            has_library = true;
+        } else if let Some(value) = entry.strip_prefix(b"SILO_IP=") {
+            if value != ip {
+                return false;
+            }
+            has_ip = true;
+        } else if let Some(value) = entry.strip_prefix(b"WORLD_TMP=") {
+            let Some(expected) = tmp else {
+                return false;
+            };
+            if value != expected {
+                return false;
+            }
+            has_tmp = true;
+        }
+    }
+    has_library && has_ip && (has_tmp == tmp.is_some()) && !library.is_empty() && !ip.is_empty()
+}
+
 /// Refuse child launches that would silently lose injection. This is a
 /// compatibility check, not protection from a program using raw syscalls.
 pub unsafe fn spawn_allowed(path: *const libc::c_char, envp: *const *const libc::c_char) -> bool {
@@ -158,34 +236,13 @@ pub unsafe fn spawn_allowed(path: *const libc::c_char, envp: *const *const libc:
         let Some((library, ip)) = INJECTION.get().and_then(Option::as_ref) else {
             return false;
         };
-        let mut has_library = false;
-        let mut has_ip = false;
-        let mut tmp = None;
-        for i in 0..65536 {
-            let entry = unsafe { *envp.add(i) };
-            if entry.is_null() {
-                break;
-            }
-            let value = unsafe { CStr::from_ptr(entry) }.to_string_lossy();
-            if let Some(value) = value.strip_prefix("DYLD_INSERT_LIBRARIES=") {
-                if value != library {
-                    return false;
-                }
-                has_library = true;
-            }
-            if let Some(value) = value.strip_prefix("SILO_IP=") {
-                if value != ip {
-                    return false;
-                }
-                has_ip = true;
-            }
-            if let Some(value) = value.strip_prefix("WORLD_TMP=") {
-                tmp = Some(value.to_owned());
-            }
-        }
+        // No allocation: each entry borrows straight from the child's envp.
+        let entries = (0..65536)
+            .map(|i| unsafe { *envp.add(i) })
+            .take_while(|entry| !entry.is_null())
+            .map(|entry| unsafe { CStr::from_ptr(entry) }.to_bytes());
         // A child without the same temp root would silently share host /tmp.
-        let same_tmp = tmp.as_deref().map(str::as_bytes) == crate::tmp::root();
-        has_library && has_ip && same_tmp && !library.is_empty() && !ip.is_empty()
+        injection_matches(entries, library, ip, crate::tmp::root())
     })();
     if !valid {
         unsafe {
@@ -198,9 +255,12 @@ pub unsafe fn spawn_allowed(path: *const libc::c_char, envp: *const *const libc:
 pub fn acknowledge(tmp_valid: bool) {
     // Constructor-time values cannot be replaced by later setenv calls.
     INJECTION.get_or_init(|| {
+        use std::os::unix::ffi::OsStrExt;
+        let library = std::env::var_os("DYLD_INSERT_LIBRARIES")?;
+        let ip = std::env::var_os("SILO_IP")?;
         Some((
-            std::env::var("DYLD_INSERT_LIBRARIES").ok()?,
-            std::env::var("SILO_IP").ok()?,
+            library.as_bytes().to_vec().into_boxed_slice(),
+            ip.as_bytes().to_vec().into_boxed_slice(),
         ))
     });
     if std::env::var("WORLD_SILO_ACTIVE").as_deref() != Ok("1") {
@@ -236,5 +296,150 @@ pub fn acknowledge(tmp_valid: bool) {
         if n != data.len() as isize {
             libc::_exit(125);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_path_maps_a_relative_entry_crossing_tmp_after_absolutizing() {
+        // The entry itself never mentions /tmp; only joining it against cwd
+        // does, so the map function only ever sees absolute candidates.
+        let cwd = Path::new("/tmp/wt-x");
+        let map = |p: &Path| -> Result<PathBuf, c_int> {
+            let bytes = p.as_os_str().as_encoded_bytes();
+            if let Some(rest) = bytes.strip_prefix(b"/tmp/") {
+                Ok(PathBuf::from(format!(
+                    "/root/tmp/{}",
+                    std::str::from_utf8(rest).unwrap()
+                )))
+            } else {
+                Ok(p.to_owned())
+            }
+        };
+        let found = search_path(
+            OsStr::new("probe"),
+            cwd,
+            OsStr::new("probe-dir"),
+            map,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(found, Path::new("/root/tmp/wt-x/probe-dir/probe"));
+    }
+
+    #[test]
+    fn search_path_skips_enoent_and_tries_the_next_entry() {
+        let cwd = Path::new("/cwd");
+        let map = |p: &Path| -> Result<PathBuf, c_int> {
+            if p == Path::new("/cwd/a/probe") {
+                Err(libc::ENOENT)
+            } else {
+                Ok(p.to_owned())
+            }
+        };
+        let found =
+            search_path(OsStr::new("probe"), cwd, OsStr::new("a:b"), map, |_| true).unwrap();
+        assert_eq!(found, Path::new("/cwd/b/probe"));
+    }
+
+    #[test]
+    fn search_path_propagates_a_non_skippable_error() {
+        let cwd = Path::new("/cwd");
+        let map = |_: &Path| -> Result<PathBuf, c_int> { Err(libc::ELOOP) };
+        let err =
+            search_path(OsStr::new("probe"), cwd, OsStr::new("a"), map, |_| true).unwrap_err();
+        assert_eq!(err, libc::ELOOP);
+    }
+
+    #[test]
+    fn search_path_fails_with_eacces_when_nothing_is_found() {
+        let cwd = Path::new("/cwd");
+        let map = |p: &Path| -> Result<PathBuf, c_int> { Ok(p.to_owned()) };
+        let err =
+            search_path(OsStr::new("probe"), cwd, OsStr::new("a:b"), map, |_| false).unwrap_err();
+        assert_eq!(err, libc::EACCES);
+    }
+
+    #[test]
+    fn search_path_empty_entry_means_cwd() {
+        let cwd = Path::new("/cwd");
+        let map = |p: &Path| -> Result<PathBuf, c_int> { Ok(p.to_owned()) };
+        let found = search_path(OsStr::new("probe"), cwd, OsStr::new(""), map, |_| true).unwrap();
+        assert_eq!(found, Path::new("/cwd/probe"));
+    }
+
+    #[test]
+    fn injection_matches_non_utf8_tmp_root_exact_bytes() {
+        let tmp: &[u8] = b"/U/\xff/w";
+        let entries: Vec<&[u8]> = vec![
+            b"WORLD_TMP=/U/\xff/w",
+            b"DYLD_INSERT_LIBRARIES=lib",
+            b"SILO_IP=1.2.3.4",
+        ];
+        assert!(injection_matches(entries, b"lib", b"1.2.3.4", Some(tmp)));
+    }
+
+    #[test]
+    fn injection_matches_rejects_a_lossy_look_alike() {
+        // The lossy decoding of b"/U/\xff/w" is "/U/\u{fffd}/w"; a *different*
+        // invalid byte sequence that lossy-decodes the same way must not be
+        // accepted as a byte-exact match.
+        let tmp: &[u8] = b"/U/\xff/w";
+        let look_alike: &[u8] = "/U/\u{fffd}/w".as_bytes();
+        assert_ne!(tmp, look_alike);
+        let mut world_tmp_entry = b"WORLD_TMP=".to_vec();
+        world_tmp_entry.extend_from_slice(look_alike);
+        let entries: Vec<&[u8]> = vec![
+            b"DYLD_INSERT_LIBRARIES=lib",
+            b"SILO_IP=1.2.3.4",
+            &world_tmp_entry,
+        ];
+        assert!(!injection_matches(entries, b"lib", b"1.2.3.4", Some(tmp)));
+    }
+
+    #[test]
+    fn injection_matches_rejects_a_conflicting_duplicate_world_tmp() {
+        let entries: Vec<&[u8]> = vec![
+            b"DYLD_INSERT_LIBRARIES=lib",
+            b"SILO_IP=1.2.3.4",
+            b"WORLD_TMP=/root/tmp/w",
+            b"WORLD_TMP=/root/tmp/other",
+        ];
+        assert!(!injection_matches(
+            entries,
+            b"lib",
+            b"1.2.3.4",
+            Some(b"/root/tmp/w")
+        ));
+    }
+
+    #[test]
+    fn injection_matches_rejects_missing_world_tmp_when_expected() {
+        let entries: Vec<&[u8]> = vec![b"DYLD_INSERT_LIBRARIES=lib", b"SILO_IP=1.2.3.4"];
+        assert!(!injection_matches(
+            entries,
+            b"lib",
+            b"1.2.3.4",
+            Some(b"/root/tmp/w")
+        ));
+    }
+
+    #[test]
+    fn injection_matches_rejects_world_tmp_present_when_not_expected() {
+        let entries: Vec<&[u8]> = vec![
+            b"DYLD_INSERT_LIBRARIES=lib",
+            b"SILO_IP=1.2.3.4",
+            b"WORLD_TMP=/root/tmp/w",
+        ];
+        assert!(!injection_matches(entries, b"lib", b"1.2.3.4", None));
+    }
+
+    #[test]
+    fn injection_matches_accepts_no_tmp_when_none_expected() {
+        let entries: Vec<&[u8]> = vec![b"DYLD_INSERT_LIBRARIES=lib", b"SILO_IP=1.2.3.4"];
+        assert!(injection_matches(entries, b"lib", b"1.2.3.4", None));
     }
 }

@@ -15,11 +15,14 @@ pub fn find_non_sip_in_path(name: &str) -> Option<CString> {
 }
 
 fn find_non_sip_in(name: &str, path_var: &str) -> Option<CString> {
+    use std::os::unix::ffi::OsStringExt;
     // An interpreter name is part of the script's semantics, not an alias.
     let names = [name];
+    // Our own calls are not interposed, so this is the physical (already
+    // redirected, for a cwd under a temp root) working directory.
+    let cwd = std::env::current_dir().ok();
     for try_name in names {
         for dir in path_var.split(':') {
-            let dir = if dir.is_empty() { "." } else { dir };
             if dir.starts_with("/usr/bin/")
                 || dir == "/usr/bin"
                 || dir.starts_with("/bin/")
@@ -31,9 +34,37 @@ fn find_non_sip_in(name: &str, path_var: &str) -> Option<CString> {
             {
                 continue;
             }
-            let candidate = format!("{}/{}", dir, try_name);
-            if let Ok(c) = CString::new(candidate)
-                && unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0
+            let literal = format!("{}/{}", if dir.is_empty() { "." } else { dir }, try_name);
+            let Ok(literal_c) = CString::new(literal.clone()) else {
+                continue;
+            };
+            // Map the candidate when it lies under a temp root, even via a
+            // relative PATH entry resolved against `cwd` (an escaping `..`
+            // is handled by `map_path` itself, exactly as for the primary
+            // posix_spawnp search): checks and the actual exec must see the
+            // workspace-private copy, never whatever the host's real /tmp
+            // happens to hold at that name. An unmapped result keeps the
+            // literal candidate text unchanged, so argv/exec are unaffected
+            // here for the common (non-temp) case -- see the env-shebang
+            // empty-PATH-component test, which asserts the literal "./name".
+            let c = match cwd.as_deref() {
+                Some(cwd) => {
+                    let physical = cwd.join(&literal);
+                    match crate::tmp::map_path(&physical) {
+                        Ok(mapped) if mapped == physical => literal_c,
+                        Ok(mapped) => match CString::new(mapped.into_os_string().into_vec()) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        },
+                        // Either a skippable "does not exist" or some other
+                        // mapping failure: neither is a reason to fall back
+                        // to the literal, unmapped (and possibly host) path.
+                        Err(_) => continue,
+                    }
+                }
+                None => literal_c,
+            };
+            if unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0
                 && unsafe { crate::world::native_target(c.as_ptr()) }
             {
                 return Some(c);

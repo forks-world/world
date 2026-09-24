@@ -470,6 +470,14 @@ pub fn requeried_unix(
     Some(total)
 }
 
+/// Errors from mapping or resolving a PATH candidate that just mean "this
+/// entry does not exist", so the search should move on to the next one,
+/// rather than fail the whole lookup. Shared by silo-bind's PATH search and
+/// world-runtime's `map_candidate` so both skip the same errors.
+pub fn skippable(errno: c_int) -> bool {
+    matches!(errno, libc::ENOENT | libc::ENOTDIR | libc::EACCES)
+}
+
 /// Allocating form for callers outside async-signal context, such as
 /// world-runtime resolving an entry point's executable before `exec`.
 /// `root` is the workspace's temp root (see `world-runtime::silo::temp_root`).

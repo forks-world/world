@@ -61,14 +61,17 @@ pub unsafe fn map_ptr(
     })
 }
 
-/// Allocating form for code that already runs outside async-signal context.
-pub fn map_path(path: &std::path::Path) -> std::path::PathBuf {
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    let mut buf = [0u8; PATH_MAX];
-    match root().map(|root| map(root, path.as_os_str().as_bytes(), &mut buf)) {
-        Some(Ok(Some(len))) => std::ffi::OsString::from_vec(buf[..len].to_vec()).into(),
-        _ => path.to_owned(),
-    }
+/// Allocating form for code that already runs outside async-signal context,
+/// such as the `posix_spawnp`/`env` PATH search below. No root means `path`
+/// is used unchanged; a mapping error is returned rather than silently
+/// falling back to the (wrong, host) path.
+pub fn map_path(path: &std::path::Path) -> Result<std::path::PathBuf, c_int> {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(root) = root() else {
+        return Ok(path.to_owned());
+    };
+    let root = std::path::Path::new(std::ffi::OsStr::from_bytes(root));
+    world_tmp_path::map_under(root, path).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
 }
 
 /// Rewrite a NUL-terminated result string in place.

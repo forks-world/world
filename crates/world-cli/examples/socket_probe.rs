@@ -267,6 +267,16 @@ fn run() -> std::io::Result<()> {
                 .status()?;
             std::process::exit(status.code().unwrap_or(99));
         }
+        "launch-in" => {
+            // Like "launch", but chdir first so a relative PATH entry is
+            // resolved against a caller-chosen directory rather than this
+            // process's own cwd.
+            std::env::set_current_dir(&args[2])?;
+            let status = std::process::Command::new(&args[3])
+                .args(&args[4..])
+                .status()?;
+            std::process::exit(status.code().unwrap_or(99));
+        }
         "exec" => {
             use std::os::unix::process::CommandExt;
             return Err(std::process::Command::new(&args[2]).args(&args[3..]).exec());

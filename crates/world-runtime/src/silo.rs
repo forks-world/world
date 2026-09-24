@@ -644,14 +644,7 @@ fn executable_file(path: &Path) -> bool {
 fn map_candidate(temp: &Path, candidate: &Path) -> Result<Option<PathBuf>> {
     match world_tmp_path::map_under(temp, candidate) {
         Ok(mapped) => Ok(Some(mapped)),
-        Err(e)
-            if matches!(
-                e.raw_os_error(),
-                Some(libc::ENOENT | libc::ENOTDIR | libc::EACCES)
-            ) =>
-        {
-            Ok(None)
-        }
+        Err(e) if e.raw_os_error().is_some_and(world_tmp_path::skippable) => Ok(None),
         Err(e) => Err(e).with_context(|| format!("resolve {}", candidate.display())),
     }
 }

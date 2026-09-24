@@ -64,6 +64,7 @@ mkdir -p ~/world-a ~/world-b
 - 私有目录不会随 Workspace 自动清理，也不像宿主 `/tmp` 那样在重启时清空；需要时停止任务后手动删除。
 - `~/.world`、`~/.world/tmp`、`<地址>`、`tmp`、`var`、`var/tmp` 必须是当前用户拥有的真实目录（非符号链接），前两级不可被组/其他用户写；否则拒绝执行且不修改任何权限。
 - `world exec` 的入口程序（绝对/相对路径或经 PATH 查找）同样先按该 Workspace 的临时目录重定向，再做 SIP/setuid/脚本校验并启动；argv[0] 保持用户写法。
+- 受管进程内 `posix_spawnp` 及 `env` 解释器按 PATH 查找时，相对 PATH 项先按进程实际（物理）工作目录补全再重定向；私有前缀不存在（ENOENT/ENOTDIR/EACCES）则跳过该项，其他错误直接返回，不回退宿主路径。
 
 `world workspace show A` 查看配置。Workspace 本地 ID 是开发用稳定标识，尚未对接 forkfs 全局 Workspace Resource ID 或组织授权。`create` 成功只表示元信息登记，不表示已配置地址或通过隔离验收。重启后需要重新 `setup`。停止所有关联任务后可以按 show 返回的地址手工执行 `sudo ifconfig lo0 -alias IP` 清理别名；这不会删除工作目录或注册表。
 
@@ -74,7 +75,7 @@ mkdir -p ~/world-a ~/world-b
 - localhost 始终重写，不保留上游“没有监听者就访问宿主”的回退，也不依赖存在竞争窗口的监听探测。
 - 拦截到的其他 Workspace loopback 地址访问被拒绝；IPv4-mapped localhost 也必须映射到当前 Workspace。
 - SIP 系统程序及带 setuid/setgid 位的程序直接拒绝；脚本需显式指定非 SIP 解释器。受拦截的子进程启动检查注入环境，不允许静默丢失；shebang 替代仅匹配同名解释器。`env -S` 支持普通空白分隔参数，含引号、转义或展开的形式明确拒绝，需显式调用解释器。带 chdir/fchdir spawn file actions 的相对目标或相对替代解释器也拒绝，以免目录切换改变实际执行目标。已有程序无需修改源码，但并不承诺所有 macOS 可执行文件都兼容。
-- 共享临时目录按 Workspace 重定向（见[临时目录](#临时目录)）；启用时缺少或无效的 `WORLD_TMP` 终止任务，子进程必须继承相同的值。
+- 共享临时目录按 Workspace 重定向（见[临时目录](#临时目录)）；启用时缺少或无效的 `WORLD_TMP` 终止任务，子进程必须继承逐字节相同的值。
 - 动态库加载后写入本次执行确认文件；未确认会终止任务并报错。确认检查不能替代代码签名策略或证明每个 socket 调用都经过了拦截。
 - 状态管理、代理和一般 CLI 使用安全 Rust；系统调用边界与继承描述符处理集中在运行时/动态库中。不得将语言的内存安全等同于无逻辑竞争。
 

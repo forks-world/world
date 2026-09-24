@@ -222,10 +222,10 @@ unsafe fn spawn_common(
         return libc::EACCES;
     }
     let candidate = if label == "posix_spawnp" {
-        let Some(candidate) = (unsafe { crate::world::path_candidate(path) }) else {
-            return libc::EACCES;
-        };
-        Some(candidate)
+        match unsafe { crate::world::path_candidate(path) } {
+            Ok(candidate) => Some(candidate),
+            Err(error) => return error,
+        }
     } else {
         None
     };

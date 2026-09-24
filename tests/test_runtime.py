@@ -721,6 +721,60 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
             self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
 
     @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_relative_path_entry_crossing_tmp_is_redirected(self):
+        # A PATH entry with no literal "/tmp" in it, but which lands there
+        # once resolved against the (physical) cwd via enough "..": the
+        # posix_spawnp PATH search must map it exactly as an absolute
+        # /tmp-rooted entry would be, not walk the host's real /tmp.
+        n = f"wt-{uuid.uuid4().hex[:8]}"
+        (self.world_tmp / "tmp" / n).mkdir()
+        (self.world_tmp / "tmp" / n / "probe").symlink_to(PROBE)
+        cwd = pathlib.Path(self.short.name) / "c"
+        cwd.mkdir()
+        depth = os.path.realpath(cwd).count("/")
+        path = "../" * depth + f"tmp/{n}"
+        result = run(PROBE, "launch", "probe", "fd", "999",
+                     env=self.shim_env(self.world_tmp, PATH=path), cwd=cwd)
+        self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_relative_path_entry_resolved_against_a_launched_cwd(self):
+        # Same redirection, but the relevant cwd is the launched child's own
+        # (set via chdir before the PATH-searched exec), not the harness's.
+        n = f"wt-{uuid.uuid4().hex[:8]}"
+        (self.world_tmp / "tmp" / n).mkdir()
+        (self.world_tmp / "tmp" / n / "probe").symlink_to(PROBE)
+        result = run(PROBE, "launch-in", f"/tmp/{n}", "probe", "fd", "999",
+                     env=self.shim_env(self.world_tmp, PATH="."))
+        self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_mapping_error_does_not_fall_back_to_host(self):
+        # A PATH entry that walks through a *host* /tmp directory (real, but
+        # with no private copy in this workspace) and back out to an
+        # otherwise-reachable binary: the escaping ".." must hit ENOENT
+        # against the missing private copy, never fall back to resolving
+        # the literal (host) text and finding the real file that way.
+        h = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, h, ignore_errors=True)
+        bindir = pathlib.Path(os.path.realpath(pathlib.Path(self.short.name) / "bin"))
+        bindir.mkdir()
+        (bindir / "probe").symlink_to(PROBE)
+        basename = os.path.basename(h)
+        # /tmp/<h> is really /private/tmp/<h> on the host; that many ".."
+        # reach "/", from where the literal text continues into bindir.
+        host_path = f"/private/tmp/{basename}"
+        depth = host_path.count("/")
+        path = f"/tmp/{basename}/" + "../" * depth + str(bindir).lstrip("/")
+        result = run(PROBE, "launch", "probe", "fd", "999",
+                     env=self.shim_env(self.world_tmp, PATH=path))
+        self.assertNotIn("descriptor-closed", result.stdout)
+        # path_candidate finds nothing (the escape maps to ENOENT, which is
+        # skipped rather than used) so posix_spawnp itself fails EACCES,
+        # which Rust's Command reports as PermissionDenied -> exit 77.
+        self.assertEqual(result.returncode, 77, result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
     def test_active_shim_requires_private_temp_root(self):
         env = self.shim_env(self.world_tmp)
         for value in [None, "", "/private/tmp/world", "relative/world/tmp"]:
