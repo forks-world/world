@@ -137,6 +137,12 @@ class CLI(unittest.TestCase):
                 receiver.recv(16)
         result = self.network(PROBE, "pair")
         self.assertEqual((result.returncode, result.stdout), (0, "pair"), result.stderr)
+        with tempfile.TemporaryDirectory() as outside:
+            target = pathlib.Path(outside) / "target"
+            target.write_text("original")
+            result = self.network("/usr/bin/truncate", "-s", "0", target)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(target.read_text(), "original")
         # Only loopback exists, private to this execution.
         result = self.network("/bin/sh", "-c", "tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' '")
         self.assertEqual((result.returncode, result.stdout), (0, "lo\n"), result.stderr)

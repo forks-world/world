@@ -305,11 +305,12 @@ mod landlock {
                 Error::last_os_error()
             );
         }
-        let mut file_rights = WRITE_FILE;
-        if abi >= 3 {
-            file_rights |= TRUNCATE;
+        // ABI 3 (Linux 6.2) is the first to mediate truncate and O_TRUNC.
+        if abi < 3 {
+            bail!("Landlock ABI {abi} cannot restrict truncation; Linux 6.2+ is required");
         }
-        let mut dir_rights = file_rights
+        let file_rights = WRITE_FILE | TRUNCATE;
+        let dir_rights = file_rights
             | REMOVE_DIR
             | REMOVE_FILE
             | MAKE_CHAR
@@ -318,10 +319,8 @@ mod landlock {
             | MAKE_SOCK
             | MAKE_FIFO
             | MAKE_BLOCK
-            | MAKE_SYM;
-        if abi >= 2 {
-            dir_rights |= REFER;
-        }
+            | MAKE_SYM
+            | REFER;
         let attr = RulesetAttr {
             handled_access_fs: dir_rights,
             handled_access_net: 0,

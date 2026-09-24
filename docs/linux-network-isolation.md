@@ -5,7 +5,7 @@ Linux 与 macOS 使用同一个 CLI（`world network exec`、`world silo ...`）
 ## 前提
 
 - 允许非特权 user namespace。Fedora、Debian 等默认允许；Ubuntu 23.10+ 的 AppArmor 默认限制它，需要 `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`，或者为 `world` 配置 AppArmor profile。
-- `network exec` 需要 Landlock（Linux 5.13+，并且已在 LSM 列表中启用），以及 x86_64 或 aarch64 架构的 seccomp。缺少任何一项都拒绝执行，不会退回到无沙箱执行。
+- `network exec` 需要 Landlock ABI 3（Linux 6.2+，并且已在 LSM 列表中启用；更早的 ABI 不限制截断文件），以及 x86_64 或 aarch64 架构的 seccomp。缺少任何一项都拒绝执行，不会退回到无沙箱执行。
 - 只构建 `target/debug/world` 即可，不需要 `libworld_silo_bind`。
 
 ## 出站白名单模式
