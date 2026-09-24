@@ -225,7 +225,7 @@ struct StdinRelay {
 impl StdinRelay {
     fn start(input: tokio::process::ChildStdin) -> Result<Self> {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        let source = relay_source()?;
+        let (source, mut offset) = relay_source()?;
         let target = input.into_owned_fd()?;
         // Our own pipe end: block on writes instead of spinning.
         // SAFETY: fcntl on an owned descriptor with integer arguments.
@@ -251,6 +251,25 @@ impl StdinRelay {
             use std::io::Write;
             let mut target = std::fs::File::from(target);
             let mut buf = [0u8; 16384];
+            let stopped = || *flag.lock().unwrap_or_else(|e| e.into_inner());
+            // Files: positional reads, outside the lock (they may block).
+            while let Some(at) = offset.as_mut() {
+                if stopped() {
+                    return;
+                }
+                let (fd, len) = (source.as_raw_fd(), buf.len());
+                // SAFETY: buf is a live, writable buffer of the given length.
+                let n = unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), len, *at) };
+                let error = std::io::Error::last_os_error();
+                if n < 0 && error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                // EOF, error, or the workload stopped reading (EPIPE).
+                if n <= 0 || target.write_all(&buf[..n as usize]).is_err() {
+                    return;
+                }
+                *at += n as libc::off_t;
+            }
             loop {
                 let mut polls = [
                     libc::pollfd {
@@ -306,22 +325,27 @@ impl StdinRelay {
     }
 }
 
-/// The relay's own descriptor for stdin. Terminals and FIFOs may be
-/// shared with another reader that consumes input between poll and read,
-/// so they are reopened as a separate, non-blocking open file description:
-/// the read (held under the cancellation lock) never blocks, and the
-/// caller's own stdin flags stay untouched. Reads from regular files,
-/// directories and block devices never block, so those are duplicated.
+/// The relay's own descriptor for stdin, and for files the offset to read
+/// from. Terminals and FIFOs may be shared with another reader that
+/// consumes input between poll and read, so they are reopened as a
+/// separate, non-blocking open file description: a read (held under the
+/// cancellation lock) never blocks, and the caller's stdin flags stay
+/// untouched. Files, directories and block devices are read with pread at
+/// the relay's own offset: such reads can block (FUSE, NFS), so they are
+/// not done under the lock, and one finishing after cancellation consumes
+/// nothing that anyone else would read.
 #[cfg(unix)]
-fn relay_source() -> Result<std::os::fd::OwnedFd> {
-    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+fn relay_source() -> Result<(std::os::fd::OwnedFd, Option<libc::off_t>)> {
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
     let stdin = std::io::stdin().as_fd().try_clone_to_owned()?;
     let kind = std::fs::File::from(stdin.try_clone()?)
         .metadata()?
         .file_type();
     use std::os::unix::fs::FileTypeExt;
     if !(kind.is_fifo() || kind.is_char_device()) {
-        return Ok(stdin);
+        // SAFETY: lseek on an owned descriptor with integer arguments.
+        let offset = unsafe { libc::lseek(stdin.as_raw_fd(), 0, libc::SEEK_CUR) };
+        return Ok((stdin, Some(offset.max(0))));
     }
     let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
     // SAFETY: a NUL-terminated literal path and integer flags.
@@ -330,7 +354,7 @@ fn relay_source() -> Result<std::os::fd::OwnedFd> {
         return Err(std::io::Error::last_os_error()).context("reopen stdin for relaying");
     }
     // SAFETY: open returned a new descriptor we exclusively own.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    Ok((unsafe { OwnedFd::from_raw_fd(fd) }, None))
 }
 
 #[cfg(unix)]

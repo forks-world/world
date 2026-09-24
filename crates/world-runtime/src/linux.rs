@@ -1225,6 +1225,18 @@ fn reap_if_child(pidfd: &OwnedFd) {
     }
 }
 
+/// reap_if_child without a pidfd (before Linux 5.3). Only our own child
+/// can be waited for by PID, so this cannot touch an unrelated process.
+fn reap_pid_if_child(pid: libc::pid_t) {
+    let mut status = 0;
+    // SAFETY: status is a live int.
+    while unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return;
+        }
+    }
+}
+
 /// A holder this process just started, pinned by pidfd when available.
 pub(crate) struct StartedHolder {
     pub holder: Holder,
@@ -1251,8 +1263,9 @@ impl StartedHolder {
             }
         };
         check(result)?;
-        if let Some(fd) = &self.pidfd {
-            reap_if_child(fd);
+        match &self.pidfd {
+            Some(fd) => reap_if_child(fd),
+            None => reap_pid_if_child(self.pid),
         }
         Ok(())
     }
@@ -1273,6 +1286,7 @@ pub(crate) fn stop_holder(holder: &Holder) -> Result<()> {
         let _namespaces = holder.open()?;
         // SAFETY: kill takes plain integers.
         check(unsafe { libc::kill(holder.pid as libc::pid_t, libc::SIGKILL) })?;
+        reap_pid_if_child(holder.pid as libc::pid_t);
         return Ok(());
     }
     // SAFETY: the kernel returned a new descriptor we exclusively own.
