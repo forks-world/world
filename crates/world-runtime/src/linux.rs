@@ -530,10 +530,8 @@ mod seccomp {
                         RET_ERRNO | libc::EACCES as u32
                     );
                 }
-                let pair = |kind: libc::c_int| {
-                    let unix = libc::AF_UNIX as u32;
-                    run_filter(&filter, ARCH, libc::SYS_socketpair as u32, unix, kind as u32)
-                };
+                let (socketpair, unix) = (libc::SYS_socketpair as u32, libc::AF_UNIX as u32);
+                let pair = |k: i32| run_filter(&filter, ARCH, socketpair, unix, k as u32);
                 for kind in [libc::SOCK_STREAM, libc::SOCK_SEQPACKET] {
                     assert_eq!(pair(kind), RET_ALLOW);
                     assert_eq!(pair(kind | libc::SOCK_CLOEXEC), RET_ALLOW);
