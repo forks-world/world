@@ -216,6 +216,9 @@ pub(crate) struct Workload {
 #[cfg(unix)]
 struct StdinRelay {
     cancel: std::os::fd::OwnedFd,
+    /// Held across "check cancelled, then read": once drop sets it, no
+    /// further read of the caller's stdin can start.
+    cancelled: std::sync::Arc<std::sync::Mutex<bool>>,
 }
 
 #[cfg(unix)]
@@ -245,6 +248,8 @@ impl StdinRelay {
             // SAFETY: fcntl on an owned descriptor with integer arguments.
             unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
         }
+        let cancelled = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let flag = cancelled.clone();
         std::thread::spawn(move || {
             use std::io::Write;
             let mut target = std::fs::File::from(target);
@@ -274,15 +279,23 @@ impl StdinRelay {
                     return;
                 }
                 let (fd, len) = (source.as_raw_fd(), buf.len());
-                // SAFETY: buf is a live, writable buffer of the given length.
-                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), len) };
+                let n = {
+                    let stop = flag.lock().unwrap_or_else(|e| e.into_inner());
+                    if *stop {
+                        return;
+                    }
+                    // Poll reported input, so this read does not block while
+                    // the lock is held.
+                    // SAFETY: buf is a live, writable buffer of the given length.
+                    unsafe { libc::read(fd, buf.as_mut_ptr().cast(), len) }
+                };
                 // EOF, error, or the workload stopped reading (EPIPE).
                 if n <= 0 || target.write_all(&buf[..n as usize]).is_err() {
                     return;
                 }
             }
         });
-        Ok(Self { cancel })
+        Ok(Self { cancel, cancelled })
     }
 }
 
@@ -290,6 +303,8 @@ impl StdinRelay {
 impl Drop for StdinRelay {
     fn drop(&mut self) {
         use std::os::fd::AsRawFd;
+        // Waits out a read already in progress, then forbids new ones.
+        *self.cancelled.lock().unwrap_or_else(|e| e.into_inner()) = true;
         // Wakes the relay's poll. A write blocked on a full pipe ends with
         // EPIPE once the workload, which holds the other end, is killed.
         // SAFETY: writes one byte from a static buffer to an owned pipe.

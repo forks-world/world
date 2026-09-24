@@ -867,6 +867,21 @@ class LinuxSilo(unittest.TestCase):
         time.sleep(0.3)
         self.assertEqual(self.holders() - before, set())
 
+    def test_setup_with_ignored_sigchld(self):
+        # SIG_IGN survives exec, as for an embedding process that ignores
+        # SIGCHLD: the intermediate child is auto-reaped (ECHILD on wait).
+        work = self.root / "F"
+        work.mkdir()
+        silo = [str(WORLD), "silo", "--state-dir", str(self.state)]
+        self.assertEqual(run(*silo, "create", "--world", "F", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *silo, "teardown", "--world", "F")
+        before = self.holders()
+        result = run("/bin/sh", "-c", 'trap "" CHLD; exec "$@"', "sh", *silo, "setup", "--world", "F")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pid = json.loads((self.state / "holders.json").read_text())["F"]["pid"]
+        self.assertEqual(self.holders() - before, {pid})
+        self.assertEqual(run(*self.command("F", "fd", "999")).returncode, 0)
+
     def test_stale_holder_is_replaced_and_forgotten(self):
         work = self.root / "E"
         work.mkdir()

@@ -1174,7 +1174,10 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
         });
     }
     let mut child = cmd.spawn().context("start World namespace holder")?;
-    child.wait()?;
+    // Reap the intermediate. A caller that ignores SIGCHLD or reaps
+    // children itself may already have done so (ECHILD); spawn returning
+    // means the holder is running either way, so always read its PID.
+    let _ = child.wait();
     drop(write);
     let mut bytes = [0u8; std::mem::size_of::<libc::pid_t>()];
     // read_exact retries EINTR and short reads.
