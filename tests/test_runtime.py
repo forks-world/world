@@ -913,6 +913,13 @@ class LinuxSilo(unittest.TestCase):
         self.assertEqual(self.holders() - before, {pid})
         self.assertEqual(run(*self.command("F", "fd", "999")).returncode, 0)
 
+    def test_socket_stdin_is_refused(self):
+        first, second = socket.socketpair()
+        with first as sock, second:
+            result = run(*self.command("A", "fd", "999"), stdin=sock.fileno())
+        self.assertEqual(result.returncode, 125)
+        self.assertIn("socket stdin", result.stderr)
+
     def test_exit_status_with_ignored_sigchld(self):
         command = [str(x) for x in self.command("A", "fd", "999")]
         command[-3:] = ["/bin/sh", "-c", "exit 3"]

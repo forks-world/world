@@ -1247,15 +1247,16 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
                 let size = std::mem::size_of_val(&value);
                 libc::write(0, (&value as *const libc::pid_t).cast(), size) == size as isize
             };
-            // PID first, so the caller can pin (and, if this fails and it
-            // adopted us as a subreaper, reap) the holder; then the result.
-            if !send(libc::getpid()) {
-                libc::_exit(125);
-            }
             // Only the report (0) and acknowledgment (1) pipes remain, so
             // the wait below sees EOF if the caller dies before pinning.
-            if let Err(error) = close_from(2) {
-                send(-error.raw_os_error().unwrap_or(libc::EIO));
+            // Done before reporting the PID: once reported, the holder
+            // must stay alive until pinned, so no failure may come between.
+            if close_from(2).is_err() {
+                libc::_exit(125);
+            }
+            // PID first, so the caller can pin (and, if setup fails and it
+            // adopted us as a subreaper, reap) the holder; then the result.
+            if !send(libc::getpid()) {
                 libc::_exit(125);
             }
             let mut byte = 0u8;

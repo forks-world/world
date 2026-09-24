@@ -244,6 +244,12 @@ async fn linux_exec(
 ) -> Result<i32> {
     use std::os::{fd::AsRawFd, unix::process::CommandExt};
     let dir = run::workdir(&world.workdir)?;
+    // The checked descriptor itself, never whatever fd 0 is at spawn: a
+    // host socket swapped in by another thread would cross into the World.
+    let stdin = match run::pin_stdin_with(false)? {
+        Some(fd) => std::process::Stdio::from(fd),
+        None => std::process::Stdio::null(),
+    };
     let (user, net) = holder(state, &world.id)?.open().with_context(|| {
         format!(
             "World namespace is not running; run world silo setup --world {}",
@@ -269,7 +275,7 @@ async fn linux_exec(
     }
     let result = run::supervise(
         cmd,
-        None,
+        Some(stdin),
         Instant::now() + duration,
         cancel,
         &mut None,

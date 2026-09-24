@@ -182,6 +182,12 @@ pub(crate) fn is_null_device(rdev: libc::dev_t) -> bool {
 /// access mode inside the sandbox. `None` means stdin is closed.
 #[cfg(unix)]
 pub(crate) fn pin_stdin() -> Result<Option<std::os::fd::OwnedFd>> {
+    pin_stdin_with(true)
+}
+
+/// pin_stdin, optionally allowing writable files (silo is no write sandbox).
+#[cfg(unix)]
+pub(crate) fn pin_stdin_with(refuse_writable: bool) -> Result<Option<std::os::fd::OwnedFd>> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor we exclusively own.
     let fd = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
@@ -203,7 +209,7 @@ pub(crate) fn pin_stdin() -> Result<Option<std::os::fd::OwnedFd>> {
     if kind == libc::S_IFSOCK {
         bail!("socket stdin is not allowed; use a pipe");
     }
-    if kind == libc::S_IFREG || kind == libc::S_IFBLK {
+    if refuse_writable && (kind == libc::S_IFREG || kind == libc::S_IFBLK) {
         // SAFETY: F_GETFL takes no pointer argument.
         let flags = unsafe { libc::fcntl(pinned.as_raw_fd(), libc::F_GETFL) };
         if flags < 0 {
