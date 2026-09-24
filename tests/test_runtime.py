@@ -148,8 +148,14 @@ class CLI(unittest.TestCase):
                             ["ln", "-s", "x", pathlib.Path(outside) / "link"]]:
                 result = self.network(*command)
                 self.assertNotEqual(result.returncode, 0, command)
+            # No new alias of an outside file: hard links cross mounts (EXDEV)
+            # and writes through symlinks land on the read-only view.
+            result = self.network("/bin/sh", "-c", f"ln {target} hard; ln -s {target} soft; echo x > soft")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((self.dir / "hard").exists())
             after = target.stat()
             self.assertEqual((after.st_mode, after.st_mtime_ns), (before.st_mode, before.st_mtime_ns))
+            self.assertEqual(target.read_text(), "original")
             self.assertFalse((pathlib.Path(outside) / "link").exists())
         result = self.network("/bin/sh", "-c", 'echo in > inside && chmod 700 inside && touch -d 2000-01-01 inside && echo t > "$TMPDIR/t" && cat inside')
         self.assertEqual((result.returncode, result.stdout), (0, "in\n"), result.stderr)
@@ -210,6 +216,18 @@ print("stolen" if got >= 0 else os.strerror(ctypes.get_errno()))
                     self.assertEqual(result.stdout, "2\n")  # PID 1 is the reaper
                 time.sleep(3)
                 self.assertFalse((self.dir / "marker").exists())
+
+    @unittest.skipUnless(LINUX, "stdin relay is Linux-specific")
+    def test_file_stdin_is_relayed_through_a_pipe(self):
+        with tempfile.TemporaryDirectory() as outside:
+            target = pathlib.Path(outside) / "target"
+            target.write_text("content")
+            target.chmod(0o644)
+            script = "import os, stat, sys\ntry: os.fchmod(0, 0o600)\nexcept OSError: pass\nprint(stat.S_ISFIFO(os.fstat(0).st_mode), sys.stdin.read())"
+            with open(target) as stdin:
+                result = self.network("/usr/bin/python3", "-c", script, stdin=stdin)
+            self.assertEqual((result.returncode, result.stdout), (0, "True content\n"), result.stderr)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o644)
 
     @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_writable_file_stdin_is_refused(self):

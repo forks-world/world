@@ -819,7 +819,7 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
     if cancel.is_cancelled() || Instant::now() >= deadline {
         return Ok(124);
     }
-    let workload = run::spawn(cmd)?;
+    let workload = run::spawn(cmd, run::stdin_is_storage()?)?;
     drop(ruleset);
     let mut proxy = match (prepared, channel) {
         (Some(prepared), Some((parent, child))) => {

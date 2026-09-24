@@ -122,6 +122,23 @@ async fn seatbelt(options: RunOptions, cancel: CancellationToken) -> Result<i32>
     result
 }
 
+/// Whether stdin is backed by a file, directory or block device. Even a
+/// read-only descriptor allows fchmod, futimens and fsetxattr on its inode.
+#[cfg(target_os = "linux")]
+pub(crate) fn stdin_is_storage() -> Result<bool> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat initializes the provided stat structure only on success.
+    if unsafe { libc::fstat(libc::STDIN_FILENO, stat.as_mut_ptr()) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EBADF) {
+            return Ok(false);
+        }
+        return Err(error.into());
+    }
+    let kind = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
+    Ok([libc::S_IFREG, libc::S_IFBLK, libc::S_IFDIR].contains(&kind))
+}
+
 /// An inherited descriptor keeps its access mode inside the sandbox, so a
 /// writable file or block device as stdin would bypass the write boundary.
 #[cfg(unix)]
@@ -179,15 +196,31 @@ pub(crate) struct Workload {
     err: Forward,
 }
 
-pub(crate) fn spawn(mut cmd: Command) -> Result<Workload> {
-    cmd.stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
+/// `relay_stdin`: pass stdin through a pipe instead of the inherited
+/// descriptor, so the workload holds no descriptor for the underlying file.
+pub(crate) fn spawn(mut cmd: Command, relay_stdin: bool) -> Result<Workload> {
+    cmd.stdin(if relay_stdin {
+        Stdio::piped()
+    } else {
+        Stdio::inherit()
+    })
+    .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.as_std_mut().process_group(0);
     let mut child = cmd.spawn().context("start workload")?;
     let pid = child.id().context("child PID unavailable")?;
+    if let Some(mut input) = child.stdin.take() {
+        #[cfg(unix)]
+        let source = {
+            use std::os::fd::AsFd;
+            std::io::stdin().as_fd().try_clone_to_owned()?
+        };
+        let mut source = tokio::fs::File::from_std(std::fs::File::from(source));
+        // Ends with EPIPE once the workload exits without reading it all.
+        tokio::spawn(async move { tokio::io::copy(&mut source, &mut input).await });
+    }
     let guard = ProcessGroup(pid);
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
@@ -214,7 +247,7 @@ pub(crate) async fn supervise(
     if cancel.is_cancelled() || Instant::now() >= deadline {
         return Ok(124);
     }
-    wait(spawn(cmd)?, deadline, cancel, proxy, ack).await
+    wait(spawn(cmd, false)?, deadline, cancel, proxy, ack).await
 }
 
 pub(crate) async fn wait(
