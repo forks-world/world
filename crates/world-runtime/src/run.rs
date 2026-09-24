@@ -205,8 +205,8 @@ pub(crate) fn spawn(mut cmd: Command, relay_stdin: bool) -> Result<Workload> {
         Stdio::inherit()
     })
     .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
     #[cfg(unix)]
     cmd.as_std_mut().process_group(0);
     let mut child = cmd.spawn().context("start workload")?;
