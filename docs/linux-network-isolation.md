@@ -22,8 +22,8 @@ Linux 与 macOS 使用同一个 CLI（`world network exec`、`world silo ...`）
 1. 在子进程中创建新的 user namespace 和 network namespace，把当前 uid/gid 映射进去，并启用 `lo`。新 namespace 除 loopback 外没有任何接口，内核层面不存在去往宿主或外网的路由。
 2. 有允许目标时，在该 namespace 的 `127.0.0.1`（以及可用时的 `::1`）上创建代理监听 socket，通过 `SCM_RIGHTS` 传回 World 进程。代理在宿主侧接受连接并按策略转发。任务仍然通过 `http_proxy` 等变量使用代理。
 3. 设置 `no_new_privs`，用 Landlock 禁止工作目录、私有临时目录和 `/dev/null` 之外的写入。内核支持 Landlock ABI 6（Linux 6.12+）时，还禁止向沙箱外发送信号和连接沙箱外的抽象 Unix socket。
-4. 用 seccomp 拒绝 `AF_INET`、`AF_INET6`、`AF_NETLINK` 之外的 `socket()`，以及 `io_uring_setup`。network namespace 管不到文件系统 Unix socket（例如 Docker、D-Bus），这一步就是阻止借用它们出网；`socketpair` 仍可用于进程内部通信。
-5. 清空环境变量、拒绝 socket 标准输入，并关闭 0/1/2 之外继承的描述符。
+4. 用 seccomp 拒绝 `AF_INET`、`AF_INET6`、`AF_NETLINK` 之外的 `socket()`、数据报类型的 `socketpair()`，以及 `io_uring_setup`。network namespace 管不到文件系统 Unix socket（例如 Docker、D-Bus），这一步就是阻止借用它们出网。数据报 socket 对的一端可以被 `connect` 或 `sendto` 重新指向宿主 Unix socket，所以只允许 stream 和 seqpacket 类型的 `socketpair`，用于进程内部通信。
+5. 清空环境变量；拒绝 socket 标准输入，以及以可写方式打开的普通文件或块设备标准输入（Landlock 不限制沙箱建立前已打开的描述符）；关闭 0/1/2 之外继承的描述符。
 
 与 macOS 的差异：
 

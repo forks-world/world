@@ -101,6 +101,60 @@ class CLI(unittest.TestCase):
             self.assertEqual(result.returncode, 77, result.stderr)
         self.assertEqual(self.network(PROBE, "serve", "127.0.0.1:0", "denied").returncode, 77)
 
+    @unittest.skipUnless(LINUX, "network namespaces require Linux")
+    def test_namespace_denials_and_children(self):
+        for family, host in [(socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")]:
+            with self.subTest(host=host), socket.socket(family) as listener:
+                listener.bind((host, 0))
+                listener.listen()
+                address = f"[{host}]:{listener.getsockname()[1]}" if ":" in host else f"{host}:{listener.getsockname()[1]}"
+                self.assertEqual(run(PROBE, "dial", address).returncode, 0)
+                for prefix in [[], ["child"]]:
+                    result = self.network(PROBE, *prefix, "dial", address)
+                    self.assertEqual(result.returncode, DIAL_DENIED, result.stderr)
+        with serving([PROBE, "udp-serve", "127.0.0.1:0", "HOST"]) as (_, port):
+            self.assertEqual(run(PROBE, "udp-get", f"127.0.0.1:{port}").stdout, "HOST")
+            result = self.network(PROBE, "udp-get", f"127.0.0.1:{port}")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("HOST", result.stdout)
+        with tempfile.TemporaryDirectory(dir="/tmp") as d, socket.socket(socket.AF_UNIX) as listener:
+            path = str(pathlib.Path(d) / "s")
+            listener.bind(path)
+            listener.listen()
+            self.assertEqual(run(PROBE, "unix", path).returncode, 0)
+            for prefix in [[], ["child"]]:
+                result = self.network(PROBE, *prefix, "unix", path)
+                self.assertEqual(result.returncode, 77, result.stderr)
+        with tempfile.TemporaryDirectory(dir="/tmp") as d, socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as receiver:
+            path = str(pathlib.Path(d) / "d")
+            receiver.bind(path)
+            self.assertEqual(run(PROBE, "pair-dgram", path).returncode, 0)
+            self.assertEqual(receiver.recv(16), b"escape")
+            receiver.setblocking(False)
+            result = self.network(PROBE, "pair-dgram", path)
+            self.assertEqual(result.returncode, 77, result.stderr)
+            with self.assertRaises(BlockingIOError):
+                receiver.recv(16)
+        result = self.network(PROBE, "pair")
+        self.assertEqual((result.returncode, result.stdout), (0, "pair"), result.stderr)
+        # Only loopback exists, private to this execution.
+        result = self.network("/bin/sh", "-c", "tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' '")
+        self.assertEqual((result.returncode, result.stdout), (0, "lo\n"), result.stderr)
+
+    @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
+    def test_writable_file_stdin_is_refused(self):
+        with tempfile.TemporaryDirectory() as outside:
+            target = pathlib.Path(outside) / "target"
+            target.write_text("original")
+            with open(target, "r+") as stdin:
+                result = self.network("/bin/sh", "-c", "echo escape >&0", stdin=stdin)
+            self.assertEqual(result.returncode, 125, result.stderr)
+            self.assertIn("writable file stdin", result.stderr)
+            self.assertEqual(target.read_text(), "original")
+            with open(target) as stdin:
+                result = self.network("/bin/cat", stdin=stdin)
+            self.assertEqual((result.returncode, result.stdout), (0, "original"), result.stderr)
+
     @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_exit_timeout_and_open_stdin(self):
         self.assertEqual(self.network("/bin/sh", "-c", "exit 42").returncode, 42)

@@ -47,6 +47,10 @@ pub fn workdir(path: &Path) -> Result<PathBuf> {
 pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<i32> {
     options.policy.validate()?;
     validate_command(&options.command, options.timeout)?;
+    #[cfg(unix)]
+    if stdin_writes_storage()? {
+        bail!("writable file stdin is not allowed; open it read-only or use a pipe");
+    }
     #[cfg(target_os = "macos")]
     {
         seatbelt(options, cancel).await
@@ -116,6 +120,31 @@ async fn seatbelt(options: RunOptions, cancel: CancellationToken) -> Result<i32>
         proxy.close().await;
     }
     result
+}
+
+/// An inherited descriptor keeps its access mode inside the sandbox, so a
+/// writable file or block device as stdin would bypass the write boundary.
+#[cfg(unix)]
+fn stdin_writes_storage() -> Result<bool> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat initializes the provided stat structure only on success.
+    if unsafe { libc::fstat(libc::STDIN_FILENO, stat.as_mut_ptr()) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EBADF) {
+            return Ok(false);
+        }
+        return Err(error.into());
+    }
+    let kind = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
+    if kind != libc::S_IFREG && kind != libc::S_IFBLK {
+        return Ok(false);
+    }
+    // SAFETY: F_GETFL takes no pointer argument.
+    let flags = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(flags & libc::O_ACCMODE != libc::O_RDONLY)
 }
 
 #[cfg(unix)]

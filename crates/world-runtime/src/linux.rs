@@ -398,6 +398,7 @@ mod seccomp {
     const LD_W_ABS: u16 = 0x20;
     const JEQ_K: u16 = 0x15;
     const JGE_K: u16 = 0x35;
+    const AND_K: u16 = 0x54;
     const RET_K: u16 = 0x06;
     const RET_KILL_PROCESS: u32 = 0x8000_0000;
     const RET_ERRNO: u32 = 0x0005_0000;
@@ -408,8 +409,8 @@ mod seccomp {
     }
 
     /// Refuse socket families that are not confined by the network
-    /// namespace (filesystem Unix sockets, vsock, ...), and io_uring, which
-    /// can create sockets without the socket system call.
+    /// namespace (filesystem Unix sockets, vsock, ...), datagram socket
+    /// pairs, and io_uring, which can create sockets without these calls.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub fn socket_filter() -> Result<Vec<libc::sock_filter>> {
         // x32 system calls share the x86_64 audit architecture.
@@ -426,17 +427,27 @@ mod seccomp {
             op(LD_W_ABS, 0, 0, 0),
         ];
         if x32_guard {
-            filter.push(op(JGE_K, 0x4000_0000, 9, 0));
+            filter.push(op(JGE_K, 0x4000_0000, 15, 0));
         }
+        let flags = (libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) as u32;
         filter.extend([
-            op(JEQ_K, libc::SYS_socket as u32, 2, 0),
-            op(JEQ_K, libc::SYS_io_uring_setup as u32, 7, 0),
+            op(JEQ_K, libc::SYS_socket as u32, 3, 0),
+            op(JEQ_K, libc::SYS_socketpair as u32, 7, 0),
+            op(JEQ_K, libc::SYS_io_uring_setup as u32, 12, 0),
             op(RET_K, RET_ALLOW, 0, 0),
-            // seccomp_data.args[0], low word (little endian).
+            // socket: seccomp_data.args[0] (domain), low word.
             op(LD_W_ABS, 16, 0, 0),
-            op(JEQ_K, libc::AF_INET as u32, 3, 0),
-            op(JEQ_K, libc::AF_INET6 as u32, 2, 0),
-            op(JEQ_K, libc::AF_NETLINK as u32, 1, 0),
+            op(JEQ_K, libc::AF_INET as u32, 8, 0),
+            op(JEQ_K, libc::AF_INET6 as u32, 7, 0),
+            op(JEQ_K, libc::AF_NETLINK as u32, 6, 0),
+            op(RET_K, RET_ERRNO | libc::EACCES as u32, 0, 0),
+            // socketpair: args[1] (type) without flags. Connected stream and
+            // seqpacket pairs ignore destinations; a datagram end could be
+            // redirected to a host Unix socket with connect or sendto.
+            op(LD_W_ABS, 24, 0, 0),
+            op(AND_K, !flags, 0, 0),
+            op(JEQ_K, libc::SOCK_STREAM as u32, 2, 0),
+            op(JEQ_K, libc::SOCK_SEQPACKET as u32, 1, 0),
             op(RET_K, RET_ERRNO | libc::EACCES as u32, 0, 0),
             op(RET_K, RET_ALLOW, 0, 0),
             op(RET_K, RET_ERRNO | libc::EPERM as u32, 0, 0),
@@ -471,7 +482,7 @@ mod seccomp {
 
         /// Minimal classic-BPF evaluator for the instructions used above,
         /// rejecting out-of-range jumps like the kernel verifier.
-        fn eval(filter: &[libc::sock_filter], arch: u32, nr: u32, arg0: u32) -> u32 {
+        fn run_filter(filter: &[libc::sock_filter], arch: u32, nr: u32, a0: u32, a1: u32) -> u32 {
             let (mut pc, mut acc) = (0usize, 0u32);
             loop {
                 let ins = filter[pc];
@@ -482,10 +493,12 @@ mod seccomp {
                         acc = match ins.k {
                             0 => nr,
                             4 => arch,
-                            16 => arg0,
+                            16 => a0,
+                            24 => a1,
                             k => panic!("load {k}"),
                         }
                     }
+                    AND_K => acc &= ins.k,
                     RET_K => return ins.k,
                     JEQ_K | JGE_K => {
                         let taken = if ins.code == JEQ_K {
@@ -506,7 +519,7 @@ mod seccomp {
             for x32_guard in [true, false] {
                 let filter = build(ARCH, x32_guard);
                 let socket = libc::SYS_socket as u32;
-                let eval = |arch, nr, arg0| eval(&filter, arch, nr, arg0);
+                let eval = |arch, nr, arg0| run_filter(&filter, arch, nr, arg0, 0);
                 assert_eq!(eval(ARCH ^ 1, socket, 0), RET_KILL_PROCESS);
                 for family in [libc::AF_INET, libc::AF_INET6, libc::AF_NETLINK] {
                     assert_eq!(eval(ARCH, socket, family as u32), RET_ALLOW);
@@ -516,6 +529,17 @@ mod seccomp {
                         eval(ARCH, socket, family as u32),
                         RET_ERRNO | libc::EACCES as u32
                     );
+                }
+                let pair = |kind: libc::c_int| {
+                    let unix = libc::AF_UNIX as u32;
+                    run_filter(&filter, ARCH, libc::SYS_socketpair as u32, unix, kind as u32)
+                };
+                for kind in [libc::SOCK_STREAM, libc::SOCK_SEQPACKET] {
+                    assert_eq!(pair(kind), RET_ALLOW);
+                    assert_eq!(pair(kind | libc::SOCK_CLOEXEC), RET_ALLOW);
+                }
+                for kind in [libc::SOCK_DGRAM, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC] {
+                    assert_eq!(pair(kind), RET_ERRNO | libc::EACCES as u32);
                 }
                 let io_uring = libc::SYS_io_uring_setup as u32;
                 assert_eq!(eval(ARCH, io_uring, 0), RET_ERRNO | libc::EPERM as u32);
