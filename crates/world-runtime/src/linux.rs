@@ -235,6 +235,26 @@ pub(crate) unsafe fn drop_capabilities() -> IoResult<()> {
     Ok(())
 }
 
+/// pre_exec: close every descriptor from `first` on. close_range needs
+/// Linux 5.9, which the silo backend does not otherwise require.
+unsafe fn close_from(first: libc::c_int) {
+    unsafe {
+        if libc::syscall(libc::SYS_close_range, first as u32, u32::MAX, 0u32) != 0 {
+            close_each_from(first);
+        }
+    }
+}
+
+unsafe fn close_each_from(first: libc::c_int) {
+    unsafe {
+        let limit = libc::sysconf(libc::_SC_OPEN_MAX);
+        let limit = if limit < 0 { 65536 } else { limit as libc::c_int };
+        for fd in first..limit {
+            libc::close(fd);
+        }
+    }
+}
+
 /// Exit like the child whose wait status is `status`. A namespace init
 /// cannot signal itself, so it falls back to the shell convention 128+n.
 unsafe fn relay_exit(status: libc::c_int) -> ! {
@@ -254,7 +274,7 @@ unsafe fn wait_for(child: libc::pid_t) -> ! {
     unsafe {
         // Hold no pipes: spawn sees exec (or its error) from the workload,
         // and output ends when the workload's descendants close it.
-        libc::syscall(libc::SYS_close_range, 0u32, u32::MAX, 0u32);
+        close_from(0);
         loop {
             let mut status = 0;
             let pid = libc::waitpid(-1, &mut status, 0);
@@ -939,5 +959,27 @@ pub fn hold() -> ! {
     loop {
         // SAFETY: pause has no arguments.
         unsafe { libc::pause() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn close_fallback_closes_every_descriptor() {
+        let (read, write) = std::os::unix::net::UnixStream::pair().unwrap();
+        // SAFETY: the forked child only closes descriptors, checks one with
+        // fcntl and exits without returning into the test harness.
+        unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                super::close_each_from(3);
+                let closed = libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&write), libc::F_GETFD);
+                libc::_exit(if closed < 0 { 0 } else { 1 });
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        }
+        drop((read, write));
     }
 }
