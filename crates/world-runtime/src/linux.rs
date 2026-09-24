@@ -349,29 +349,38 @@ pub(crate) unsafe fn drop_capabilities() -> IoResult<()> {
 
 /// pre_exec: close every descriptor from `first` on. close_range needs
 /// Linux 5.9, which the silo backend does not otherwise require.
-unsafe fn close_from(first: libc::c_int) {
+unsafe fn close_from(first: libc::c_int) -> IoResult<()> {
     unsafe {
-        if libc::syscall(libc::SYS_close_range, first as u32, u32::MAX, 0u32) != 0 {
-            close_each_from(first);
+        if libc::syscall(libc::SYS_close_range, first as u32, u32::MAX, 0u32) == 0 {
+            return Ok(());
         }
+        close_each_from(first)
     }
 }
 
-unsafe fn close_each_from(first: libc::c_int) {
+unsafe fn close_each_from(first: libc::c_int) -> IoResult<()> {
     // Closing while listing can skip entries; list again until a pass
-    // finds nothing left, as glibc's closefrom fallback does.
-    while unsafe { for_each_open_descriptor(first, |fd| libc::close(fd)) } {}
+    // finds nothing left, as glibc's closefrom fallback does. Errors from
+    // close itself leave the descriptor closed (or never open) on Linux.
+    while unsafe {
+        for_each_open_descriptor(first, |fd| {
+            libc::close(fd);
+            Ok(())
+        })?
+    } {}
+    Ok(())
 }
 
 /// pre_exec: call `f` for every open descriptor >= `first`, found through
 /// /proc/self/fd with raw getdents64 (no allocation). Unlike an
 /// RLIMIT_NOFILE bound, this sees descriptors opened before the limit was
-/// lowered. Without /proc it falls back to the larger of the rlimits.
-/// Returns whether `f` was called at all.
+/// lowered. Without /proc it falls back to the larger of the rlimits. An
+/// incomplete listing is an error, never a silent success. Returns whether
+/// `f` was called at all.
 unsafe fn for_each_open_descriptor(
     first: libc::c_int,
-    mut f: impl FnMut(libc::c_int) -> libc::c_int,
-) -> bool {
+    mut f: impl FnMut(libc::c_int) -> IoResult<()>,
+) -> IoResult<bool> {
     unsafe {
         let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
         let dir = libc::open(c"/proc/self/fd".as_ptr(), flags);
@@ -380,19 +389,39 @@ unsafe fn for_each_open_descriptor(
                 rlim_cur: 0,
                 rlim_max: 0,
             };
-            libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
+            check(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit))?;
             let bound = limit.rlim_cur.max(limit.rlim_max).min(1 << 20) as libc::c_int;
             for fd in first..bound {
-                f(fd);
+                f(fd)?;
             }
-            return false;
+            return Ok(false);
         }
+        let result = list_descriptors(dir, first, &mut f);
+        libc::close(dir);
+        result
+    }
+}
+
+/// The getdents64 loop of for_each_open_descriptor over an open `dir`.
+unsafe fn list_descriptors(
+    dir: libc::c_int,
+    first: libc::c_int,
+    f: &mut impl FnMut(libc::c_int) -> IoResult<()>,
+) -> IoResult<bool> {
+    unsafe {
         let mut called = false;
         let mut buf = [0u64; 512];
         loop {
             let n = libc::syscall(libc::SYS_getdents64, dir, buf.as_mut_ptr(), 4096usize);
-            if n <= 0 {
-                break;
+            if n == 0 {
+                return Ok(called);
+            }
+            if n < 0 {
+                let error = Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
             }
             let bytes = buf.as_ptr().cast::<u8>();
             let mut offset = 0usize;
@@ -412,14 +441,12 @@ unsafe fn for_each_open_descriptor(
                     digits += 1;
                 }
                 if digits > 0 && *name == 0 && fd >= first && fd != dir {
-                    f(fd);
+                    f(fd)?;
                     called = true;
                 }
                 offset += reclen;
             }
         }
-        libc::close(dir);
-        called
     }
 }
 
@@ -442,7 +469,9 @@ unsafe fn wait_for(child: libc::pid_t) -> ! {
     unsafe {
         // Hold no pipes: spawn sees exec (or its error) from the workload,
         // and output ends when the workload's descendants close it.
-        close_from(0);
+        if close_from(0).is_err() {
+            libc::_exit(125);
+        }
         loop {
             let mut status = 0;
             let pid = libc::waitpid(-1, &mut status, 0);
@@ -487,7 +516,16 @@ pub(crate) unsafe fn close_extra_descriptors() -> IoResult<()> {
         if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) == 0 {
             return Ok(());
         }
-        for_each_open_descriptor(3, |fd| libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC));
+        for_each_open_descriptor(3, |fd| {
+            if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                let error = Error::last_os_error();
+                // Closed since it was listed: nothing left to inherit.
+                if error.raw_os_error() != Some(libc::EBADF) {
+                    return Err(error);
+                }
+            }
+            Ok(())
+        })?;
     }
     Ok(())
 }
@@ -1323,7 +1361,9 @@ unsafe fn hold() -> ! {
         let mut empty = std::mem::zeroed::<libc::sigset_t>();
         libc::sigemptyset(&mut empty);
         libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
-        close_from(0);
+        if close_from(0).is_err() {
+            libc::_exit(125);
+        }
         loop {
             libc::pause();
         }
@@ -1347,7 +1387,7 @@ mod tests {
                     rlim_max: 64,
                 };
                 libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
-                super::close_each_from(3);
+                super::close_each_from(3).unwrap();
                 libc::_exit(if libc::fcntl(high, libc::F_GETFD) < 0 {
                     0
                 } else {
@@ -1368,7 +1408,7 @@ mod tests {
         unsafe {
             let pid = libc::fork();
             if pid == 0 {
-                super::close_each_from(3);
+                super::close_each_from(3).unwrap();
                 let closed = libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&write), libc::F_GETFD);
                 libc::_exit(if closed < 0 { 0 } else { 1 });
             }
