@@ -1099,7 +1099,8 @@ impl Holder {
 
     /// Open the held namespaces, verifying they still belong to this holder.
     pub(crate) fn open(&self) -> Result<(OwnedFd, OwnedFd)> {
-        self.verify()?.context("World namespace holder is no longer running")
+        self.verify()?
+            .context("World namespace holder is no longer running")
     }
 
     /// `Ok(None)` only when the holder is definitely gone: the process no
