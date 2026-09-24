@@ -840,6 +840,33 @@ class LinuxSilo(unittest.TestCase):
             result = run(*self.command("A", "fd", sock.fileno()), pass_fds=(sock.fileno(),))
             self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
 
+    @staticmethod
+    def holders():
+        pids = set()
+        for entry in pathlib.Path("/proc").iterdir():
+            try:
+                if entry.name.isdigit() and (entry / "cmdline").read_bytes().split(b"\0")[1:3] == [b"silo", b"hold"]:
+                    pids.add(int(entry.name))
+            except OSError:
+                pass
+        return pids
+
+    def test_holder_is_single_threaded_and_never_orphaned(self):
+        pid = json.loads((self.state / "holders.json").read_text())["A"]["pid"]
+        self.assertEqual(len(os.listdir(f"/proc/{pid}/task")), 1)
+        state = self.root / "readonly-state"
+        work = self.root / "D"
+        work.mkdir()
+        silo = [WORLD, "silo", "--state-dir", state]
+        self.assertEqual(run(*silo, "create", "--world", "D", "--workdir", work).returncode, 0)
+        state.chmod(0o555)
+        self.addCleanup(state.chmod, 0o755)
+        before = self.holders()
+        result = run(*silo, "setup", "--world", "D")
+        self.assertEqual(result.returncode, 125, result.stderr)
+        time.sleep(0.3)
+        self.assertEqual(self.holders() - before, set())
+
     def test_escaped_descendants_are_killed(self):
         work = self.root / "A"
         command = [WORLD, "silo", "--state-dir", self.state, "exec", "--world", "A", "--", "/bin/sh", "-c",

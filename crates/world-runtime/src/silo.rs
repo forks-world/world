@@ -141,8 +141,14 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
         if holders.get(&world.id).is_some_and(|h| h.open().is_ok()) {
             return Ok(());
         }
-        holders.insert(world.id.clone(), crate::linux::start_holder()?);
-        persist(state, "holders.json", &holders)
+        let holder = crate::linux::start_holder()?;
+        holders.insert(world.id.clone(), holder);
+        if let Err(err) = persist(state, "holders.json", &holders) {
+            // An unrecorded holder could never be torn down or reused.
+            let _ = crate::linux::stop_holder(&holder);
+            return Err(err);
+        }
+        Ok(())
     }
     #[cfg(not(target_os = "linux"))]
     {

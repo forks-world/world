@@ -74,8 +74,7 @@ enum Silo {
     },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
@@ -91,8 +90,20 @@ async fn main() {
         ..
     } = cli.command
     {
+        // Before any runtime exists: the holder stays a single thread.
         world_runtime::linux::hold();
     }
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("world: start runtime: {err}");
+            std::process::exit(125);
+        }
+    };
+    std::process::exit(runtime.block_on(run(cli)));
+}
+
+async fn run(cli: Cli) -> i32 {
     let cancel = CancellationToken::new();
     let signal = cancel.clone();
     tokio::spawn(async move {
@@ -116,7 +127,7 @@ async fn main() {
             125
         }
     };
-    std::process::exit(code);
+    code
 }
 
 async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
