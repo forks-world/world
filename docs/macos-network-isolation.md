@@ -53,14 +53,14 @@ mkdir -p ~/world-a ~/world-b
 
 多数服务把锁文件和 Unix socket 放在 `/tmp`，例如 Postgres 的 `/tmp/.s.PGSQL.5432` 及其 `.lock`。只隔离端口时，两个 Workspace 仍会在这些路径上冲突，因此 `world exec` 同时把 `/tmp`、`/private/tmp`、`/var/tmp`、`/private/var/tmp` 重定向到该 Workspace 的私有目录 `~/.world/tmp/<内部地址>/{tmp,var/tmp}`，并把 `TMPDIR` 设为其中的 `tmp/`。同一 Workspace 的多个进程和多次 `exec` 共享该目录，因此仍可用文件锁互斥；不同 Workspace 使用相同名字互不影响。宿主 `/tmp` 不可见，宿主上的非受管程序也看不到 Workspace 的 `/tmp`，需要通过 `world exec` 访问，与 localhost 一致。
 
-重定向由同一动态库在 libSystem 路径调用处完成：打开、创建、stat、目录、改名、链接、权限、时间、xattr、`getattrlist`、`clonefile`、`chdir`、`exec`/`posix_spawn`（含 file actions）以及 `AF_UNIX` 的 `bind/connect/sendto/sendmsg`。`getcwd`、`realpath`、`readlink`、`getsockname/getpeername` 返回宿主名称（`/private/tmp/...`）。程序创建指向 `/tmp/...` 的符号链接时，链接内容写为 Workspace 内的位置。
+重定向由同一动态库在 libSystem 路径调用处完成：打开、创建、stat、目录、改名、链接、权限、时间、xattr、`getattrlist`、`clonefile`、`chdir`、`exec`/`posix_spawn`（含 file actions）以及 `AF_UNIX` 的 `bind/connect/sendto/sendmsg`。`getcwd`、`realpath`、`readlink`、`getsockname/getpeername` 返回宿主名称（`/private/tmp/...`）；即使调用方缓冲区只够放下宿主名称、放不下更长的私有物理路径，也按宿主名称判断是否截断（`getcwd` 返回 `ERANGE`、`readlink` 截断长度），不会因为物理路径更长而误报。程序创建指向 `/tmp/...` 的符号链接时，链接内容写为 Workspace 内的位置。
 
 限制：
 
-- Workspace 工作目录和 `HOME` 不能位于上述临时目录下，否则拒绝执行；私有目录必须在宿主临时目录之外，否则其自身路径会被再次重定向。
+- Workspace 工作目录和 `HOME` 不能位于上述临时目录下，否则拒绝执行；私有目录必须在宿主临时目录之外，否则其自身路径会被再次重定向。`WORLD_TMP` 必须是规范路径（不含符号链接分量）；`world exec` 已确保这一点，手动设置时需自行规范化，否则视为无效。
 - Unix socket 路径上限 104 字节，重定向后路径会加上私有目录前缀（例如 `/Users/me/.world/tmp/127.77.0.1/tmp/`）。超长时 `bind/connect` 返回 `ENAMETOOLONG`。
 - 已存在于 Workspace 之外、指向 `/tmp` 的符号链接由内核解析，不经过重定向；`fcntl(F_GETPATH)`、`accept/recvfrom` 返回的对端地址、原始系统调用和脚本 shebang 中位于 `/tmp` 的解释器不在覆盖范围内。
-- 判断是否重定向时对前缀中的 `..` 按字面解析，前缀里的符号链接（如 `/Users/me/link/../../tmp`）可能判断错误；重定向后的剩余路径原样交给内核解析。
+- 从临时目录向上的 `..` 若前面有具名路径分量，会由内核在私有目录中解析实际位置后再判断；仍按字面处理的是临时目录之前宿主路径中的 `..`（如 `/Users/me/link/../../tmp`）以及私有目录内向上越出的相对符号链接（如 `/tmp/l -> ../etc`）。
 - 私有目录不会随 Workspace 自动清理，也不像宿主 `/tmp` 那样在重启时清空；需要时停止任务后手动删除。
 
 `world workspace show A` 查看配置。Workspace 本地 ID 是开发用稳定标识，尚未对接 forkfs 全局 Workspace Resource ID 或组织授权。`create` 成功只表示元信息登记，不表示已配置地址或通过隔离验收。重启后需要重新 `setup`。停止所有关联任务后可以按 show 返回的地址手工执行 `sudo ifconfig lo0 -alias IP` 清理别名；这不会删除工作目录或注册表。

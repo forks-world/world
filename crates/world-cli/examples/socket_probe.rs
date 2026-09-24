@@ -376,6 +376,104 @@ fn run() -> std::io::Result<()> {
             });
             print!("{report}");
         }
+        "temp-escape" => {
+            // A symlink inside the redirected temp root, then enough ".." to
+            // leave it entirely: the kernel must resolve the symlink first,
+            // so the escape lands back in the *private* root, not on the
+            // host's real /tmp.
+            let n = &args[2];
+            let dir = std::path::PathBuf::from("/tmp").join(n);
+            std::fs::create_dir_all(dir.join("b/c"))?;
+            std::os::unix::fs::symlink("b/c", dir.join("link"))?;
+            std::fs::write(dir.join("f"), "escaped-ok")?;
+            let via_link = match std::fs::read_to_string(format!("/tmp/{n}/link/../../../{n}/f")) {
+                Ok(s) => s,
+                Err(e) => format!("error:{:?}", e.kind()),
+            };
+            let hosts = std::fs::File::open(format!("/tmp/{n}/b/../../../etc/hosts")).is_ok();
+            let missing = std::fs::read_to_string(format!("/tmp/{n}/missing/../../../etc/hosts"))
+                .err()
+                .and_then(|e| e.raw_os_error());
+            let report = serde_json::json!({
+                "via_link": via_link,
+                "hosts": hosts,
+                "missing": missing,
+            });
+            print!("{report}");
+        }
+        "cwd-sized" => {
+            // Exercise getcwd with buffers sized against the (shorter) host
+            // name, including the NULL-buffer allocating form.
+            let n = &args[2];
+            let dir = std::path::PathBuf::from("/tmp").join(n);
+            std::fs::create_dir_all(&dir)?;
+            std::env::set_current_dir(&dir)?;
+            let host = format!("/private/tmp/{n}");
+            let call = |size: usize| -> serde_json::Value {
+                let mut buf = vec![0u8; size.max(1)];
+                let r = unsafe { libc::getcwd(buf.as_mut_ptr().cast(), size) };
+                if r.is_null() {
+                    serde_json::json!({ "errno": std::io::Error::last_os_error().raw_os_error() })
+                } else {
+                    let s = unsafe { std::ffi::CStr::from_ptr(r) }
+                        .to_string_lossy()
+                        .into_owned();
+                    serde_json::json!(s)
+                }
+            };
+            let call_null = |size: usize| -> serde_json::Value {
+                let r = unsafe { libc::getcwd(std::ptr::null_mut(), size) };
+                if r.is_null() {
+                    serde_json::json!({ "errno": std::io::Error::last_os_error().raw_os_error() })
+                } else {
+                    let s = unsafe { std::ffi::CStr::from_ptr(r) }
+                        .to_string_lossy()
+                        .into_owned();
+                    unsafe { libc::free(r.cast()) };
+                    serde_json::json!(s)
+                }
+            };
+            let report = serde_json::json!({
+                "fit": call(host.len() + 1),
+                "exact": call(host.len()),
+                "null_fit": call_null(host.len() + 1),
+                "null_zero": call_null(0),
+            });
+            print!("{report}");
+        }
+        "readlink-sized" => {
+            // Exercise readlink with a buffer sized against the (shorter)
+            // host target name, and one too small to hold it.
+            let n = &args[2];
+            let dir = std::path::PathBuf::from("/tmp").join(n);
+            std::fs::create_dir_all(&dir)?;
+            let target = format!("/tmp/{n}/target");
+            std::os::unix::fs::symlink(&target, dir.join("l"))?;
+            let link = std::ffi::CString::new(dir.join("l").into_os_string().into_encoded_bytes())
+                .unwrap();
+            let host_target = format!("/private/tmp/{n}/target");
+            let read = |size: usize| -> (String, isize) {
+                let mut buf = vec![0u8; size.max(1)];
+                let r = unsafe { libc::readlink(link.as_ptr(), buf.as_mut_ptr().cast(), size) };
+                if r < 0 {
+                    (String::new(), r as isize)
+                } else {
+                    (
+                        String::from_utf8_lossy(&buf[..r as usize]).into_owned(),
+                        r as isize,
+                    )
+                }
+            };
+            let (full, full_ret) = read(host_target.len());
+            let (short, short_ret) = read(10);
+            let report = serde_json::json!({
+                "full": full,
+                "full_ret": full_ret,
+                "short": short,
+                "short_ret": short_ret,
+            });
+            print!("{report}");
+        }
         _ => panic!("unknown probe"),
     }
     Ok(())

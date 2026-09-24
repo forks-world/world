@@ -7,6 +7,7 @@ WORLD_SILO_INTEGRATION=1 python3 -m unittest discover -s tests -v
 """
 import concurrent.futures
 import contextlib
+import errno
 import http.server
 import json
 import os
@@ -659,6 +660,43 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         self.assertTrue(report["guard_intact"], report)
         self.assertEqual(report["prefix"], host[:18])
         self.assertEqual(report["len"], 2 + len(host) + 1)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_dotdot_escapes_a_redirected_temp_root_through_a_symlink(self):
+        # A `..` chain long enough to leave the temp root, after a symlink
+        # inside it: the kernel resolves the symlink first, so the escape
+        # must land back in the *private* root, not walk the host's /tmp.
+        name = f"wt-{uuid.uuid4().hex[:8]}"
+        result = run(PROBE, "temp-escape", name, env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["via_link"], "escaped-ok")
+        self.assertTrue(report["hosts"], report)
+        self.assertEqual(report["missing"], errno.ENOENT)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_getcwd_reports_the_host_name_even_in_a_small_buffer(self):
+        name = f"wt-{uuid.uuid4().hex[:8]}"
+        result = run(PROBE, "cwd-sized", name, env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        host = f"/private/tmp/{name}"
+        self.assertEqual(report["fit"], host)
+        self.assertEqual(report["exact"], {"errno": errno.ERANGE})
+        self.assertEqual(report["null_fit"], host)
+        self.assertEqual(report["null_zero"], host)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_readlink_reports_the_host_name_even_when_truncated(self):
+        name = f"wt-{uuid.uuid4().hex[:8]}"
+        result = run(PROBE, "readlink-sized", name, env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        host_target = f"/private/tmp/{name}/target"
+        self.assertEqual(report["full"], host_target)
+        self.assertEqual(report["full_ret"], len(host_target))
+        self.assertEqual(report["short"], host_target[:10])
+        self.assertEqual(report["short_ret"], 10)
 
     @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
     def test_same_temp_lock_and_socket_names_do_not_conflict(self):

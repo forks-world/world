@@ -2,7 +2,7 @@
 //! Path results (getcwd, realpath, readlink, AF_UNIX names) report host names.
 //! Only libSystem entry points are covered: raw syscalls, pre-existing symlinks
 //! into host temp roots and `fcntl(F_GETPATH)` still observe physical paths.
-use crate::tmp::{PATH_MAX, map_ptr, root, unmap_cstr, unmap_in_place, unmap_unix};
+use crate::tmp::{PATH_MAX, copy_cwd, copy_link, map_ptr, root, unmap_cstr, unmap_unix};
 use libc::{
     c_char, c_int, c_long, c_ulong, c_void, dev_t, gid_t, mode_t, off_t, size_t, sockaddr,
     socklen_t, ssize_t, uid_t,
@@ -183,15 +183,6 @@ interpose!(
     real_openat_nocancel
 );
 
-unsafe fn unmap_link(buf: *mut c_char, len: ssize_t) -> ssize_t {
-    let Some(root) = root() else { return len };
-    if buf.is_null() || len <= 0 {
-        return len;
-    }
-    let bytes = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), len as usize) };
-    unmap_in_place(root, bytes, len as usize).map_or(len, |n| n as ssize_t)
-}
-
 unsafe extern "C" {
     #[link_name = "readlink"]
     fn real_readlink(path: Path, buf: *mut c_char, size: size_t) -> ssize_t;
@@ -209,15 +200,36 @@ unsafe extern "C" {
     fn real_getpeername(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int;
 }
 
+// A caller's buffer may fit the (shorter) host name but not the physical
+// name: read the real link into a full-sized local buffer first, so
+// truncation is judged against the host name rather than the physical one.
 unsafe extern "C" fn readlink_entry(path: Path, buf: *mut c_char, size: size_t) -> ssize_t {
     let mut mapped = [0u8; PATH_MAX];
-    match unsafe { map_ptr(path, &mut mapped) } {
-        Ok(path) => unsafe { unmap_link(buf, real_readlink(path, buf, size)) },
+    let path = match unsafe { map_ptr(path, &mut mapped) } {
+        Ok(path) => path,
         Err(error) => {
             unsafe { *crate::errno_ptr() = error };
-            -1
+            return -1;
         }
+    };
+    let Some(root) = root() else {
+        return unsafe { real_readlink(path, buf, size) };
+    };
+    if buf.is_null() || size == 0 {
+        return unsafe { real_readlink(path, buf, size) };
     }
+    let mut local = [0u8; PATH_MAX];
+    let n = unsafe { real_readlink(path, local.as_mut_ptr().cast(), PATH_MAX) };
+    if n < 0 {
+        return n;
+    }
+    if n as usize == PATH_MAX {
+        // Our probe buffer may itself have truncated; let the real call
+        // apply the caller's exact size instead of guessing.
+        return unsafe { real_readlink(path, buf, size) };
+    }
+    let dst = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), size) };
+    copy_link(root, &mut local, n as usize, dst) as ssize_t
 }
 unsafe extern "C" fn readlinkat_entry(
     fd: c_int,
@@ -226,13 +238,29 @@ unsafe extern "C" fn readlinkat_entry(
     size: size_t,
 ) -> ssize_t {
     let mut mapped = [0u8; PATH_MAX];
-    match unsafe { map_ptr(path, &mut mapped) } {
-        Ok(path) => unsafe { unmap_link(buf, real_readlinkat(fd, path, buf, size)) },
+    let path = match unsafe { map_ptr(path, &mut mapped) } {
+        Ok(path) => path,
         Err(error) => {
             unsafe { *crate::errno_ptr() = error };
-            -1
+            return -1;
         }
+    };
+    let Some(root) = root() else {
+        return unsafe { real_readlinkat(fd, path, buf, size) };
+    };
+    if buf.is_null() || size == 0 {
+        return unsafe { real_readlinkat(fd, path, buf, size) };
     }
+    let mut local = [0u8; PATH_MAX];
+    let n = unsafe { real_readlinkat(fd, path, local.as_mut_ptr().cast(), PATH_MAX) };
+    if n < 0 {
+        return n;
+    }
+    if n as usize == PATH_MAX {
+        return unsafe { real_readlinkat(fd, path, buf, size) };
+    }
+    let dst = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), size) };
+    copy_link(root, &mut local, n as usize, dst) as ssize_t
 }
 interpose!(READLINK, readlink_entry, real_readlink);
 interpose!(READLINKAT, readlinkat_entry, real_readlinkat);
@@ -260,10 +288,47 @@ realpath_entry!(realpath_extsn_entry, real_realpath_extsn);
 interpose!(REALPATH, realpath_entry, real_realpath);
 interpose!(REALPATH_EXTSN, realpath_extsn_entry, real_realpath_extsn);
 
+// A caller's buffer may fit the (shorter) host name but not the physical
+// one: probe the real cwd into a full-sized local buffer first, so ERANGE is
+// judged against the host name rather than the physical name.
 unsafe extern "C" fn getcwd_entry(buf: *mut c_char, size: size_t) -> *mut c_char {
-    let result = unsafe { real_getcwd(buf, size) };
-    unsafe { unmap_cstr(result) };
-    result
+    let Some(root) = root() else {
+        return unsafe { real_getcwd(buf, size) };
+    };
+    if buf.is_null() {
+        let result = unsafe { real_getcwd(std::ptr::null_mut(), 0) };
+        if result.is_null() {
+            return result;
+        }
+        unsafe { unmap_cstr(result) };
+        if size > 0 {
+            let len = unsafe { libc::strlen(result) };
+            if len + 1 > size {
+                unsafe { libc::free(result.cast()) };
+                unsafe { *crate::errno_ptr() = libc::ERANGE };
+                return std::ptr::null_mut();
+            }
+        }
+        return result;
+    }
+    if size == 0 {
+        unsafe { *crate::errno_ptr() = libc::EINVAL };
+        return std::ptr::null_mut();
+    }
+    let mut local = [0u8; PATH_MAX];
+    if unsafe { real_getcwd(local.as_mut_ptr().cast(), PATH_MAX) }.is_null() {
+        // Preserve whatever errno this call sets.
+        return unsafe { real_getcwd(buf, size) };
+    }
+    let len = unsafe { libc::strlen(local.as_ptr().cast()) };
+    let dst = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), size) };
+    match copy_cwd(root, &mut local, len, dst) {
+        Ok(_) => buf,
+        Err(error) => {
+            unsafe { *crate::errno_ptr() = error };
+            std::ptr::null_mut()
+        }
+    }
 }
 interpose!(GETCWD, getcwd_entry, real_getcwd);
 

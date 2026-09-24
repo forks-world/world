@@ -27,12 +27,15 @@ const CANONICAL: [(&[u8], &[u8]); 2] = [
 ];
 
 /// Read `WORLD_TMP` once, before any interposed call can observe it. Returns
-/// false when a value is present but unusable.
+/// false when a value is present but unusable. The root must be canonical: a
+/// symlink in it would make the prefix check below observe a different
+/// string than the kernel resolves, so escaping `..` handling could be fooled
+/// by its own root.
 pub fn init() -> bool {
     let value = std::env::var_os("WORLD_TMP");
     let valid = value.as_ref().is_none_or(|v| {
         use std::os::unix::ffi::OsStrExt;
-        valid_root(v.as_bytes())
+        valid_root(v.as_bytes()) && std::fs::canonicalize(v).is_ok_and(|c| c.as_os_str() == v)
     });
     ROOT.get_or_init(|| {
         use std::os::unix::ffi::OsStrExt;
@@ -131,7 +134,11 @@ impl Base {
 /// Scan state while walking a path's components left to right. `Temp` tracks
 /// how many real components have been pushed below the matched temp root
 /// (`depth`) and where its remainder begins (`start`), so re-entering a temp
-/// root later only keeps the suffix after the latest match.
+/// root later only keeps the suffix after the latest match. `named` is true
+/// once a real component (not `..`) has been pushed below the root: only
+/// then can a `..` that empties `depth` be crossing a symlink, so only then
+/// does it need the kernel's help (see `map_with`).
+#[derive(Clone, Copy)]
 enum Scan {
     Base(Base),
     Other {
@@ -143,101 +150,268 @@ enum Scan {
         parent: Base,
         start: usize,
         depth: u32,
+        named: bool,
     },
+}
+
+/// The textual parent of an absolute, slash-separated path with no trailing
+/// slash (as kernel-resolved paths are). The parent of `/` is `/`.
+fn textual_parent(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(0) => &path[..1],
+        Some(i) => &path[..i],
+        None => b"/",
+    }
+}
+
+/// Write the World location for `path` into `out` as a NUL-terminated string.
+/// Ok(None) means the path is used unchanged. Uses the real kernel to resolve
+/// an escaping `..` that follows a named component (see `map_with`).
+pub fn map(root: &[u8], path: &[u8], out: &mut [u8]) -> Result<Option<usize>, c_int> {
+    let mut resolve = kernel_full_path;
+    map_with(root, path, out, &mut resolve)
+}
+
+/// Ask the kernel where a physical path (which may cross symlinks and may
+/// still contain unresolved `..` components) really resolves, following
+/// symlinks. Our own image's libc calls are not interposed, so this reaches
+/// the real `getattrlist` rather than looping back through `map`.
+#[cfg(target_os = "macos")]
+fn kernel_full_path(path: &[u8], out: &mut [u8]) -> Result<usize, c_int> {
+    #[repr(C)]
+    struct FullPathBuf {
+        length: u32,
+        name: libc::attrreference_t,
+        data: [u8; PATH_MAX],
+    }
+    let mut list: libc::attrlist = unsafe { std::mem::zeroed() };
+    list.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
+    list.commonattr = libc::ATTR_CMN_FULLPATH;
+    let mut buf: FullPathBuf = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<FullPathBuf>();
+    let ret = unsafe {
+        libc::getattrlist(
+            path.as_ptr().cast(),
+            (&mut list as *mut libc::attrlist).cast(),
+            (&mut buf as *mut FullPathBuf).cast(),
+            size,
+            0, // follow symlinks
+        )
+    };
+    if ret != 0 {
+        return Err(unsafe { *crate::errno_ptr() });
+    }
+    // attr_dataoffset is relative to the address of the attrreference_t itself.
+    let base = (&buf.name as *const libc::attrreference_t).cast::<u8>();
+    let text_ptr = unsafe { base.offset(buf.name.attr_dataoffset as isize) };
+    let text = unsafe { std::slice::from_raw_parts(text_ptr, buf.name.attr_length as usize) };
+    let text = text.split(|&b| b == 0).next().unwrap_or(text);
+    if text.len() >= out.len() {
+        return Err(libc::ENAMETOOLONG);
+    }
+    out[..text.len()].copy_from_slice(text);
+    Ok(text.len())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn kernel_full_path(_path: &[u8], _out: &mut [u8]) -> Result<usize, c_int> {
+    Err(libc::ENOSYS)
 }
 
 /// Write the World location for `path` into `out` as a NUL-terminated string.
 /// Ok(None) means the path is used unchanged. Only the leading components
-/// decide redirection, exactly as the kernel resolves them one at a time; the
-/// remainder is then copied verbatim, so a `..` that crosses a symlink (e.g.
-/// `/tmp/a/link/../x`) is left for the kernel to resolve rather than resolved
-/// lexically here.
-pub fn map(root: &[u8], path: &[u8], out: &mut [u8]) -> Result<Option<usize>, c_int> {
+/// decide redirection, exactly as the kernel resolves them one at a time.
+/// Below a temp root, the remainder is normally copied verbatim: a `..` that
+/// crosses a symlink (e.g. `/tmp/a/link/../x`) is left for the kernel to
+/// resolve rather than resolved lexically here. But a `..` that empties a
+/// temp root's depth *after* a named component was pushed (e.g.
+/// `/tmp/a/link/../../../etc/x`) would otherwise return to `Base`, and the
+/// caller's literal text would then walk the *host's* temp root instead of
+/// the redirected one. `resolve` (the real kernel for `map`, a fake one in
+/// tests) is asked where the physical prefix up to that `..` really
+/// resolves, so the escape can be rewritten and the scan restarted.
+pub(crate) fn map_with(
+    root: &[u8],
+    path: &[u8],
+    out: &mut [u8],
+    resolve: &mut impl FnMut(&[u8], &mut [u8]) -> Result<usize, c_int>,
+) -> Result<Option<usize>, c_int> {
     // An overlong path is rejected by the kernel exactly as the caller wrote it.
     if !path.starts_with(b"/") || path.len() >= PATH_MAX {
         return Ok(None);
     }
-    let mut state = Scan::Base(Base::Root);
-    let mut pos = 0;
-    for component in path.split(|&b| b == b'/') {
-        let end = pos + component.len();
-        pos = end + 1;
-        state = match (state, component) {
-            (s, b"" | b".") => s,
-            (Scan::Base(b), b"..") => Scan::Base(b.parent()),
-            (Scan::Base(Base::Root), b"private") => Scan::Base(Base::Private),
-            (Scan::Base(Base::Root | Base::Private), b"var") => Scan::Base(Base::PrivVar),
-            (Scan::Base(Base::Root | Base::Private), b"tmp") => Scan::Temp {
-                sub: b"/tmp",
-                parent: Base::Private,
-                start: end,
-                depth: 0,
-            },
-            (Scan::Base(Base::PrivVar), b"tmp") => Scan::Temp {
-                sub: b"/var/tmp",
-                parent: Base::PrivVar,
-                start: end,
-                depth: 0,
-            },
-            (Scan::Base(b), _) => Scan::Other { base: b, depth: 1 },
-            (Scan::Other { base, depth: 1 }, b"..") => Scan::Base(base),
-            (Scan::Other { base, depth }, b"..") => Scan::Other {
-                base,
-                depth: depth - 1,
-            },
-            (Scan::Other { base, depth }, _) => Scan::Other {
-                base,
-                depth: depth + 1,
-            },
-            (
-                Scan::Temp {
-                    parent, depth: 0, ..
+    let mut cur = [0u8; PATH_MAX];
+    cur[..path.len()].copy_from_slice(path);
+    let mut cur_len = path.len();
+    let mut rewritten = false;
+
+    for _ in 0..64 {
+        let mut state = Scan::Base(Base::Root);
+        let mut pos = 0;
+        let mut escape = None;
+        for component in cur[..cur_len].split(|&b| b == b'/') {
+            let comp_start = pos;
+            let end = pos + component.len();
+            pos = end + 1;
+            state = match (state, component) {
+                (s, b"" | b".") => s,
+                (Scan::Base(b), b"..") => Scan::Base(b.parent()),
+                (Scan::Base(Base::Root), b"private") => Scan::Base(Base::Private),
+                (Scan::Base(Base::Root | Base::Private), b"var") => Scan::Base(Base::PrivVar),
+                (Scan::Base(Base::Root | Base::Private), b"tmp") => Scan::Temp {
+                    sub: b"/tmp",
+                    parent: Base::Private,
+                    start: end,
+                    depth: 0,
+                    named: false,
                 },
-                b"..",
-            ) => Scan::Base(parent),
-            (
-                Scan::Temp {
+                (Scan::Base(Base::PrivVar), b"tmp") => Scan::Temp {
+                    sub: b"/var/tmp",
+                    parent: Base::PrivVar,
+                    start: end,
+                    depth: 0,
+                    named: false,
+                },
+                (Scan::Base(b), _) => Scan::Other { base: b, depth: 1 },
+                (Scan::Other { base, depth: 1 }, b"..") => Scan::Base(base),
+                (Scan::Other { base, depth }, b"..") => Scan::Other {
+                    base,
+                    depth: depth - 1,
+                },
+                (Scan::Other { base, depth }, _) => Scan::Other {
+                    base,
+                    depth: depth + 1,
+                },
+                (
+                    Scan::Temp {
+                        depth: 0,
+                        named: false,
+                        parent,
+                        ..
+                    },
+                    b"..",
+                ) => Scan::Base(parent),
+                (
+                    Scan::Temp {
+                        sub,
+                        start,
+                        depth: 0,
+                        named: true,
+                        ..
+                    },
+                    b"..",
+                ) => {
+                    escape = Some((sub, start, comp_start, end));
+                    break;
+                }
+                (
+                    Scan::Temp {
+                        sub,
+                        parent,
+                        start,
+                        depth,
+                        named,
+                    },
+                    b"..",
+                ) => Scan::Temp {
                     sub,
                     parent,
                     start,
-                    depth,
+                    depth: depth - 1,
+                    named,
                 },
-                b"..",
-            ) => Scan::Temp {
-                sub,
-                parent,
-                start,
-                depth: depth - 1,
-            },
-            (
-                Scan::Temp {
+                (
+                    Scan::Temp {
+                        sub,
+                        parent,
+                        start,
+                        depth,
+                        ..
+                    },
+                    _,
+                ) => Scan::Temp {
                     sub,
                     parent,
                     start,
-                    depth,
+                    depth: depth + 1,
+                    named: true,
                 },
-                _,
-            ) => Scan::Temp {
-                sub,
-                parent,
-                start,
-                depth: depth + 1,
-            },
+            };
+        }
+
+        let Some((sub, start, comp_start, dotdot_end)) = escape else {
+            let Scan::Temp { sub, start, .. } = state else {
+                if !rewritten {
+                    return Ok(None);
+                }
+                // The rewritten text must be used: the original would walk
+                // the host's temp root instead of the redirected one.
+                if cur_len >= out.len() {
+                    return Err(libc::ENAMETOOLONG);
+                }
+                out[..cur_len].copy_from_slice(&cur[..cur_len]);
+                out[cur_len] = 0;
+                return Ok(Some(cur_len));
+            };
+            let rest = &cur[start..cur_len];
+            let total = root.len() + sub.len() + rest.len();
+            if total >= out.len() {
+                return Err(libc::ENAMETOOLONG);
+            }
+            out[..root.len()].copy_from_slice(root);
+            out[root.len()..root.len() + sub.len()].copy_from_slice(sub);
+            out[root.len() + sub.len()..total].copy_from_slice(rest);
+            out[total] = 0;
+            return Ok(Some(total));
         };
+
+        // Build the physical path up to (not including) the escaping `..`,
+        // using `out` as scratch, and ask where it really resolves.
+        let prefix = &cur[start..comp_start];
+        let total = root.len() + sub.len() + prefix.len();
+        if total >= out.len() {
+            return Err(libc::ENAMETOOLONG);
+        }
+        out[..root.len()].copy_from_slice(root);
+        out[root.len()..root.len() + sub.len()].copy_from_slice(sub);
+        out[root.len() + sub.len()..total].copy_from_slice(prefix);
+        out[total] = 0;
+
+        let mut resolved = [0u8; PATH_MAX];
+        let resolved_len = resolve(&out[..total + 1], &mut resolved)?;
+        let host_len = unmap_in_place(root, &mut resolved, resolved_len).unwrap_or(resolved_len);
+        let parent = textual_parent(&resolved[..host_len]);
+        let remainder_start = if dotdot_end < cur_len {
+            dotdot_end + 1
+        } else {
+            cur_len
+        };
+        let remainder = &cur[remainder_start..cur_len];
+
+        let mut next = [0u8; PATH_MAX];
+        let mut next_len = parent.len();
+        if next_len >= next.len() {
+            return Err(libc::ENAMETOOLONG);
+        }
+        next[..next_len].copy_from_slice(parent);
+        if parent != b"/" {
+            if next_len >= next.len() {
+                return Err(libc::ENAMETOOLONG);
+            }
+            next[next_len] = b'/';
+            next_len += 1;
+        }
+        if next_len + remainder.len() >= next.len() {
+            return Err(libc::ENAMETOOLONG);
+        }
+        next[next_len..next_len + remainder.len()].copy_from_slice(remainder);
+        next_len += remainder.len();
+
+        cur[..next_len].copy_from_slice(&next[..next_len]);
+        cur_len = next_len;
+        rewritten = true;
     }
-    let Scan::Temp { sub, start, .. } = state else {
-        return Ok(None);
-    };
-    let rest = &path[start..];
-    let total = root.len() + sub.len() + rest.len();
-    if total >= out.len() {
-        return Err(libc::ENAMETOOLONG);
-    }
-    out[..root.len()].copy_from_slice(root);
-    out[root.len()..root.len() + sub.len()].copy_from_slice(sub);
-    out[root.len() + sub.len()..total].copy_from_slice(rest);
-    out[total] = 0;
-    Ok(Some(total))
+    Err(libc::ELOOP)
 }
 
 /// Rewrite a physical World location back to its host name in place.
@@ -280,6 +454,35 @@ pub fn map_path(path: &std::path::Path) -> std::path::PathBuf {
         Some(Ok(Some(len))) => std::ffi::OsString::from_vec(buf[..len].to_vec()).into(),
         _ => path.to_owned(),
     }
+}
+
+/// Copy a `getcwd` result into the caller's buffer, unmapping it first.
+/// `local[..len]` holds the physical name (no NUL required); `dst` is the
+/// caller's buffer. Errors (`ERANGE`) leave `dst` untouched, matching
+/// `getcwd`'s contract.
+pub(crate) fn copy_cwd(
+    root: &[u8],
+    local: &mut [u8],
+    len: usize,
+    dst: &mut [u8],
+) -> Result<usize, c_int> {
+    let n = unmap_in_place(root, local, len).unwrap_or(len);
+    if n + 1 > dst.len() {
+        return Err(libc::ERANGE);
+    }
+    dst[..n].copy_from_slice(&local[..n]);
+    dst[n] = 0;
+    Ok(n)
+}
+
+/// Copy a `readlink` result into the caller's buffer, unmapping it first and
+/// truncating to `dst`'s capacity exactly as the kernel would (no NUL, since
+/// `readlink` does not add one).
+pub(crate) fn copy_link(root: &[u8], local: &mut [u8], len: usize, dst: &mut [u8]) -> usize {
+    let n = unmap_in_place(root, local, len).unwrap_or(len);
+    let copied = n.min(dst.len());
+    dst[..copied].copy_from_slice(&local[..copied]);
+    copied
 }
 
 /// Rewrite a NUL-terminated result string in place.
@@ -445,11 +648,61 @@ mod tests {
 
     const ROOT: &[u8] = b"/Users/me/.local/share/world/workspaces/tmp/127.77.0.1";
 
-    fn mapped(path: &str) -> Option<String> {
+    /// A resolver that stands in for the kernel: it follows `links`
+    /// (physical path -> target, matched by whole leading components;
+    /// relative targets resolve against the link's own parent, absolute
+    /// targets as-is) until none apply, then lexically normalizes. This is
+    /// oracle-consistent with the kernel exactly when no symlink is
+    /// involved, which is why the plain `mapped()` tests below (no links)
+    /// can use it in place of a live `getattrlist`.
+    fn fake_resolve<'a>(
+        links: &'a [(&'a str, &'a str)],
+    ) -> impl FnMut(&[u8], &mut [u8]) -> Result<usize, c_int> + 'a {
+        move |path: &[u8], out: &mut [u8]| {
+            let mut current = path.split(|&b| b == 0).next().unwrap_or(path).to_vec();
+            for _ in 0..32 {
+                let Some((link, target)) = links
+                    .iter()
+                    .find(|(link, _)| component_rest(&current, link.as_bytes()).is_some())
+                else {
+                    break;
+                };
+                let rest = component_rest(&current, link.as_bytes()).unwrap().to_vec();
+                let mut next = if let Some(abs) = target.strip_prefix('/') {
+                    let mut v = vec![b'/'];
+                    v.extend_from_slice(abs.as_bytes());
+                    v
+                } else {
+                    let parent = textual_parent(link.as_bytes());
+                    let mut v = parent.to_vec();
+                    if parent != b"/" {
+                        v.push(b'/');
+                    }
+                    v.extend_from_slice(target.as_bytes());
+                    v
+                };
+                next.extend_from_slice(&rest);
+                current = next;
+            }
+            let mut buf = [0u8; PATH_MAX];
+            let len = normalize(&current, &mut buf).ok_or(libc::ENAMETOOLONG)?;
+            if len >= out.len() {
+                return Err(libc::ENAMETOOLONG);
+            }
+            out[..len].copy_from_slice(&buf[..len]);
+            Ok(len)
+        }
+    }
+
+    fn mapped_with(path: &str, links: &[(&str, &str)]) -> Result<Option<String>, c_int> {
         let mut out = [0u8; PATH_MAX];
-        map(ROOT, path.as_bytes(), &mut out)
-            .unwrap()
-            .map(|n| String::from_utf8(out[..n].to_vec()).unwrap())
+        let mut resolve = fake_resolve(links);
+        let result = map_with(ROOT, path.as_bytes(), &mut out, &mut resolve)?;
+        Ok(result.map(|n| String::from_utf8(out[..n].to_vec()).unwrap()))
+    }
+
+    fn mapped(path: &str) -> Option<String> {
+        mapped_with(path, &[]).unwrap()
     }
 
     #[test]
@@ -497,6 +750,103 @@ mod tests {
         ] {
             assert_eq!(mapped(path), None, "{path}");
         }
+    }
+
+    #[test]
+    fn escaping_dotdot_after_a_named_component_asks_the_kernel() {
+        let root = std::str::from_utf8(ROOT).unwrap();
+        let link = format!("{root}/tmp/a/link");
+        // A relative symlink, then enough ".." to leave the temp root
+        // entirely: the kernel resolves "a/link" -> "a/b/c" first, so the
+        // three ".." land on "a", then "tmp", then the private root -- not
+        // on a lexical (and wrong) parent of "a/link".
+        assert_eq!(
+            mapped_with("/tmp/a/link/../../../etc/x", &[(&link, "b/c")]),
+            Ok(Some(format!("{root}/tmp/etc/x")))
+        );
+        let abs_link = format!("{root}/tmp/a/abs");
+        // An absolute symlink target is used as-is, ignoring the redirected
+        // prefix it was found under.
+        assert_eq!(
+            mapped_with("/tmp/a/abs/../../../tmp/f", &[(&abs_link, "/usr/bin")]),
+            Ok(Some(format!("{root}/tmp/f")))
+        );
+        // No symlink at all: the escape still needs the kernel's help
+        // because a named component ("a") was pushed first, but the result
+        // is the same as plain lexical resolution.
+        assert_eq!(
+            mapped_with("/tmp/a/../../etc/hosts", &[]),
+            Ok(Some("/private/etc/hosts".to_string()))
+        );
+        // Escaping past the temp root with no named component in between
+        // (e.g. "/tmp/..") never needs the kernel: it stays on the fast,
+        // allocation-free path and is left unmapped.
+        assert_eq!(mapped_with("/tmp/..", &[]), Ok(None));
+    }
+
+    #[test]
+    fn map_with_propagates_resolver_errors() {
+        let mut out = [0u8; PATH_MAX];
+        let mut resolve = |_: &[u8], _: &mut [u8]| Err(libc::ENOENT);
+        let result = map_with(ROOT, b"/tmp/a/../../etc", &mut out, &mut resolve);
+        assert_eq!(result, Err(libc::ENOENT));
+    }
+
+    #[test]
+    fn copies_cwd_result_unmapping_first() {
+        let physical = format!("{}/tmp/a", std::str::from_utf8(ROOT).unwrap());
+        let host = "/private/tmp/a";
+        let mut local = [0u8; PATH_MAX];
+        local[..physical.len()].copy_from_slice(physical.as_bytes());
+
+        // Exactly the host name plus NUL fits.
+        let mut dst = [0u8; PATH_MAX];
+        let n = copy_cwd(ROOT, &mut local, physical.len(), &mut dst).unwrap();
+        assert_eq!(n, host.len());
+        assert_eq!(&dst[..n], host.as_bytes());
+
+        // A buffer that only fits the host name without its NUL is ERANGE,
+        // even though the physical name would not have fit either.
+        let mut local2 = local;
+        let mut dst2 = [0xAAu8; PATH_MAX];
+        let err = copy_cwd(ROOT, &mut local2, physical.len(), &mut dst2[..host.len()]).unwrap_err();
+        assert_eq!(err, libc::ERANGE);
+        assert!(dst2[..host.len()].iter().all(|&b| b == 0xAA));
+
+        // An unmapped path is copied through as-is.
+        let mut other = *b"/other\0\0\0\0\0\0\0\0\0\0";
+        let mut dst3 = [0u8; PATH_MAX];
+        let n = copy_cwd(ROOT, &mut other, 6, &mut dst3).unwrap();
+        assert_eq!(&dst3[..n], b"/other");
+    }
+
+    #[test]
+    fn copies_readlink_result_unmapping_first() {
+        let physical = format!("{}/tmp/target", std::str::from_utf8(ROOT).unwrap());
+        let host = "/private/tmp/target";
+        let mut local = [0u8; PATH_MAX];
+        local[..physical.len()].copy_from_slice(physical.as_bytes());
+
+        // Truncation is measured against the (shorter) host name, not the
+        // physical name.
+        let mut local1 = local;
+        let mut dst = [0xAAu8; 32];
+        let n = copy_link(ROOT, &mut local1, physical.len(), &mut dst[..10]);
+        assert_eq!(n, 10);
+        assert_eq!(&dst[..10], &host.as_bytes()[..10]);
+
+        // An exact fit is copied in full, with no NUL appended.
+        let mut local2 = local;
+        let mut dst2 = [0xAAu8; PATH_MAX];
+        let n = copy_link(ROOT, &mut local2, physical.len(), &mut dst2[..host.len()]);
+        assert_eq!(n, host.len());
+        assert_eq!(&dst2[..host.len()], host.as_bytes());
+
+        // An unmapped target is copied through as-is.
+        let mut other = *b"/other\0\0\0\0\0\0\0\0\0\0";
+        let mut dst3 = [0u8; 32];
+        let n = copy_link(ROOT, &mut other, 6, &mut dst3);
+        assert_eq!(&dst3[..n], b"/other");
     }
 
     #[test]
@@ -636,10 +986,24 @@ mod tests {
             let normalized_len = normalize(path.as_bytes(), &mut normalized_buf).unwrap();
             let normalized_path = normalized_buf[..normalized_len].to_vec();
 
+            // No symlinks are in play here, so the fake (lexical) resolver
+            // is oracle-consistent with the real kernel.
             let mut mapped_buf = [0u8; PATH_MAX];
-            let mapped = map(ROOT, path.as_bytes(), &mut mapped_buf).unwrap();
+            let mapped = map_with(ROOT, path.as_bytes(), &mut mapped_buf, &mut fake_resolve(&[])).unwrap();
             let mut mapped_norm_buf = [0u8; PATH_MAX];
-            let mapped_norm = map(ROOT, &normalized_path, &mut mapped_norm_buf).unwrap();
+            let mapped_norm = map_with(ROOT, &normalized_path, &mut mapped_norm_buf, &mut fake_resolve(&[])).unwrap();
+
+            // An escape that crosses the temp root's own boundary (e.g.
+            // "/tmp/a/../..") depends on resolver knowledge that plain
+            // lexical normalization does not have: `/tmp` itself behaves
+            // like a symlink to `/private/tmp`, so backing out of it lands
+            // on `/private`, not on `/`. Such host-passthrough results
+            // (outside `root`) are exempt from this oracle and are covered
+            // by the dedicated escape tests instead.
+            let escapes = |buf: &[u8], n: Option<usize>| n.is_some_and(|n| !buf[..n].starts_with(ROOT));
+            if escapes(&mapped_buf, mapped) || escapes(&mapped_norm_buf, mapped_norm) {
+                return Ok(());
+            }
 
             proptest::prop_assert_eq!(mapped.is_some(), mapped_norm.is_some());
             if let (Some(a), Some(b)) = (mapped, mapped_norm) {

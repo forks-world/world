@@ -156,7 +156,11 @@ pub fn temp_root(world: &World) -> Result<PathBuf> {
         // Match host temp directory permissions; the parent keeps it private.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777))?;
     }
-    Ok(root)
+    // silo-bind's `..`-escape handling asks the kernel where a physical
+    // prefix resolves and compares that against WORLD_TMP textually, so the
+    // root it is given must already be canonical (HOME is canonicalized
+    // above, but a symlink could still be introduced under `.world/tmp`).
+    root.canonicalize().context("temp root")
 }
 
 pub fn alias_ready(ip: Ipv4Addr) -> bool {
