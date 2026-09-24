@@ -347,16 +347,66 @@ unsafe fn close_from(first: libc::c_int) {
 }
 
 unsafe fn close_each_from(first: libc::c_int) {
+    // Closing while listing can skip entries; list again until a pass
+    // finds nothing left, as glibc's closefrom fallback does.
+    while unsafe { for_each_open_descriptor(first, |fd| libc::close(fd)) } {}
+}
+
+/// pre_exec: call `f` for every open descriptor >= `first`, found through
+/// /proc/self/fd with raw getdents64 (no allocation). Unlike an
+/// RLIMIT_NOFILE bound, this sees descriptors opened before the limit was
+/// lowered. Without /proc it falls back to the larger of the rlimits.
+/// Returns whether `f` was called at all.
+unsafe fn for_each_open_descriptor(
+    first: libc::c_int,
+    mut f: impl FnMut(libc::c_int) -> libc::c_int,
+) -> bool {
     unsafe {
-        let limit = libc::sysconf(libc::_SC_OPEN_MAX);
-        let limit = if limit < 0 {
-            65536
-        } else {
-            limit as libc::c_int
-        };
-        for fd in first..limit {
-            libc::close(fd);
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        let dir = libc::open(c"/proc/self/fd".as_ptr(), flags);
+        if dir < 0 {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
+            let bound = limit.rlim_cur.max(limit.rlim_max).min(1 << 20) as libc::c_int;
+            for fd in first..bound {
+                f(fd);
+            }
+            return false;
         }
+        let mut called = false;
+        let mut buf = [0u64; 512];
+        loop {
+            let n = libc::syscall(libc::SYS_getdents64, dir, buf.as_mut_ptr(), 4096usize);
+            if n <= 0 {
+                break;
+            }
+            let bytes = buf.as_ptr().cast::<u8>();
+            let mut offset = 0usize;
+            while offset < n as usize {
+                // linux_dirent64: d_ino u64, d_off i64, d_reclen u16,
+                // d_type u8, then the NUL-terminated name.
+                let entry = bytes.add(offset);
+                let reclen = entry.add(16).cast::<u16>().read_unaligned() as usize;
+                let mut name = entry.add(19);
+                let mut fd: libc::c_int = 0;
+                let mut digits = 0;
+                while (*name).is_ascii_digit() {
+                    fd = fd.saturating_mul(10).saturating_add((*name - b'0') as libc::c_int);
+                    name = name.add(1);
+                    digits += 1;
+                }
+                if digits > 0 && *name == 0 && fd >= first && fd != dir {
+                    f(fd);
+                    called = true;
+                }
+                offset += reclen;
+            }
+        }
+        libc::close(dir);
+        called
     }
 }
 
@@ -424,13 +474,7 @@ pub(crate) unsafe fn close_extra_descriptors() -> IoResult<()> {
         if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) == 0 {
             return Ok(());
         }
-        let limit = libc::sysconf(libc::_SC_OPEN_MAX);
-        if limit < 0 {
-            return Err(Error::last_os_error());
-        }
-        for fd in 3..limit as i32 {
-            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-        }
+        for_each_open_descriptor(3, |fd| libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC));
     }
     Ok(())
 }
@@ -1072,6 +1116,12 @@ impl Holder {
 /// Start a detached process that keeps new namespaces alive.
 pub(crate) fn start_holder() -> Result<Holder> {
     let maps = IdMaps::current();
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 writes two new descriptors into fds on success.
+    check(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) })?;
+    // SAFETY: both descriptors are new and exclusively owned here.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let report = write.as_raw_fd();
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.args(["silo", "hold"])
         .current_dir("/")
@@ -1082,12 +1132,34 @@ pub(crate) fn start_holder() -> Result<Holder> {
     unsafe {
         cmd.pre_exec(move || {
             check(libc::setsid())?;
+            // Double fork: the holder is reparented to init (or a subreaper),
+            // which reaps it after teardown, so a long-lived caller of setup
+            // never accumulates zombies. The holder still owns spawn's
+            // exec-status pipe, so spawn returns once it has exec'd.
+            let holder = check(libc::fork())?;
+            if holder != 0 {
+                libc::_exit(0);
+            }
             enter_new_namespaces(&maps)?;
+            let pid = libc::getpid();
+            let size = std::mem::size_of_val(&pid);
+            if libc::write(report, (&pid as *const libc::pid_t).cast(), size) != size as isize {
+                return Err(Error::last_os_error());
+            }
             close_extra_descriptors()
         });
     }
-    let child = cmd.spawn().context("start World namespace holder")?;
-    Holder::observe(child.id())
+    let mut child = cmd.spawn().context("start World namespace holder")?;
+    child.wait()?;
+    drop(write);
+    let mut pid: libc::pid_t = 0;
+    let size = std::mem::size_of_val(&pid);
+    // SAFETY: pid is a live, writable buffer of the given size.
+    let n = unsafe { libc::read(read.as_raw_fd(), (&mut pid as *mut libc::pid_t).cast(), size) };
+    if n != size as isize {
+        bail!("World namespace holder did not start");
+    }
+    Holder::observe(pid as u32)
 }
 
 pub(crate) fn stop_holder(holder: &Holder) -> Result<()> {
@@ -1136,6 +1208,30 @@ pub fn hold() -> ! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn close_fallback_sees_descriptors_above_a_lowered_limit() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        // SAFETY: the forked child only duplicates, lowers its own limit,
+        // closes descriptors and exits without returning into the harness.
+        unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                let high = 900;
+                libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&file), high);
+                let limit = libc::rlimit {
+                    rlim_cur: 64,
+                    rlim_max: 64,
+                };
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+                super::close_each_from(3);
+                libc::_exit(if libc::fcntl(high, libc::F_GETFD) < 0 { 0 } else { 1 });
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        }
+    }
+
     #[test]
     fn close_fallback_closes_every_descriptor() {
         let (read, write) = std::os::unix::net::UnixStream::pair().unwrap();
