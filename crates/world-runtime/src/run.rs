@@ -316,7 +316,9 @@ impl StdinRelay {
 fn relay_source() -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
     let stdin = std::io::stdin().as_fd().try_clone_to_owned()?;
-    let kind = std::fs::File::from(stdin.try_clone()?).metadata()?.file_type();
+    let kind = std::fs::File::from(stdin.try_clone()?)
+        .metadata()?
+        .file_type();
     use std::os::unix::fs::FileTypeExt;
     if !(kind.is_fifo() || kind.is_char_device()) {
         return Ok(stdin);
