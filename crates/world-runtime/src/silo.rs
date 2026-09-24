@@ -246,6 +246,10 @@ async fn linux_exec(
             world.id
         )
     })?;
+    let (user, net) = (
+        crate::linux::above_stdio(user)?,
+        crate::linux::above_stdio(net)?,
+    );
     let (user_fd, net_fd) = (user.as_raw_fd(), net.as_raw_fd());
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..])

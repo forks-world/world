@@ -38,6 +38,18 @@ fn check(result: libc::c_int) -> IoResult<libc::c_int> {
     }
 }
 
+/// Move a descriptor handed to a child above the standard descriptors: if
+/// a library caller has closed 0-2, a new descriptor can land there, and
+/// Command replaces 0-2 with the child's stdio before pre_exec runs.
+pub(crate) fn above_stdio(fd: OwnedFd) -> IoResult<OwnedFd> {
+    if fd.as_raw_fd() > 2 {
+        return Ok(fd);
+    }
+    // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor we exclusively own.
+    let moved = check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) })?;
+    Ok(unsafe { OwnedFd::from_raw_fd(moved) })
+}
+
 /// Maps the caller's own uid/gid into a new user namespace.
 pub(crate) struct IdMaps {
     uid: Vec<u8>,
@@ -773,7 +785,7 @@ mod landlock {
                     .with_context(|| format!("Landlock rule for {}", path.display()));
             }
         }
-        Ok((ruleset, dir_rights))
+        Ok((above_stdio(ruleset)?, dir_rights))
     }
 
     /// pre_exec: grant `rights` beneath a directory that only exists in the
@@ -990,6 +1002,10 @@ mod seccomp {
 /// `world network exec`: private network namespace plus egress proxy.
 pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Result<i32> {
     let deadline = Instant::now() + options.timeout;
+    // Before this function opens any descriptor that could land on a
+    // closed fd 0 and make it look like an unsupported stdin.
+    run::check_stdin()?;
+    run::check_linux_stdin()?;
     let dir = run::workdir(&options.workdir)?;
     // The private /dev hides anything beneath the host /dev.
     if dir.starts_with("/dev") {
@@ -1033,7 +1049,9 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
                 )
             })?;
             // SAFETY: both descriptors are new and exclusively owned here.
-            Some(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+            let (parent, child) =
+                unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+            Some((above_stdio(parent)?, above_stdio(child)?))
         }
     };
     let mut cmd = Command::new(&options.command[0]);
@@ -1082,8 +1100,6 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
             enter_pid_namespace()
         });
     }
-    run::check_stdin()?;
-    run::check_linux_stdin()?;
     if cancel.is_cancelled() || Instant::now() >= deadline {
         return Ok(124);
     }
@@ -1182,6 +1198,7 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
     check(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) })?;
     // SAFETY: both descriptors are new and exclusively owned here.
     let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let (read, write) = (above_stdio(read)?, above_stdio(write)?);
     let report = write.as_raw_fd();
     // The program is never executed: the holder stays in pre_exec forever,
     // so any embedding executable works, not only the world CLI.
