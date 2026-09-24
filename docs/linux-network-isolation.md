@@ -54,6 +54,7 @@ mkdir -p /tmp/world-a /tmp/world-b
 - `exec` 校验 holder 身份后，用 `setns` 加入这两个 namespace，再执行命令。同一个 World 的多次 `exec` 共享同一个内核网络栈。不同 World 的 localhost 完全独立，都可以绑定同一地址和端口，包括 `127.0.0.1`、`0.0.0.0`、`::1`、`::`、UDP，以及 1024 以下的端口。
 - 程序形态不限：脚本、系统程序、静态链接程序和 setuid 程序都可以运行。其中 setuid 位在 namespace 中不会提升权限。注册表里的 `ip` 字段在 Linux 上只是标识，不参与网络。
 - World 内只有 loopback：宿主访问不到 World 内的监听，World 内也没有外网，客户端必须同样通过 `world silo exec` 启动。继承的 `http_proxy` 等变量指向宿主代理时，World 内同样无法连接，访问 localhost 时应设置 `no_proxy` 或使用 `--noproxy`。与 macOS silo 一样，文件系统 Unix socket 不受限制。
+- 在库中调用 `silo::setup` 的长期运行进程如果是 child subreaper，holder 会被它收养；Linux 5.4+ 上 teardown 会用 `waitid(P_PIDFD)` 精确回收，更早的内核上无法安全地按 PID 回收，需要调用者自行回收子进程。
 - `world silo teardown --world A` 停止 holder：先用 pidfd 固定进程再校验身份，避免 PID 复用误杀；Linux 5.3 以前没有 pidfd，会在校验后立即按 PID 发送信号。已经在运行的 World 进程会继续持有旧的 namespace，但之后的 `exec` 无法再加入它。holder 被杀死或机器重启后，需要重新 `setup`；新 namespace 不会与仍在运行的旧进程共享。
 
 与 macOS 的 silo 不同，这里是内核 network namespace：原始系统调用、静态链接程序或绕过 libc 的程序，也无法访问其他 World 或宿主的 loopback。它仍然不是完整沙箱：不限制文件读写，同一 uid 的宿主进程可以加入 World 的 namespace，也不提供跨 World 文件保密、组织授权或远程租约。
