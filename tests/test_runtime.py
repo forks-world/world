@@ -203,6 +203,26 @@ print("stolen" if got >= 0 else os.strerror(ctypes.get_errno()))
                 self.assertNotEqual(result.returncode, 0, "remount must fail")
                 self.assertEqual(result.stdout, "0000000000000000\n", result.stderr)
 
+    @unittest.skipUnless(LINUX, "private /dev requires Linux")
+    def test_host_terminal_and_devices_are_unreachable(self):
+        import pty, termios
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        path = os.ttyname(slave)
+        code = f"""
+import os, termios
+fd = os.open({path!r}, os.O_RDONLY | os.O_NOCTTY)
+attrs = termios.tcgetattr(fd); attrs[3] &= ~termios.ECHO
+termios.tcsetattr(fd, termios.TCSANOW, attrs)
+"""
+        result = self.network("/usr/bin/python3", "-c", code)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(termios.tcgetattr(slave)[3] & termios.ECHO, "host terminal was changed")
+        script = "ls /dev | tr '\\n' ' '; test -e /dev/tty && echo tty; echo x > /dev/null && echo s > /dev/shm/s && cat /dev/shm/s; touch /dev/new 2>/dev/null || echo ro"
+        result = self.network("/bin/sh", "-c", script)
+        self.assertEqual(result.stdout, "fd full null random shm stderr stdin stdout urandom zero s\nro\n", result.stderr)
+
     @unittest.skipUnless(LINUX, "PID namespaces require Linux")
     def test_escaped_descendants_are_killed(self):
         self.assertEqual(self.network("/bin/sh", "-c", "kill -9 $$").returncode, 137)

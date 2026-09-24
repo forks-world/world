@@ -192,7 +192,88 @@ pub(crate) unsafe fn enter_read_only_view(view: &WritableView) -> IoResult<()> {
             libc::close(tree);
             result?;
         }
+        private_dev()?;
         check(libc::chdir(view.workdir.as_ptr()))?;
+    }
+    Ok(())
+}
+
+/// pre_exec (inside the private mount namespace): replace /dev with a
+/// minimal tmpfs, as containers do. Only harmless host nodes are bound in;
+/// there is no /dev/tty or /dev/pts, so the workload cannot reach the host
+/// terminal or other device nodes, whose ioctls the read-only view and
+/// Landlock ABI < 5 do not restrict.
+unsafe fn private_dev() -> IoResult<()> {
+    const OPEN_TREE_CLONE: libc::c_uint = 1;
+    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 4;
+    const NODES: [(&CStr, &CStr); 5] = [
+        (c"/dev/null", c"null"),
+        (c"/dev/zero", c"zero"),
+        (c"/dev/full", c"full"),
+        (c"/dev/random", c"random"),
+        (c"/dev/urandom", c"urandom"),
+    ];
+    let syscall = |result: libc::c_long| check(result as libc::c_int);
+    unsafe {
+        // Detach the host nodes before the new /dev hides them.
+        let mut trees = [-1; NODES.len()];
+        for (tree, (host, _)) in trees.iter_mut().zip(NODES) {
+            *tree = syscall(libc::syscall(
+                libc::SYS_open_tree,
+                libc::AT_FDCWD,
+                host.as_ptr(),
+                OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint,
+            ))?;
+        }
+        check(libc::mount(
+            c"tmpfs".as_ptr(),
+            c"/dev".as_ptr(),
+            c"tmpfs".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NOEXEC,
+            c"mode=0755,size=64k".as_ptr().cast(),
+        ))?;
+        let dev = check(libc::open(
+            c"/dev".as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        ))?;
+        for (tree, (_, name)) in trees.into_iter().zip(NODES) {
+            let flags = libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC;
+            let file = check(libc::openat(dev, name.as_ptr(), flags, 0o666))?;
+            libc::close(file);
+            syscall(libc::syscall(
+                libc::SYS_move_mount,
+                tree,
+                c"".as_ptr(),
+                dev,
+                name.as_ptr(),
+                MOVE_MOUNT_F_EMPTY_PATH,
+            ))?;
+            libc::close(tree);
+        }
+        for (target, name) in [
+            (c"/proc/self/fd", c"fd"),
+            (c"/proc/self/fd/0", c"stdin"),
+            (c"/proc/self/fd/1", c"stdout"),
+            (c"/proc/self/fd/2", c"stderr"),
+        ] {
+            check(libc::symlinkat(target.as_ptr(), dev, name.as_ptr()))?;
+        }
+        check(libc::mkdirat(dev, c"shm".as_ptr(), 0o1777))?;
+        libc::close(dev);
+        check(libc::mount(
+            c"tmpfs".as_ptr(),
+            c"/dev/shm".as_ptr(),
+            c"tmpfs".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            c"mode=1777,size=64m".as_ptr().cast(),
+        ))?;
+        check(libc::mount(
+            std::ptr::null(),
+            c"/dev".as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NOEXEC,
+            std::ptr::null(),
+        ))?;
     }
     Ok(())
 }
@@ -473,6 +554,7 @@ mod landlock {
     const MAKE_SYM: u64 = 1 << 12;
     const REFER: u64 = 1 << 13;
     const TRUNCATE: u64 = 1 << 14;
+    const IOCTL_DEV: u64 = 1 << 15;
     const SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
     const SCOPE_SIGNAL: u64 = 1 << 1;
 
@@ -503,7 +585,8 @@ mod landlock {
     /// Build (in the parent) a ruleset that denies writes except beneath
     /// `dirs` and to `files`. Signals leaving the sandbox are scoped when
     /// the kernel supports it (Landlock ABI 6, Linux 6.12).
-    pub fn write_ruleset(dirs: &[&Path], files: &[&Path]) -> Result<OwnedFd> {
+    /// Returns the ruleset and the rights granted beneath writable dirs.
+    pub fn write_ruleset(dirs: &[&Path], files: &[&Path]) -> Result<(OwnedFd, u64)> {
         let abi = abi();
         if abi < 1 {
             bail!(
@@ -515,7 +598,12 @@ mod landlock {
         if abi < 3 {
             bail!("Landlock ABI {abi} cannot restrict truncation; Linux 6.2+ is required");
         }
-        let file_rights = WRITE_FILE | TRUNCATE;
+        let mut file_rights = WRITE_FILE | TRUNCATE;
+        // ABI 5 (Linux 6.10) mediates device ioctls; the private /dev
+        // already keeps other device nodes out of reach on older ABIs.
+        if abi >= 5 {
+            file_rights |= IOCTL_DEV;
+        }
         let dir_rights = file_rights
             | REMOVE_DIR
             | REMOVE_FILE
@@ -579,7 +667,33 @@ mod landlock {
                     .with_context(|| format!("Landlock rule for {}", path.display()));
             }
         }
-        Ok(ruleset)
+        Ok((ruleset, dir_rights))
+    }
+
+    /// pre_exec: grant `rights` beneath a directory that only exists in the
+    /// child's mount namespace, before the ruleset is enforced.
+    pub unsafe fn allow_dir(ruleset: RawFd, path: &CStr, rights: u64) -> IoResult<()> {
+        unsafe {
+            let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+            let dir = check(libc::open(path.as_ptr(), flags))?;
+            let rule = PathBeneath {
+                allowed_access: rights,
+                parent_fd: dir,
+            };
+            let result = libc::syscall(
+                libc::SYS_landlock_add_rule,
+                ruleset,
+                RULE_PATH_BENEATH,
+                &rule as *const PathBeneath,
+                0u32,
+            );
+            let error = Error::last_os_error();
+            libc::close(dir);
+            if result != 0 {
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     /// pre_exec: requires no_new_privs.
@@ -764,7 +878,8 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
         .prefix("world-network-")
         .tempdir()?;
     let temp_path = temp.path().canonicalize()?;
-    let ruleset = landlock::write_ruleset(&[&dir, &temp_path], &[Path::new("/dev/null")])?;
+    let (ruleset, dir_rights) =
+        landlock::write_ruleset(&[&dir, &temp_path], &[Path::new("/dev/null")])?;
     let filter = seccomp::socket_filter()?;
     let prepared = if options.policy.allow.is_empty() {
         None
@@ -828,6 +943,7 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
         cmd.as_std_mut().pre_exec(move || {
             enter_new_namespaces(&maps)?;
             enter_read_only_view(&view)?;
+            landlock::allow_dir(ruleset_fd, c"/dev/shm", dir_rights)?;
             if let Some(channel) = child_channel {
                 send_listeners(channel, port)?;
             }
