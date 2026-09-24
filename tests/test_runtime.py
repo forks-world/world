@@ -228,6 +228,17 @@ print("stolen" if got >= 0 else os.strerror(ctypes.get_errno()))
                 result = self.network("/usr/bin/python3", "-c", script, stdin=stdin)
             self.assertEqual((result.returncode, result.stdout), (0, "True content\n"), result.stderr)
             self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+            fifo = pathlib.Path(outside) / "fifo"
+            os.mkfifo(fifo, 0o644)
+            fd = os.open(fifo, os.O_RDWR)
+            try:
+                os.write(fd, b"fifo")
+                check = "import os, stat\ntry: os.fchmod(0, 0o600)\nexcept OSError: pass\nprint(stat.S_ISFIFO(os.fstat(0).st_mode), os.read(0, 4).decode())"
+                result = self.network("/usr/bin/python3", "-c", check, stdin=fd)
+            finally:
+                os.close(fd)
+            self.assertEqual((result.returncode, result.stdout), (0, "True fifo\n"), result.stderr)
+            self.assertEqual(fifo.stat().st_mode & 0o777, 0o644)
 
     @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_writable_file_stdin_is_refused(self):

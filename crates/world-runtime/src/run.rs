@@ -122,10 +122,12 @@ async fn seatbelt(options: RunOptions, cancel: CancellationToken) -> Result<i32>
     result
 }
 
-/// Whether stdin is backed by a file, directory or block device. Even a
-/// read-only descriptor allows fchmod, futimens and fsetxattr on its inode.
+/// Whether stdin must be relayed: anything but an anonymous pipe (or a
+/// socket, refused elsewhere) is a filesystem or device inode, and even a
+/// read-only descriptor allows fchmod, fchown, futimens and fsetxattr on it.
 #[cfg(target_os = "linux")]
-pub(crate) fn stdin_is_storage() -> Result<bool> {
+pub(crate) fn stdin_needs_relay() -> Result<bool> {
+    const PIPEFS_MAGIC: u32 = 0x5049_5045;
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: fstat initializes the provided stat structure only on success.
     if unsafe { libc::fstat(libc::STDIN_FILENO, stat.as_mut_ptr()) } != 0 {
@@ -135,8 +137,19 @@ pub(crate) fn stdin_is_storage() -> Result<bool> {
         }
         return Err(error.into());
     }
-    let kind = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
-    Ok([libc::S_IFREG, libc::S_IFBLK, libc::S_IFDIR].contains(&kind))
+    match unsafe { stat.assume_init() }.st_mode & libc::S_IFMT {
+        libc::S_IFSOCK => Ok(false),
+        libc::S_IFIFO => {
+            let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            // SAFETY: fstatfs initializes the structure only on success.
+            if unsafe { libc::fstatfs(libc::STDIN_FILENO, fs.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // f_type's integer type differs between C libraries.
+            Ok(unsafe { fs.assume_init() }.f_type as u32 != PIPEFS_MAGIC)
+        }
+        _ => Ok(true),
+    }
 }
 
 /// An inherited descriptor keeps its access mode inside the sandbox, so a
