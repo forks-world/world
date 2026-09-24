@@ -32,6 +32,7 @@ Linux 与 macOS 使用同一个 CLI（`world network exec`、`world silo ...`）
 - **错误码**：连接宿主监听端口时，得到的是 namespace 内的 `ECONNREFUSED`，而不是 `EPERM`；Unix socket 返回 `EACCES`。
 - **进程信息**：所有支持的 Landlock ABI 都会阻止对沙箱外进程的 ptrace 及相关访问（`pidfd_getfd`、`process_vm_readv`、受保护的 `/proc/<pid>` 数据），因此任务无法借用宿主进程的 socket；但任务仍能列出宿主进程和它们的命令行。Linux 6.12 以前，同一 uid 的宿主进程也可能收到任务发出的信号。
 - **路径**：私有 `/dev` 会遮住宿主 `/dev` 下的路径，因此不支持位于 `/dev` 下的工作目录（例如 `/dev/shm/...`）；`TMPDIR` 指向 `/dev` 下时，私有临时目录改建在 `/tmp`。
+- **库调用者与 SIGCHLD**：在库中调用 `network exec` / `silo exec` 的进程不能忽略 `SIGCHLD`（`SIG_IGN` 或 `SA_NOCLDWAIT`，否则会直接报错），也不能在执行期间用 `waitpid(-1)` 回收未知子进程；否则任务的退出状态会丢失，`world` 会明确报错，而不会返回错误的状态。CLI 在启动时会重置 `SIGCHLD` 并解除对它的屏蔽。
 - **进程回收**：Linux 的两种模式都在 PID namespace 中运行任务，脱离进程组的后代也会被回收；任务内看到的 PID 是 namespace 内的编号。
 - **标准输入**：Linux 的 `network exec` 只接受匿名管道的读端、`/dev/null` 或已关闭的标准输入（管道写端会成为通向宿主的通道，也会被拒绝）。其他文件、目录、命名 FIFO、终端和设备都会被拒绝，因为即使是只读描述符，也能对其 inode 执行 `fchmod`、`fchown`、`futimens`、`fsetxattr` 或终端 ioctl。需要输入文件时改用管道，例如 `cat FILE | world network exec ...`。`/dev/null` 会在沙箱内从只读的私有 `/dev` 重新打开，因此任务不持有宿主的设备节点。
 - **硬链接**：与 macOS 一样，写入边界基于路径。调用者事先放进工作目录、指向外部文件的硬链接会共享同一个 inode，任务可以通过它写入。任务自己无法创建这类别名：硬链接跨挂载会返回 `EXDEV`，经符号链接写入会落在只读视图上。forkfs Workspace 用 clonefile/reflink 创建独立 inode，不会产生这种别名；自行指定工作目录时，不要放入指向需保护文件的硬链接。

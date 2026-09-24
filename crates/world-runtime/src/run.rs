@@ -48,10 +48,6 @@ pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<i32> 
     options.policy.validate()?;
     validate_command(&options.command, options.timeout)?;
     check_sigchld()?;
-    #[cfg(unix)]
-    if stdin_writes_storage()? {
-        bail!("writable file stdin is not allowed; open it read-only or use a pipe");
-    }
     #[cfg(target_os = "macos")]
     {
         seatbelt(options, cancel).await
@@ -70,6 +66,11 @@ pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<i32> 
 #[cfg(target_os = "macos")]
 async fn seatbelt(options: RunOptions, cancel: CancellationToken) -> Result<i32> {
     let deadline = Instant::now() + options.timeout;
+    // A closed stdin becomes /dev/null, which Seatbelt keeps read-only.
+    let stdin = match pin_stdin()? {
+        Some(fd) => Stdio::from(fd),
+        None => Stdio::null(),
+    };
     let dir = workdir(&options.workdir)?;
     let temp = tempfile::Builder::new()
         .prefix("world-network-")
@@ -116,7 +117,7 @@ async fn seatbelt(options: RunOptions, cancel: CancellationToken) -> Result<i32>
             cmd.env(key, proxy.url());
         }
     }
-    let result = supervise(cmd, deadline, cancel, &mut proxy, None).await;
+    let result = supervise(cmd, Some(stdin), deadline, cancel, &mut proxy, None).await;
     if let Some(proxy) = &mut proxy {
         proxy.close().await;
     }
@@ -132,19 +133,11 @@ async fn seatbelt(options: RunOptions, cancel: CancellationToken) -> Result<i32>
 /// fd 0 afterwards cannot bypass the check. `None` means stdin is closed.
 #[cfg(target_os = "linux")]
 pub(crate) fn pin_linux_stdin() -> Result<Option<std::os::fd::OwnedFd>> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::AsRawFd;
     const PIPEFS_MAGIC: u32 = 0x5049_5045;
-    // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor we exclusively own.
-    let fd = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EBADF) {
-            return Ok(None);
-        }
-        return Err(error.into());
-    }
-    // SAFETY: as above.
-    let pinned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let Some(pinned) = pin_stdin()? else {
+        return Ok(None);
+    };
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: fstat initializes the provided stat structure only on success.
     if unsafe { libc::fstat(pinned.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
@@ -182,29 +175,45 @@ pub(crate) fn is_null_device(rdev: libc::dev_t) -> bool {
     libc::major(rdev) == 1 && libc::minor(rdev) == 3
 }
 
-/// An inherited descriptor keeps its access mode inside the sandbox, so a
-/// writable file or block device as stdin would bypass the write boundary.
+/// Duplicate stdin once and check the duplicate; the caller installs that
+/// exact descriptor as the child's stdin, so another thread replacing fd 0
+/// afterwards cannot bypass the checks. Sockets are refused, and so is a
+/// writable file or block device: an inherited descriptor keeps its
+/// access mode inside the sandbox. `None` means stdin is closed.
 #[cfg(unix)]
-fn stdin_writes_storage() -> Result<bool> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: fstat initializes the provided stat structure only on success.
-    if unsafe { libc::fstat(libc::STDIN_FILENO, stat.as_mut_ptr()) } != 0 {
+pub(crate) fn pin_stdin() -> Result<Option<std::os::fd::OwnedFd>> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor we exclusively own.
+    let fd = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    if fd < 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::EBADF) {
-            return Ok(false);
+            return Ok(None);
         }
         return Err(error.into());
     }
-    let kind = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
-    if kind != libc::S_IFREG && kind != libc::S_IFBLK {
-        return Ok(false);
-    }
-    // SAFETY: F_GETFL takes no pointer argument.
-    let flags = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL) };
-    if flags < 0 {
+    // SAFETY: as above.
+    let pinned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat initializes the provided stat structure only on success.
+    if unsafe { libc::fstat(pinned.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    Ok(flags & libc::O_ACCMODE != libc::O_RDONLY)
+    let kind = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
+    if kind == libc::S_IFSOCK {
+        bail!("socket stdin is not allowed; use a pipe");
+    }
+    if kind == libc::S_IFREG || kind == libc::S_IFBLK {
+        // SAFETY: F_GETFL takes no pointer argument.
+        let flags = unsafe { libc::fcntl(pinned.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if flags & libc::O_ACCMODE != libc::O_RDONLY {
+            bail!("writable file stdin is not allowed; open it read-only or use a pipe");
+        }
+    }
+    Ok(Some(pinned))
 }
 
 #[cfg(unix)]
@@ -284,18 +293,27 @@ pub(crate) fn spawn(mut cmd: Command) -> Result<Workload> {
     })
 }
 
+/// `stdin`: a descriptor already pinned and checked by the caller, or
+/// `None` to check fd 0 and let the child inherit it.
 pub(crate) async fn supervise(
     mut cmd: Command,
+    stdin: Option<Stdio>,
     deadline: Instant,
     cancel: CancellationToken,
     proxy: &mut Option<Proxy>,
     ack: Option<&Path>,
 ) -> Result<i32> {
-    check_stdin()?;
+    let stdin = match stdin {
+        Some(stdin) => stdin,
+        None => {
+            check_stdin()?;
+            Stdio::inherit()
+        }
+    };
     if cancel.is_cancelled() || Instant::now() >= deadline {
         return Ok(124);
     }
-    cmd.stdin(Stdio::inherit());
+    cmd.stdin(stdin);
     wait(spawn(cmd)?, deadline, cancel, proxy, ack).await
 }
 
@@ -325,7 +343,16 @@ pub(crate) async fn wait(
         _=injection_failure=>None,
         _=cancel.cancelled()=>None,
         _=sleep_until(deadline)=>None,
-        result=child.wait()=>Some(result?),
+        result=child.wait()=>Some(result.map_err(|error| {
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                anyhow::anyhow!(
+                    "the workload was reaped elsewhere in this process \
+                     (a SIGCHLD handler calling waitpid(-1)?); its exit status is unavailable"
+                )
+            } else {
+                error.into()
+            }
+        })?),
     };
     if let Some(proxy) = proxy {
         proxy.close().await;

@@ -78,6 +78,11 @@ fn main() {
     // SAFETY: resets one signal disposition before any thread exists.
     unsafe {
         libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+        // A blocked mask survives exec too; Tokio's worker threads inherit it.
+        let mut set = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGCHLD);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
     }
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,

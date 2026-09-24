@@ -267,7 +267,15 @@ async fn linux_exec(
             crate::linux::enter_pid_namespace()
         });
     }
-    let result = run::supervise(cmd, Instant::now() + duration, cancel, &mut None, None).await;
+    let result = run::supervise(
+        cmd,
+        None,
+        Instant::now() + duration,
+        cancel,
+        &mut None,
+        None,
+    )
+    .await;
     drop((user, net));
     result
 }
@@ -332,6 +340,7 @@ async fn macos_exec(
     }
     run::supervise(
         cmd,
+        None,
         Instant::now() + duration,
         cancel,
         &mut None,
