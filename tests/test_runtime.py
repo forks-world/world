@@ -223,6 +223,17 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         result = self.network("/bin/sh", "-c", script)
         self.assertEqual(result.stdout, "fd full null random shm stderr stdin stdout urandom zero s\nro\n", result.stderr)
 
+    @unittest.skipUnless(LINUX, "IPC namespaces require Linux")
+    def test_host_sysv_ipc_is_unreachable(self):
+        created = run("ipcmk", "-M", "4096")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        shmid = created.stdout.split()[-1]
+        self.addCleanup(run, "ipcrm", "-m", shmid)
+        result = self.network("/bin/sh", "-c", f"ipcs -m | grep -c ' {shmid} '; ipcrm -m {shmid}")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), "0")
+        self.assertIn(f" {shmid} ", run("ipcs", "-m").stdout)
+
     @unittest.skipUnless(LINUX, "PID namespaces require Linux")
     def test_escaped_descendants_are_killed(self):
         self.assertEqual(self.network("/bin/sh", "-c", "kill -9 $$").returncode, 137)

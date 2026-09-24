@@ -942,6 +942,8 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
     unsafe {
         cmd.as_std_mut().pre_exec(move || {
             enter_new_namespaces(&maps)?;
+            // Private System V IPC and POSIX message queues.
+            check(libc::unshare(libc::CLONE_NEWIPC))?;
             enter_read_only_view(&view)?;
             landlock::allow_dir(ruleset_fd, c"/dev/shm", dir_rights)?;
             if let Some(channel) = child_channel {
