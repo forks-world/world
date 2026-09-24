@@ -122,8 +122,8 @@ async fn seatbelt(options: RunOptions, cancel: CancellationToken) -> Result<i32>
     result
 }
 
-/// Linux network exec accepts stdin only as an anonymous pipe, the null
-/// device (replaced inside the sandbox) or closed. Any other file, FIFO,
+/// Linux network exec accepts stdin only as the read end of an anonymous
+/// pipe, the null device (replaced inside the sandbox) or closed. Any other file, FIFO,
 /// terminal or device is an inode the workload could modify through the
 /// inherited descriptor (fchmod, fchown, futimens, fsetxattr, ioctl).
 #[cfg(target_os = "linux")]
@@ -147,7 +147,11 @@ pub(crate) fn check_linux_stdin() -> Result<()> {
                 return Err(std::io::Error::last_os_error().into());
             }
             // f_type's integer type differs between C libraries.
-            unsafe { fs.assume_init() }.f_type as u32 == PIPEFS_MAGIC
+            let pipe = unsafe { fs.assume_init() }.f_type as u32 == PIPEFS_MAGIC;
+            // Only a read end: a write end would be a channel to the host.
+            // SAFETY: F_GETFL takes no pointer argument.
+            let flags = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL) };
+            pipe && flags >= 0 && flags & libc::O_ACCMODE == libc::O_RDONLY
         }
         libc::S_IFCHR => is_null_device(stat.st_rdev),
         _ => false,

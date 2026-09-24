@@ -1213,13 +1213,18 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
                 let size = std::mem::size_of_val(&value);
                 libc::write(0, (&value as *const libc::pid_t).cast(), size) == size as isize
             };
+            // PID first, so the caller can pin (and, if this fails and it
+            // adopted us as a subreaper, reap) the holder; then the result.
+            if !send(libc::getpid()) {
+                libc::_exit(125);
+            }
             let setup = close_from(1).and_then(|()| enter_new_namespaces(&maps));
             if let Err(error) = setup {
                 send(-error.raw_os_error().unwrap_or(libc::EIO));
                 libc::_exit(125);
             }
             libc::prctl(libc::PR_SET_NAME, c"world-holder".as_ptr());
-            if !send(libc::getpid()) {
+            if !send(0) {
                 libc::_exit(125);
             }
             hold()
@@ -1231,20 +1236,28 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
     // means the holder is running either way, so always read its PID.
     let _ = child.wait();
     drop(write);
-    let mut bytes = [0u8; std::mem::size_of::<libc::pid_t>()];
+    let mut report = std::fs::File::from(read);
     // read_exact retries EINTR and short reads.
-    std::io::Read::read_exact(&mut std::fs::File::from(read), &mut bytes)
-        .context("World namespace holder did not start")?;
-    let pid = libc::pid_t::from_ne_bytes(bytes);
-    if pid <= 0 {
-        return Err(Error::from_raw_os_error(-pid)).context("start World namespace holder");
-    }
-    // Pin the holder before inspecting it. The holder only exits when
+    let mut next = || -> Result<libc::pid_t> {
+        let mut bytes = [0u8; std::mem::size_of::<libc::pid_t>()];
+        std::io::Read::read_exact(&mut report, &mut bytes)
+            .context("World namespace holder did not start")?;
+        Ok(libc::pid_t::from_ne_bytes(bytes))
+    };
+    let pid = next()?;
+    // Pin the holder before reading its result. It only exits by itself
+    // when setup fails (then it is a zombie until reaped), otherwise when
     // signalled, so its PID cannot have been reused yet.
     // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
     // SAFETY: a non-negative result is a new descriptor we exclusively own.
     let pidfd = (pidfd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) });
+    let status = next().inspect_err(|_| reap_if_child(pidfd.as_ref()))?;
+    if status != 0 {
+        // A subreaper caller adopted the failed holder: reap it.
+        reap_if_child(pidfd.as_ref());
+        return Err(Error::from_raw_os_error(-status)).context("start World namespace holder");
+    }
     let started = |holder| StartedHolder { holder, pid, pidfd };
     match Holder::observe(pid as u32) {
         Ok(holder) => Ok(started(holder)),

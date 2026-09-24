@@ -301,6 +301,15 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
                         self.assertIn("stdin must be a pipe or /dev/null", result.stderr)
             finally:
                 os.close(fd)
+        # A pipe's write end would be a channel back to the host.
+        r, w = os.pipe()
+        try:
+            result = self.network("/bin/true", stdin=w)
+            self.assertEqual(result.returncode, 125, result.stderr)
+            self.assertIn("stdin must be a pipe or /dev/null", result.stderr)
+        finally:
+            os.close(r)
+            os.close(w)
         result = self.network("/bin/cat", input="piped")
         self.assertEqual((result.returncode, result.stdout), (0, "piped"), result.stderr)
         check = "import os\nst = os.fstat(0)\nprint(os.major(st.st_rdev), os.minor(st.st_rdev), os.read(0, 1) == b'')"
