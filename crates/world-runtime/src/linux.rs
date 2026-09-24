@@ -248,7 +248,11 @@ unsafe fn close_from(first: libc::c_int) {
 unsafe fn close_each_from(first: libc::c_int) {
     unsafe {
         let limit = libc::sysconf(libc::_SC_OPEN_MAX);
-        let limit = if limit < 0 { 65536 } else { limit as libc::c_int };
+        let limit = if limit < 0 {
+            65536
+        } else {
+            limit as libc::c_int
+        };
         for fd in first..limit {
             libc::close(fd);
         }
