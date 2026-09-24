@@ -120,14 +120,13 @@ async fn run(cli: Cli) -> i32 {
         }
         signal.cancel();
     });
-    let code = match execute(cli, cancel).await {
+    match execute(cli, cancel).await {
         Ok(code) => code,
         Err(err) => {
             eprintln!("world: {err:#}");
             125
         }
-    };
-    code
+    }
 }
 
 async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
