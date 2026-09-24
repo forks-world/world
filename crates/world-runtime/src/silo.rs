@@ -29,13 +29,13 @@ pub struct World {
 pub fn default_state_dir() -> Result<PathBuf> {
     Ok(
         PathBuf::from(std::env::var_os("HOME").context("HOME is required")?)
-            .join(".local/share/world/silo"),
+            .join(".local/share/world/workspaces"),
     )
 }
 
 fn supported() -> Result<()> {
     if !cfg!(any(target_os = "macos", target_os = "linux")) {
-        bail!("silo backend requires macOS or Linux");
+        bail!("workspace localhost isolation requires macOS or Linux");
     }
     Ok(())
 }
@@ -65,24 +65,24 @@ fn persist<T: Serialize>(state: &Path, name: &str, value: &T) -> Result<()> {
 pub fn create(state: &Path, id: &str, workdir: &Path) -> Result<World> {
     supported()?;
     if id.is_empty() || id.len() > 128 || id.contains(['\0', '\r', '\n']) {
-        bail!("invalid World ID");
+        bail!("invalid workspace ID");
     }
     let workdir = run::workdir(workdir)?;
     let _lock = lock(state)?;
     let mut worlds = registry(state)?;
     if let Some(world) = worlds.get(id) {
         if world.workdir != workdir {
-            bail!("World already belongs to another workdir");
+            bail!("workspace already belongs to another workdir");
         }
         return Ok(world.clone());
     }
     let used: std::collections::HashSet<_> = worlds.values().map(|w| w.ip).collect();
     let ip = (1..=65534u32)
         .map(|n| Ipv4Addr::new(127, 77, (n >> 8) as u8, n as u8))
-        // On Linux the address only identifies the World; its namespace
+        // On Linux the address only identifies the workspace; its namespace
         // provides localhost, and all of 127/8 is always bindable.
         .find(|ip| !used.contains(ip) && (cfg!(target_os = "linux") || !alias_ready(*ip)))
-        .context("World address pool exhausted")?;
+        .context("workspace address pool exhausted")?;
     let world = World {
         id: id.into(),
         ip,
@@ -108,12 +108,12 @@ fn read_map<T: serde::de::DeserializeOwned>(
     }
 }
 
-pub fn inspect(state: &Path, id: &str) -> Result<World> {
+pub fn get(state: &Path, id: &str) -> Result<World> {
     let world = registry(state)?
         .remove(id)
-        .context("unknown World; create it first")?;
+        .context("unknown workspace; run world workspace create first")?;
     if world.id != id || world.ip.octets()[..2] != [127, 77] {
-        bail!("invalid World registry entry");
+        bail!("invalid workspace registry entry");
     }
     Ok(world)
 }
@@ -127,11 +127,11 @@ pub fn alias_ready(ip: Ipv4Addr) -> bool {
 fn holder(state: &Path, id: &str) -> Result<crate::linux::Holder> {
     read_map(state, "holders.json")?
         .remove(id)
-        .context("World namespace is not running; run world silo setup")
+        .context("workspace namespace is not running; run world workspace setup")
 }
 
-/// macOS: add the World loopback alias (sudo). Linux: start the process
-/// holding the World network namespace; no privilege is required.
+/// macOS: add the workspace loopback alias (sudo). Linux: start the process
+/// holding the workspace network namespace; no privilege is required.
 pub fn setup(state: &Path, world: &World) -> Result<()> {
     supported()?;
     #[cfg(target_os = "linux")]
@@ -157,7 +157,7 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
         }
         started
             .commit()
-            .context("World namespace holder exited before its record was committed")?;
+            .context("workspace namespace holder exited before its record was committed")?;
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]
@@ -177,7 +177,7 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
             ])
             .status()?;
         if !status.success() || !alias_ready(world.ip) {
-            bail!("loopback setup failed; World is not ready");
+            bail!("loopback setup failed; workspace is not ready");
         }
         Ok(())
     }
@@ -233,7 +233,9 @@ pub async fn exec(
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (state, world, cancel);
-        bail!("silo backend requires macOS or Linux; refusing unisolated execution");
+        bail!(
+            "workspace localhost isolation requires macOS or Linux; refusing unisolated execution"
+        );
     }
 }
 
@@ -255,7 +257,7 @@ async fn linux_exec(
     };
     let (user, net) = holder(state, &world.id)?.open().with_context(|| {
         format!(
-            "World namespace is not running; run world silo setup --world {}",
+            "workspace namespace is not running; run world workspace setup {}",
             world.id
         )
     })?;
@@ -299,7 +301,7 @@ async fn macos_exec(
 ) -> Result<i32> {
     if !alias_ready(world.ip) {
         bail!(
-            "World loopback alias is not configured; run world silo setup --world {}",
+            "workspace loopback alias is not configured; run world workspace setup {}",
             world.id
         );
     }
@@ -390,14 +392,14 @@ fn resolve_executable(name: &std::ffi::OsStr, workdir: &Path) -> Result<PathBuf>
     }
     use std::os::unix::fs::PermissionsExt;
     if path.metadata()?.permissions().mode() & 0o6000 != 0 {
-        bail!("privileged executable unsupported: setuid/setgid can suppress silo injection");
+        bail!("privileged executable unsupported: setuid/setgid can suppress localhost isolation");
     }
     let mut file = File::open(&path)?;
     let mut header = [0u8; 32];
     use std::io::Read;
     let n = file.read(&mut header)?;
     // Scripts may hide a SIP-protected interpreter. Require an explicit
-    // non-SIP interpreter, e.g. world silo exec -- python3 script.py.
+    // non-SIP interpreter, e.g. world exec W1 -- python3 script.py.
     if n < 28 || header.starts_with(b"#!") {
         bail!("use an explicit native, non-SIP interpreter for scripts");
     }

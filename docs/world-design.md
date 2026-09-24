@@ -741,9 +741,9 @@ Linux 当前沙箱保留宿主网络，宿主可读文件也不是保密边界�
 
 因此 World 受管执行必须禁止静默降级，并额外部署 Network 流量策略及跨 Network 文件访问限制。只传 `--require-sandbox` 不足以完成这些保证。节点未提供所需隔离能力时拒绝受管执行，Network 不标为可执行状态。授权撤销也需要终止或隔离已有执行进程，不能仅删除控制面授权记录。
 
-macOS 本地出站访问限制已有首版实现与内核集成测试：`world network exec` 使用默认拒绝的 Seatbelt 网络策略、每次执行独立且带凭证的 HTTP/CONNECT 代理、不可变目标白名单和有限执行期限。该出站模式禁止监听。另提供 `world silo exec`，使用固定版本的 silo 动态库透明映射 localhost，支持同端口开发服务；它的注入兼容性有限，不能作为恶意任务的内核隔离边界。此入口尚未接入组织授权、forkfs RPC、远程租约和跨 Network 文件保密边界，不能据此将节点标为完整受管执行就绪。具体能力、限制和验证方法见 [macOS 网络隔离](macos-network-isolation.md)。
+macOS 本地出站访问限制已有首版实现与内核集成测试：`world network exec` 使用默认拒绝的 Seatbelt 网络策略、每次执行独立且带凭证的 HTTP/CONNECT 代理、不可变目标白名单和有限执行期限。该出站模式禁止监听。另提供 `world exec <workspace>`，内部使用固定版本的 silo 动态库透明映射 localhost，支持同端口开发服务；它的注入兼容性有限，不能作为恶意任务的内核隔离边界。此入口尚未接入组织授权、forkfs RPC、远程租约和跨 Network 文件保密边界，不能据此将节点标为完整受管执行就绪。具体能力、限制和验证方法见 [macOS 网络隔离](macos-network-isolation.md)。
 
-Linux 使用同一 CLI，后端是非特权 user namespace 加 network namespace。`network exec` 每次执行使用只有 loopback 的私有 namespace，代理监听从 namespace 内传回宿主，并配合 Landlock 写入限制和 seccomp socket 族过滤。`silo` 为每个 World 保持一个 namespace，同一 World 的多次执行共享它，不同 World 的 localhost 互相独立，不依赖动态库注入。它同样未接入组织授权、forkfs RPC 和文件保密边界。见 [Linux 网络运行时](linux-network-isolation.md)。
+Linux 使用同一 CLI，后端是非特权 user namespace 加 network namespace。`network exec` 每次执行使用只有 loopback 的私有 namespace，代理监听从 namespace 内传回宿主，并配合 Landlock 写入限制和 seccomp socket 族过滤。`world exec` 为每个 Workspace 保持一个 namespace，同一 Workspace 的多次执行共享它，不同 Workspace 的 localhost 互相独立，不依赖动态库注入。它同样未接入组织授权、forkfs RPC 和文件保密边界。见 [Linux 网络运行时](linux-network-isolation.md)。
 
 forkfs 底层状态保留 `CREATING / ACTIVE / TRASHING / TRASHED / DEAD`，World Operation 单独表示任务进度。discard 后仍占空间，restore 可能因 GC 已开始或基线消失而失败。删除 Network 前处理运行中的 Execution、活跃资源、trash 和 pool；不能将 discard 成功解释为清理完成。
 

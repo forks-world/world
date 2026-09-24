@@ -680,7 +680,7 @@ class Silo(unittest.TestCase):
         for name in ["A", "B"]:
             work = cls.root / name
             work.mkdir()
-            result = run(WORLD, "silo", "--state-dir", cls.state, "create", "--world", name, "--workdir", work)
+            result = run(WORLD, "workspace", "--state-dir", cls.state, "create", name, "--workdir", work)
             if result.returncode:
                 raise AssertionError(result.stderr)
             info = json.loads(result.stdout)
@@ -695,7 +695,7 @@ class Silo(unittest.TestCase):
         cls.temp.cleanup()
 
     def command(self, world, *args):
-        return [WORLD, "silo", "--state-dir", self.state, "exec", "--world", world, "--timeout", "30s", "--", PROBE, *args]
+        return [WORLD, "exec", world, "--state-dir", self.state, "--timeout", "30s", "--", PROBE, *args]
 
     def test_same_port_localhost_and_lifecycle(self):
         for host in ["127.0.0.1", "0.0.0.0", "[::1]", "[::]"]:
@@ -803,7 +803,7 @@ class Silo(unittest.TestCase):
 
 
 @unittest.skipUnless(LINUX, "Linux World namespaces")
-class LinuxSilo(unittest.TestCase):
+class LinuxWorkspace(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix="world-silo-test-")
@@ -812,8 +812,8 @@ class LinuxSilo(unittest.TestCase):
         for name in ["A", "B"]:
             work = cls.root / name
             work.mkdir()
-            for action in [["create", "--world", name, "--workdir", work], ["setup", "--world", name]]:
-                result = run(WORLD, "silo", "--state-dir", cls.state, *action)
+            for action in [["create", name, "--workdir", work], ["setup", name]]:
+                result = run(WORLD, "workspace", "--state-dir", cls.state, *action)
                 if result.returncode:
                     cls.tearDownClass()
                     raise AssertionError(result.stderr)
@@ -821,11 +821,11 @@ class LinuxSilo(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         for name in ["A", "B"]:
-            run(WORLD, "silo", "--state-dir", cls.state, "teardown", "--world", name)
+            run(WORLD, "workspace", "--state-dir", cls.state, "teardown", name)
         cls.temp.cleanup()
 
     def command(self, world, *args):
-        return [WORLD, "silo", "--state-dir", self.state, "exec", "--world", world, "--timeout", "30s", "--", PROBE, *args]
+        return [WORLD, "exec", world, "--state-dir", self.state, "--timeout", "30s", "--", PROBE, *args]
 
     def test_same_port_localhost_and_lifecycle(self):
         for host in ["127.0.0.1", "0.0.0.0", "[::1]", "[::]"]:
@@ -888,12 +888,12 @@ class LinuxSilo(unittest.TestCase):
         state = self.root / "readonly-state"
         work = self.root / "D"
         work.mkdir()
-        silo = [WORLD, "silo", "--state-dir", state]
-        self.assertEqual(run(*silo, "create", "--world", "D", "--workdir", work).returncode, 0)
+        workspace = [WORLD, "workspace", "--state-dir", state]
+        self.assertEqual(run(*workspace, "create", "D", "--workdir", work).returncode, 0)
         state.chmod(0o555)
         self.addCleanup(state.chmod, 0o755)
         before = self.holders()
-        result = run(*silo, "setup", "--world", "D")
+        result = run(*workspace, "setup", "D")
         self.assertEqual(result.returncode, 125, result.stderr)
         time.sleep(0.3)
         self.assertEqual(self.holders() - before, set())
@@ -903,11 +903,11 @@ class LinuxSilo(unittest.TestCase):
         # SIGCHLD: the intermediate child is auto-reaped (ECHILD on wait).
         work = self.root / "F"
         work.mkdir()
-        silo = [str(WORLD), "silo", "--state-dir", str(self.state)]
-        self.assertEqual(run(*silo, "create", "--world", "F", "--workdir", work).returncode, 0)
-        self.addCleanup(run, *silo, "teardown", "--world", "F")
+        workspace = [str(WORLD), "workspace", "--state-dir", str(self.state)]
+        self.assertEqual(run(*workspace, "create", "F", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *workspace, "teardown", "F")
         before = self.holders()
-        result = run("/bin/sh", "-c", 'trap "" CHLD; exec "$@"', "sh", *silo, "setup", "--world", "F")
+        result = run("/bin/sh", "-c", 'trap "" CHLD; exec "$@"', "sh", *workspace, "setup", "F")
         self.assertEqual(result.returncode, 0, result.stderr)
         pid = json.loads((self.state / "holders.json").read_text())["F"]["pid"]
         self.assertEqual(self.holders() - before, {pid})
@@ -929,11 +929,11 @@ class LinuxSilo(unittest.TestCase):
     def test_stale_holder_is_replaced_and_forgotten(self):
         work = self.root / "E"
         work.mkdir()
-        silo = [WORLD, "silo", "--state-dir", self.state]
-        self.assertEqual(run(*silo, "create", "--world", "E", "--workdir", work).returncode, 0)
-        self.addCleanup(run, *silo, "teardown", "--world", "E")
+        workspace = [WORLD, "workspace", "--state-dir", self.state]
+        self.assertEqual(run(*workspace, "create", "E", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *workspace, "teardown", "E")
         for _ in range(2):
-            self.assertEqual(run(*silo, "setup", "--world", "E").returncode, 0)
+            self.assertEqual(run(*workspace, "setup", "E").returncode, 0)
             pid = json.loads((self.state / "holders.json").read_text())["E"]["pid"]
             os.kill(pid, 9)
             for _ in range(50):
@@ -941,17 +941,17 @@ class LinuxSilo(unittest.TestCase):
                     break
                 time.sleep(0.1)
         # A dead holder is replaced by setup; teardown forgets a dead one.
-        self.assertEqual(run(*silo, "setup", "--world", "E").returncode, 0)
+        self.assertEqual(run(*workspace, "setup", "E").returncode, 0)
         self.assertEqual(run(*self.command("E", "fd", "999")).returncode, 0)
         pid = json.loads((self.state / "holders.json").read_text())["E"]["pid"]
         os.kill(pid, 9)
         time.sleep(0.3)
-        self.assertEqual(run(*silo, "teardown", "--world", "E").returncode, 0)
+        self.assertEqual(run(*workspace, "teardown", "E").returncode, 0)
         self.assertNotIn("E", json.loads((self.state / "holders.json").read_text()))
 
     def test_escaped_descendants_are_killed(self):
         work = self.root / "A"
-        command = [WORLD, "silo", "--state-dir", self.state, "exec", "--world", "A", "--", "/bin/sh", "-c",
+        command = [WORLD, "exec", "A", "--state-dir", self.state, "--", "/bin/sh", "-c",
                    'setsid /bin/sh -c "sleep 2; echo escaped > marker" </dev/null >/dev/null 2>&1 &']
         self.assertEqual(run(*command).returncode, 0)
         time.sleep(3)
@@ -960,20 +960,20 @@ class LinuxSilo(unittest.TestCase):
     def test_setup_idempotent_and_teardown(self):
         work = self.root / "C"
         work.mkdir()
-        silo = [WORLD, "silo", "--state-dir", self.state]
-        self.assertEqual(run(*silo, "create", "--world", "C", "--workdir", work).returncode, 0)
-        self.addCleanup(run, *silo, "teardown", "--world", "C")
+        workspace = [WORLD, "workspace", "--state-dir", self.state]
+        self.assertEqual(run(*workspace, "create", "C", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *workspace, "teardown", "C")
         result = run(*self.command("C", "fd", "999"))
         self.assertEqual(result.returncode, 125)
-        self.assertIn("silo setup", result.stderr)
+        self.assertIn("workspace setup", result.stderr)
         for _ in range(2):
-            self.assertEqual(run(*silo, "setup", "--world", "C").returncode, 0)
+            self.assertEqual(run(*workspace, "setup", "C").returncode, 0)
         holders = json.loads((self.state / "holders.json").read_text())
         with serving(self.command("C", "serve", "127.0.0.1:0", "C")) as (_, port):
             result = run(*self.command("C", "get", f"127.0.0.1:{port}"))
             self.assertEqual((result.returncode, result.stdout), (0, "C"), result.stderr)
             self.assertEqual(json.loads((self.state / "holders.json").read_text()), holders)
-        self.assertEqual(run(*silo, "teardown", "--world", "C").returncode, 0)
+        self.assertEqual(run(*workspace, "teardown", "C").returncode, 0)
         with self.assertRaises(ProcessLookupError):
             for _ in range(50):
                 os.kill(holders["C"]["pid"], 0)
