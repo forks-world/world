@@ -192,11 +192,7 @@ unsafe fn send_listeners(channel: RawFd, port: u16) -> IoResult<()> {
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
         (*cmsg).cmsg_len = libc::CMSG_LEN((count * std::mem::size_of::<RawFd>()) as u32) as _;
-        std::ptr::copy_nonoverlapping(
-            fds.as_ptr(),
-            libc::CMSG_DATA(cmsg).cast::<RawFd>(),
-            count,
-        );
+        std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(cmsg).cast::<RawFd>(), count);
         let sent = libc::sendmsg(channel, &msg, libc::MSG_NOSIGNAL);
         let error = Error::last_os_error();
         for fd in &fds[..count] {
@@ -632,9 +628,29 @@ pub(crate) fn start_holder() -> Result<Holder> {
 }
 
 pub(crate) fn stop_holder(holder: &Holder) -> Result<()> {
+    // Pin the process first, then verify it: the signal cannot reach a
+    // process that reused the PID after verification.
+    // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, holder.pid as libc::pid_t, 0u32) };
+    if pidfd < 0 {
+        return Err(Error::last_os_error()).context("open holder pidfd");
+    }
+    // SAFETY: the kernel returned a new descriptor we exclusively own.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
     let _namespaces = holder.open()?;
-    // SAFETY: kill takes plain integers; identity was verified just above.
-    check(unsafe { libc::kill(holder.pid as libc::pid_t, libc::SIGKILL) })?;
+    // SAFETY: pidfd is open; no siginfo is passed.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0u32,
+        )
+    };
+    if result != 0 {
+        return Err(Error::last_os_error()).context("stop holder");
+    }
     Ok(())
 }
 
