@@ -194,14 +194,45 @@ print("stolen" if got >= 0 else os.strerror(ctypes.get_errno()))
 
     @unittest.skipUnless(LINUX, "user namespaces require Linux")
     def test_workload_has_no_capabilities_even_for_root(self):
-        script = "grep -E '^Cap(Prm|Eff|Bnd|Amb)' /proc/self/status | cut -f2 | sort -u; mount -o remount,rw / 2>/dev/null"
-        # `unshare -r` makes the caller UID 0, as when root runs world.
-        for prefix in [[], ["unshare", "-r"]]:
-            with self.subTest(prefix=prefix):
+        script = "grep -E '^Cap(Inh|Prm|Eff|Bnd|Amb)' /proc/self/status | cut -f2 | sort -u; mount -o remount,rw / 2>/dev/null"
+        # `unshare -r` makes the caller UID 0, as when root runs world; the
+        # caller also raises its inheritable set, which exec must not keep.
+        raise_inheritable = """
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+header = (ctypes.c_uint32 * 2)(0x20080522, 0)
+data = (ctypes.c_uint32 * 6)()
+assert libc.syscall(125, header, data) == 0
+data[2] = data[1]  # inheritable = permitted (low word)
+assert libc.syscall(126, header, data) == 0, ctypes.get_errno()
+os.execv(sys.argv[1], sys.argv[1:])
+"""
+        for prefix in [[], ["unshare", "-r", sys.executable, "-c", raise_inheritable]]:
+            with self.subTest(prefix=prefix[:2]):
                 result = run(*prefix, WORLD, "network", "exec", "--policy", self.policy,
                              "--workdir", self.dir, "--", "/bin/sh", "-c", script)
                 self.assertNotEqual(result.returncode, 0, "remount must fail")
                 self.assertEqual(result.stdout, "0000000000000000\n", result.stderr)
+
+    @unittest.skipUnless(LINUX, "Linux-specific isolation")
+    def test_keyrings_devices_and_dev_paths(self):
+        # KEYCTL_JOIN_SESSION_KEYRING: works on the host, refused by seccomp.
+        keyring = "import ctypes, os\nlibc = ctypes.CDLL(None, use_errno=True)\nr = libc.syscall(250, 1, None)\nprint('id' if r >= 0 else os.strerror(ctypes.get_errno()))"
+        self.assertIn("id", run(sys.executable, "-c", keyring).stdout)
+        result = self.network("/usr/bin/python3", "-c", keyring)
+        self.assertIn(os.strerror(1), result.stdout, result.stderr)
+        # Device nodes anywhere in the view, the workdir included, are inert.
+        options = "import os\nfor line in open('/proc/self/mountinfo'):\n    f = line.split()\n    if f[4] == os.getcwd(): print(f[5])"
+        result = self.network("/usr/bin/python3", "-c", options)
+        self.assertIn("nodev", result.stdout.strip().split(","), result.stderr)
+        # The private /dev would hide paths beneath the host /dev.
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as shm:
+            result = run(WORLD, "network", "exec", "--policy", self.policy, "--workdir", shm, "--", "/bin/true")
+            self.assertEqual(result.returncode, 125)
+            self.assertIn("workdir under /dev", result.stderr)
+            result = self.network("/bin/sh", "-c", 'case "$TMPDIR" in /dev/*) exit 1;; esac; test -d "$TMPDIR"',
+                                  env=dict(os.environ, TMPDIR=shm))
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(LINUX, "private /dev requires Linux")
     def test_host_terminal_and_devices_are_unreachable(self):

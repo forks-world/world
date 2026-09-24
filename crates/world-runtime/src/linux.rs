@@ -134,6 +134,7 @@ struct MountAttr {
 /// that Landlock does not mediate.
 pub(crate) unsafe fn enter_read_only_view(view: &WritableView) -> IoResult<()> {
     const MOUNT_ATTR_RDONLY: u64 = 1;
+    const MOUNT_ATTR_NODEV: u64 = 4;
     const AT_RECURSIVE: libc::c_uint = 0x8000;
     const OPEN_TREE_CLONE: libc::c_uint = 1;
     const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 4;
@@ -154,7 +155,10 @@ pub(crate) unsafe fn enter_read_only_view(view: &WritableView) -> IoResult<()> {
             libc::MS_REC | libc::MS_PRIVATE,
             std::ptr::null(),
         ))?;
-        let read_only = set(MOUNT_ATTR_RDONLY, 0);
+        // Read-only and nodev everywhere: device nodes on any filesystem,
+        // including the workdir, stay unusable. The private /dev re-enables
+        // only its own harmless nodes.
+        let read_only = set(MOUNT_ATTR_RDONLY | MOUNT_ATTR_NODEV, 0);
         syscall(libc::syscall(
             libc::SYS_mount_setattr,
             libc::AT_FDCWD,
@@ -206,6 +210,7 @@ pub(crate) unsafe fn enter_read_only_view(view: &WritableView) -> IoResult<()> {
 unsafe fn private_dev() -> IoResult<()> {
     const OPEN_TREE_CLONE: libc::c_uint = 1;
     const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 4;
+    const MOUNT_ATTR_NODEV: u64 = 4;
     const NODES: [(&CStr, &CStr); 5] = [
         (c"/dev/null", c"null"),
         (c"/dev/zero", c"zero"),
@@ -236,7 +241,21 @@ unsafe fn private_dev() -> IoResult<()> {
             c"/dev".as_ptr(),
             libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
         ))?;
+        let usable = MountAttr {
+            attr_set: 0,
+            attr_clr: MOUNT_ATTR_NODEV,
+            propagation: 0,
+            userns_fd: 0,
+        };
         for (tree, (_, name)) in trees.into_iter().zip(NODES) {
+            syscall(libc::syscall(
+                libc::SYS_mount_setattr,
+                tree,
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH as libc::c_uint,
+                &usable as *const MountAttr,
+                std::mem::size_of::<MountAttr>(),
+            ))?;
             let flags = libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC;
             let file = check(libc::openat(dev, name.as_ptr(), flags, 0o666))?;
             libc::close(file);
@@ -292,6 +311,7 @@ pub(crate) unsafe fn join_namespaces(user: RawFd, net: RawFd) -> IoResult<()> {
 /// root and therefore maps to UID 0 inside the user namespace. Root's
 /// automatic capabilities are disabled and locked, ambient capabilities
 /// cleared and the bounding set emptied, so exec yields an empty set.
+/// (Creating the user namespace already emptied the inheritable set.)
 pub(crate) unsafe fn drop_capabilities() -> IoResult<()> {
     const SECBIT_NOROOT: libc::c_ulong = 1 << 0;
     const SECBIT_NOROOT_LOCKED: libc::c_ulong = 1 << 1;
@@ -598,13 +618,15 @@ mod landlock {
         if abi < 3 {
             bail!("Landlock ABI {abi} cannot restrict truncation; Linux 6.2+ is required");
         }
-        let mut file_rights = WRITE_FILE | TRUNCATE;
-        // ABI 5 (Linux 6.10) mediates device ioctls; the private /dev
-        // already keeps other device nodes out of reach on older ABIs.
-        if abi >= 5 {
-            file_rights |= IOCTL_DEV;
-        }
-        let dir_rights = file_rights
+        let write = WRITE_FILE | TRUNCATE;
+        // ABI 5 (Linux 6.10) mediates device ioctls, granted only on the
+        // listed files. Older ABIs rely on the nodev view and private /dev.
+        let (file_rights, ioctl) = if abi >= 5 {
+            (write | IOCTL_DEV, IOCTL_DEV)
+        } else {
+            (write, 0)
+        };
+        let dir_rights = write
             | REMOVE_DIR
             | REMOVE_FILE
             | MAKE_CHAR
@@ -616,7 +638,7 @@ mod landlock {
             | MAKE_SYM
             | REFER;
         let attr = RulesetAttr {
-            handled_access_fs: dir_rights,
+            handled_access_fs: dir_rights | ioctl,
             handled_access_net: 0,
             scoped: if abi >= 6 {
                 SCOPE_SIGNAL | SCOPE_ABSTRACT_UNIX_SOCKET
@@ -729,7 +751,8 @@ mod seccomp {
 
     /// Refuse socket families that are not confined by the network
     /// namespace (filesystem Unix sockets, vsock, ...), datagram socket
-    /// pairs, and io_uring, which can create sockets without these calls.
+    /// pairs, io_uring, which can create sockets without these calls, and
+    /// key management, since the caller's session keyring is inherited.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub fn socket_filter() -> Result<Vec<libc::sock_filter>> {
         // x32 system calls share the x86_64 audit architecture.
@@ -746,13 +769,17 @@ mod seccomp {
             op(LD_W_ABS, 0, 0, 0),
         ];
         if x32_guard {
-            filter.push(op(JGE_K, 0x4000_0000, 15, 0));
+            filter.push(op(JGE_K, 0x4000_0000, 18, 0));
         }
         let flags = (libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) as u32;
         filter.extend([
-            op(JEQ_K, libc::SYS_socket as u32, 3, 0),
-            op(JEQ_K, libc::SYS_socketpair as u32, 7, 0),
-            op(JEQ_K, libc::SYS_io_uring_setup as u32, 12, 0),
+            op(JEQ_K, libc::SYS_socket as u32, 6, 0),
+            op(JEQ_K, libc::SYS_socketpair as u32, 10, 0),
+            op(JEQ_K, libc::SYS_io_uring_setup as u32, 15, 0),
+            // The caller's session keyring survives namespace creation.
+            op(JEQ_K, libc::SYS_keyctl as u32, 14, 0),
+            op(JEQ_K, libc::SYS_add_key as u32, 13, 0),
+            op(JEQ_K, libc::SYS_request_key as u32, 12, 0),
             op(RET_K, RET_ALLOW, 0, 0),
             // socket: seccomp_data.args[0] (domain), low word.
             op(LD_W_ABS, 16, 0, 0),
@@ -858,8 +885,14 @@ mod seccomp {
                 for kind in [libc::SOCK_DGRAM, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC] {
                     assert_eq!(pair(kind), RET_ERRNO | libc::EACCES as u32);
                 }
-                let io_uring = libc::SYS_io_uring_setup as u32;
-                assert_eq!(eval(ARCH, io_uring, 0), RET_ERRNO | libc::EPERM as u32);
+                for nr in [
+                    libc::SYS_io_uring_setup,
+                    libc::SYS_keyctl,
+                    libc::SYS_add_key,
+                    libc::SYS_request_key,
+                ] {
+                    assert_eq!(eval(ARCH, nr as u32, 0), RET_ERRNO | libc::EPERM as u32);
+                }
                 assert_eq!(eval(ARCH, libc::SYS_getpid as u32, 0), RET_ALLOW);
                 let x32 = eval(ARCH, 0x4000_0000 | socket, libc::AF_UNIX as u32);
                 if x32_guard {
@@ -874,9 +907,17 @@ mod seccomp {
 pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Result<i32> {
     let deadline = Instant::now() + options.timeout;
     let dir = run::workdir(&options.workdir)?;
+    // The private /dev hides anything beneath the host /dev.
+    if dir.starts_with("/dev") {
+        bail!("workdir under /dev is not supported; use a regular filesystem");
+    }
+    let mut parent = std::env::temp_dir().canonicalize()?;
+    if parent.starts_with("/dev") {
+        parent = "/tmp".into();
+    }
     let temp = tempfile::Builder::new()
         .prefix("world-network-")
-        .tempdir()?;
+        .tempdir_in(parent)?;
     let temp_path = temp.path().canonicalize()?;
     let (ruleset, dir_rights) =
         landlock::write_ruleset(&[&dir, &temp_path], &[Path::new("/dev/null")])?;
