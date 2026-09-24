@@ -394,7 +394,9 @@ unsafe fn for_each_open_descriptor(
                 let mut fd: libc::c_int = 0;
                 let mut digits = 0;
                 while (*name).is_ascii_digit() {
-                    fd = fd.saturating_mul(10).saturating_add((*name - b'0') as libc::c_int);
+                    fd = fd
+                        .saturating_mul(10)
+                        .saturating_add((*name - b'0') as libc::c_int);
                     name = name.add(1);
                     digits += 1;
                 }
@@ -1155,7 +1157,13 @@ pub(crate) fn start_holder() -> Result<Holder> {
     let mut pid: libc::pid_t = 0;
     let size = std::mem::size_of_val(&pid);
     // SAFETY: pid is a live, writable buffer of the given size.
-    let n = unsafe { libc::read(read.as_raw_fd(), (&mut pid as *mut libc::pid_t).cast(), size) };
+    let n = unsafe {
+        libc::read(
+            read.as_raw_fd(),
+            (&mut pid as *mut libc::pid_t).cast(),
+            size,
+        )
+    };
     if n != size as isize {
         bail!("World namespace holder did not start");
     }
@@ -1224,7 +1232,11 @@ mod tests {
                 };
                 libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
                 super::close_each_from(3);
-                libc::_exit(if libc::fcntl(high, libc::F_GETFD) < 0 { 0 } else { 1 });
+                libc::_exit(if libc::fcntl(high, libc::F_GETFD) < 0 {
+                    0
+                } else {
+                    1
+                });
             }
             let mut status = 0;
             assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
