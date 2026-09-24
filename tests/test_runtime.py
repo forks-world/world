@@ -269,6 +269,14 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         self.assertEqual(result.stdout.strip(), "0")
         self.assertIn(f" {shmid} ", run("ipcs", "-m").stdout)
 
+    @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
+    def test_exit_status_with_ignored_sigchld(self):
+        # SIG_IGN survives exec; world must still collect the exit status.
+        command = [str(WORLD), "network", "exec", "--policy", str(self.policy), "--workdir", str(self.dir),
+                   "--", "/bin/sh", "-c", "exit 3"]
+        result = run("/bin/sh", "-c", 'trap "" CHLD; exec "$@"', "sh", *command)
+        self.assertEqual(result.returncode, 3, result.stderr)
+
     @unittest.skipUnless(LINUX, "PID namespaces require Linux")
     def test_escaped_descendants_are_killed(self):
         self.assertEqual(self.network("/bin/sh", "-c", "kill -9 $$").returncode, 137)
@@ -904,6 +912,12 @@ class LinuxSilo(unittest.TestCase):
         pid = json.loads((self.state / "holders.json").read_text())["F"]["pid"]
         self.assertEqual(self.holders() - before, {pid})
         self.assertEqual(run(*self.command("F", "fd", "999")).returncode, 0)
+
+    def test_exit_status_with_ignored_sigchld(self):
+        command = [str(x) for x in self.command("A", "fd", "999")]
+        command[-3:] = ["/bin/sh", "-c", "exit 3"]
+        result = run("/bin/sh", "-c", 'trap "" CHLD; exec "$@"', "sh", *command)
+        self.assertEqual(result.returncode, 3, result.stderr)
 
     def test_stale_holder_is_replaced_and_forgotten(self):
         work = self.root / "E"

@@ -494,6 +494,9 @@ unsafe fn wait_for(child: libc::pid_t) -> ! {
 /// unchanged. The forked-off ancestors only relay the exit status.
 pub(crate) unsafe fn enter_pid_namespace() -> IoResult<()> {
     unsafe {
+        // The wrappers wait for their children: a caller's ignored SIGCHLD
+        // or reaping handler must not take the workload's status first.
+        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
         check(libc::unshare(libc::CLONE_NEWPID))?;
         let init = check(libc::fork())?;
         if init != 0 {

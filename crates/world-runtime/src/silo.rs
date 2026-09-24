@@ -217,6 +217,7 @@ pub async fn exec(
     cancel: CancellationToken,
 ) -> Result<i32> {
     run::validate_command(&command, duration)?;
+    run::check_sigchld()?;
     #[cfg(target_os = "linux")]
     {
         linux_exec(state, world, command, duration, cancel).await

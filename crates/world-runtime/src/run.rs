@@ -47,6 +47,7 @@ pub fn workdir(path: &Path) -> Result<PathBuf> {
 pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<i32> {
     options.policy.validate()?;
     validate_command(&options.command, options.timeout)?;
+    check_sigchld()?;
     #[cfg(unix)]
     if stdin_writes_storage()? {
         bail!("writable file stdin is not allowed; open it read-only or use a pipe");
@@ -218,6 +219,25 @@ fn stdin_is_socket() -> Result<bool> {
         return Err(error.into());
     }
     Ok(unsafe { stat.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFSOCK)
+}
+
+/// A process that ignores SIGCHLD (SIG_IGN or SA_NOCLDWAIT) has its
+/// children reaped automatically, so the workload's exit status could not
+/// be collected. The CLI resets it; library callers must not ignore it.
+pub(crate) fn check_sigchld() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+        // SAFETY: reads the current disposition into a live struct.
+        if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), action.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let action = unsafe { action.assume_init() };
+        if action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+            bail!("SIGCHLD is ignored in this process; the workload's exit status would be lost");
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn check_stdin() -> Result<()> {

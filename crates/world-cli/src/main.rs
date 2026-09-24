@@ -72,6 +72,13 @@ enum Silo {
 }
 
 fn main() {
+    // World must collect workload exit statuses; an ignored SIGCHLD
+    // inherited from the launcher (e.g. `trap '' CHLD`) would discard them.
+    #[cfg(unix)]
+    // SAFETY: resets one signal disposition before any thread exists.
+    unsafe {
+        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+    }
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
