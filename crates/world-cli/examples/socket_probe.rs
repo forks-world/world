@@ -1,0 +1,363 @@
+//! An ordinary application fixture: no World/silo dependencies or rewriting.
+use std::{
+    io::{Read, Write},
+    net::{TcpListener, TcpStream, UdpSocket},
+    time::Duration,
+};
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("{e}");
+        std::process::exit(if e.kind() == std::io::ErrorKind::PermissionDenied {
+            77
+        } else {
+            78
+        });
+    }
+}
+fn run() -> std::io::Result<()> {
+    let args: Vec<_> = std::env::args().collect();
+    if ["bash", "zsh", "sh", "python3"]
+        .iter()
+        .any(|name| std::path::Path::new(&args[0]).file_name().unwrap() == *name)
+    {
+        print!("{}", serde_json::to_string(&args).unwrap());
+        return Ok(());
+    }
+    match args[1].as_str() {
+        "burst" => {
+            let bytes = vec![b'x'; 16384];
+            if args[2] == "stderr" {
+                std::io::stderr().write_all(&bytes)?;
+            } else {
+                std::io::stdout().write_all(&bytes)?;
+            }
+        }
+        "serve" => {
+            let listener = TcpListener::bind(&args[2])?;
+            println!("READY {}", listener.local_addr()?.port());
+            for stream in listener.incoming() {
+                stream?.write_all(args[3].as_bytes())?;
+            }
+        }
+        "udp-serve" => {
+            let socket = UdpSocket::bind(&args[2])?;
+            println!("READY {}", socket.local_addr()?.port());
+            loop {
+                let mut buf = [0; 100];
+                let (_, peer) = socket.recv_from(&mut buf)?;
+                socket.send_to(args[3].as_bytes(), peer)?;
+            }
+        }
+        "get" => {
+            let mut stream =
+                TcpStream::connect_timeout(&args[2].parse().unwrap(), Duration::from_secs(1))?;
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            let mut value = String::new();
+            stream.read_to_string(&mut value)?;
+            print!("{value}");
+        }
+        "udp-get" => {
+            let socket = UdpSocket::bind("127.0.0.1:0")?;
+            socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+            socket.send_to(b"ping", &args[2])?;
+            let mut buf = [0; 100];
+            let (n, _) = socket.recv_from(&mut buf)?;
+            print!("{}", String::from_utf8_lossy(&buf[..n]));
+        }
+        "dial" => {
+            TcpStream::connect_timeout(&args[2].parse().unwrap(), Duration::from_secs(1))?;
+        }
+        "udp-dial" => {
+            let socket = UdpSocket::bind("127.0.0.1:0")?;
+            socket.connect(&args[2])?;
+        }
+        "unix" => {
+            #[cfg(unix)]
+            {
+                std::os::unix::net::UnixStream::connect(&args[2])?;
+            }
+        }
+        "write" => {
+            std::fs::write(&args[2], "escape")?;
+        }
+        "child" => {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(&args[2..])
+                .status()?;
+            std::process::exit(status.code().unwrap_or(99));
+        }
+        "raw-spawn"
+        | "raw-exec"
+        | "raw-spawn-chdir"
+        | "raw-spawn-fchdir"
+        | "raw-spawn-chdir-posix"
+        | "raw-spawn-fchdir-posix" => {
+            use std::{ffi::CString, os::unix::ffi::OsStrExt};
+            let argv: Vec<_> = std::iter::once(&args[2])
+                .chain(
+                    args[if args[1].starts_with("raw-spawn-") {
+                        4
+                    } else {
+                        3
+                    }..]
+                        .iter(),
+                )
+                .map(|s| CString::new(s.as_bytes()).unwrap())
+                .collect();
+            let env: Vec<_> = std::env::vars_os()
+                .map(|(k, v)| {
+                    let mut entry = k.as_bytes().to_vec();
+                    entry.push(b'=');
+                    entry.extend_from_slice(v.as_bytes());
+                    CString::new(entry).unwrap()
+                })
+                .collect();
+            let mut argp: Vec<_> = argv.iter().map(|s| s.as_ptr()).collect();
+            let mut envp: Vec<_> = env.iter().map(|s| s.as_ptr()).collect();
+            argp.push(std::ptr::null());
+            envp.push(std::ptr::null());
+            unsafe {
+                if args[1] == "raw-exec" {
+                    libc::execve(argv[0].as_ptr(), argp.as_ptr(), envp.as_ptr());
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut actions =
+                    std::mem::MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
+                let has_actions = args[1].starts_with("raw-spawn-");
+                let directory_file = if has_actions {
+                    Some(std::fs::File::open(&args[3])?)
+                } else {
+                    None
+                };
+                #[cfg(target_os = "macos")]
+                let fileport = if has_actions {
+                    Some(SpawnFileport::new()?)
+                } else {
+                    None
+                };
+                if has_actions {
+                    let result = libc::posix_spawn_file_actions_init(actions.as_mut_ptr());
+                    if result != 0 {
+                        return Err(std::io::Error::from_raw_os_error(result));
+                    }
+                    let directory = CString::new(args[3].as_bytes()).unwrap();
+                    use std::os::fd::AsRawFd;
+                    let result = add_directory_action(
+                        actions.as_mut_ptr(),
+                        directory.as_ptr(),
+                        directory_file.as_ref().unwrap().as_raw_fd(),
+                        &args[1],
+                    );
+                    if result != 0 {
+                        libc::posix_spawn_file_actions_destroy(actions.as_mut_ptr());
+                        return Err(std::io::Error::from_raw_os_error(result));
+                    }
+                }
+                // Force handle growth, then move the opaque object to another
+                // stack location before spawning, as native callers can do.
+                if has_actions {
+                    #[cfg(target_os = "macos")]
+                    for _ in 0..128 {
+                        let result = posix_spawn_file_actions_add_fileportdup2_np(
+                            actions.as_mut_ptr(),
+                            fileport.as_ref().unwrap().0,
+                            100,
+                        );
+                        if result != 0 {
+                            return Err(std::io::Error::from_raw_os_error(result));
+                        }
+                    }
+                    for _ in 0..64 {
+                        let result =
+                            libc::posix_spawn_file_actions_adddup2(actions.as_mut_ptr(), 2, 2);
+                        if result != 0 {
+                            return Err(std::io::Error::from_raw_os_error(result));
+                        }
+                    }
+                }
+                let mut moved = if has_actions {
+                    Some(actions.assume_init())
+                } else {
+                    None
+                };
+                let mut pid = 0;
+                let result = libc::posix_spawn(
+                    &mut pid,
+                    argv[0].as_ptr(),
+                    moved.as_ref().map_or(std::ptr::null(), |actions| actions),
+                    std::ptr::null(),
+                    argp.as_ptr().cast(),
+                    envp.as_ptr().cast(),
+                );
+                if let Some(actions) = moved.as_mut() {
+                    libc::posix_spawn_file_actions_destroy(actions);
+                }
+                #[cfg(target_os = "macos")]
+                drop(fileport);
+                if result != 0 {
+                    return Err(std::io::Error::from_raw_os_error(result));
+                }
+                let mut status = 0;
+                if libc::waitpid(pid, &mut status, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                std::process::exit(if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    99
+                });
+            }
+        }
+        "udp-disconnect" => {
+            use std::os::fd::AsRawFd;
+            let socket = UdpSocket::bind("127.0.0.1:0")?;
+            socket.connect(&args[2])?;
+            let mut addr: libc::sockaddr = unsafe { std::mem::zeroed() };
+            addr.sa_family = libc::AF_UNSPEC as _;
+            let result = unsafe {
+                libc::connect(socket.as_raw_fd(), &addr, std::mem::size_of_val(&addr) as _)
+            };
+            print!(
+                "{}",
+                if result == 0 {
+                    0
+                } else {
+                    std::io::Error::last_os_error().raw_os_error().unwrap()
+                }
+            );
+        }
+        "tamper-child" => {
+            // This single-threaded fixture deliberately changes its inherited
+            // injection environment before trying intercepted child launches.
+            unsafe {
+                std::env::set_var(&args[3], &args[4]);
+            }
+            let mut cmd = std::process::Command::new(std::env::current_exe()?);
+            cmd.args(["fd", "999"]);
+            if args[2] == "exec" {
+                use std::os::unix::process::CommandExt;
+                return Err(cmd.exec());
+            }
+            std::process::exit(cmd.status()?.code().unwrap_or(99));
+        }
+        "launch-envpath" | "exec-envpath" => {
+            let mut cmd = std::process::Command::new(&args[3]);
+            cmd.env("PATH", &args[2]).args(&args[4..]);
+            if args[1] == "exec-envpath" {
+                use std::os::unix::process::CommandExt;
+                return Err(cmd.exec());
+            }
+            std::process::exit(cmd.status()?.code().unwrap_or(99));
+        }
+        "launch" => {
+            let status = std::process::Command::new(&args[2])
+                .args(&args[3..])
+                .status()?;
+            std::process::exit(status.code().unwrap_or(99));
+        }
+        "exec" => {
+            use std::os::unix::process::CommandExt;
+            return Err(std::process::Command::new(&args[2]).args(&args[3..]).exec());
+        }
+        "fd" => {
+            let fd: i32 = args[2].parse().unwrap();
+            #[cfg(unix)]
+            unsafe {
+                let mut addr: libc::sockaddr_storage = std::mem::zeroed();
+                let mut size = std::mem::size_of_val(&addr) as libc::socklen_t;
+                if libc::getpeername(
+                    fd,
+                    (&mut addr as *mut libc::sockaddr_storage).cast(),
+                    &mut size,
+                ) == 0
+                {
+                    std::process::exit(99);
+                }
+            }
+            print!("descriptor-closed");
+        }
+        _ => panic!("unknown probe"),
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn fileport_makeport(fd: libc::c_int, port: *mut libc::mach_port_t) -> libc::c_int;
+    fn mach_port_deallocate(task: libc::mach_port_t, port: libc::mach_port_t) -> libc::c_int;
+    static mach_task_self_: libc::mach_port_t;
+    fn posix_spawn_file_actions_add_fileportdup2_np(
+        actions: *mut libc::posix_spawn_file_actions_t,
+        port: libc::mach_port_t,
+        newfd: libc::c_int,
+    ) -> libc::c_int;
+}
+#[cfg(target_os = "macos")]
+struct SpawnFileport(libc::mach_port_t);
+#[cfg(target_os = "macos")]
+impl SpawnFileport {
+    fn new() -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open("/dev/null")?;
+        let mut port = 0;
+        if unsafe { fileport_makeport(file.as_raw_fd(), &mut port) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(port))
+    }
+}
+#[cfg(target_os = "macos")]
+impl Drop for SpawnFileport {
+    fn drop(&mut self) {
+        unsafe { mach_port_deallocate(mach_task_self_, self.0) };
+    }
+}
+
+#[cfg(target_os = "macos")]
+core::arch::global_asm!(
+    ".weak_reference _posix_spawn_file_actions_addchdir",
+    ".weak_reference _posix_spawn_file_actions_addfchdir",
+);
+unsafe fn add_directory_action(
+    actions: *mut libc::posix_spawn_file_actions_t,
+    path: *const libc::c_char,
+    fd: libc::c_int,
+    mode: &str,
+) -> libc::c_int {
+    unsafe extern "C" {
+        fn posix_spawn_file_actions_addchdir_np(
+            actions: *mut libc::posix_spawn_file_actions_t,
+            path: *const libc::c_char,
+        ) -> libc::c_int;
+        fn posix_spawn_file_actions_addfchdir_np(
+            actions: *mut libc::posix_spawn_file_actions_t,
+            fd: libc::c_int,
+        ) -> libc::c_int;
+        #[cfg(target_os = "macos")]
+        fn posix_spawn_file_actions_addchdir(
+            actions: *mut libc::posix_spawn_file_actions_t,
+            path: *const libc::c_char,
+        ) -> libc::c_int;
+        #[cfg(target_os = "macos")]
+        fn posix_spawn_file_actions_addfchdir(
+            actions: *mut libc::posix_spawn_file_actions_t,
+            fd: libc::c_int,
+        ) -> libc::c_int;
+    }
+    unsafe {
+        #[cfg(target_os = "macos")]
+        if mode.ends_with("-posix") {
+            return if mode.contains("fchdir") {
+                posix_spawn_file_actions_addfchdir(actions, fd)
+            } else {
+                posix_spawn_file_actions_addchdir(actions, path)
+            };
+        }
+        if mode.contains("fchdir") {
+            posix_spawn_file_actions_addfchdir_np(actions, fd)
+        } else {
+            posix_spawn_file_actions_addchdir_np(actions, path)
+        }
+    }
+}

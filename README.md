@@ -25,4 +25,23 @@ forkfs 是 World 首批直接管理的资源：World 通过 forkfs RPC 服务管
 
 forkfs RPC 服务是待实现的接入契约，World 不链接 forkfs 库，也不通过解析 CLI 输出控制它。
 
-当前仓库处于设计阶段，文档中的命令与接口均为拟议规格，尚未实现。
+World 现在使用 Rust workspace。已实现两种本地运行模式：
+
+- `world network exec`：Seatbelt 出站白名单，禁止本地监听。
+- `world silo exec`：集成固定版本的 silo，透明重写受支持原生程序的 localhost，让多个 World 使用相同端口；同一 World 的多次执行共享地址。应用不用修改源码或配置 World IP。
+
+```sh
+cargo build --workspace
+mkdir -p /tmp/world-a /tmp/world-b
+./target/debug/world silo create --world A --workdir /tmp/world-a
+./target/debug/world silo create --world B --workdir /tmp/world-b
+./target/debug/world silo setup --world A
+./target/debug/world silo setup --world B
+# setup 需要管理员授权，只添加本 World 的 loopback 别名。
+./target/debug/world silo exec --world A -- /opt/homebrew/bin/python3 -m http.server 8080 --bind 127.0.0.1
+# 另一终端可在 B 中运行相同命令、使用相同端口。
+```
+
+使用、验证和兼容边界见 [macOS 网络运行时](docs/macos-network-isolation.md)。silo 模式提供开发任务的 localhost 兼容层，不是对抗恶意代码的内核网络命名空间；不能与出站白名单模式混为一谈。
+
+完整控制面、认证、计费、Skill/MCP 和 forkfs RPC 接入仍为拟议规格。forkfs 接入坚持 RPC，不链接其 C ABI。

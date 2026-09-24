@@ -1,0 +1,6 @@
+{
+  "network_id": "web",
+  "allow": [
+    {"host": "example.com", "port": 443}
+  ]
+}

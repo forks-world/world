@@ -90,6 +90,8 @@ flowchart LR
 
 隔离必须由服务端和运行环境共同执行，CLI 的当前上下文仅用于选择操作目标。
 
+每个 World/Workspace 必须拥有独立网络栈：不同 World 能同时监听相同的地址、协议和端口，同一 World 的多个进程与多次 Execution 共享栈内的 `localhost` 和监听服务。应用不得为此修改端口或配置代理。运行时绑定使用全局 Workspace 身份与运行代际，不能使用 Store 局部简写或每次 Execution 身份；同属一个 Network 不代表共用端口空间。对外发布端口是显式授权动作，宿主端口冲突单独处理。完整验收要求见 [World 网络栈验收](macos-network-isolation.md#world-网络栈验收要求)。
+
 ### 请求与权限
 
 所有 Network 级接口使用显式路径：`/v1/orgs/{org_id}/networks/{network_id}/...`。服务端先认证主体，再校验组织归属与 Network 权限；请求体中的归属字段不能覆盖路径。查询、列表、批量操作和后台任务均使用同一套授权规则。
@@ -354,26 +356,20 @@ World 原子记录取消意图并阻止尚未发送的 outbox 执行；已经发
 ## 8. 建议代码结构
 
 ```text
-cmd/world/                 CLI 入口
-                           同时提供 mcp serve 子命令
-cmd/world-api/             API 服务入口
-cmd/world-worker/          异步任务入口
-internal/identity/         身份、组织与授权
-internal/networks/         隔离边界与生命周期
-internal/metadata/         元信息与配置版本
-internal/billing/          订阅、权益、配额与计量
-internal/operations/       Operation、outbox 与重试
-internal/audit/            审计记录
-internal/adapters/         支付服务、运行环境、密钥服务
-internal/mcp/              MCP 工具注册、参数与结果映射
-skills/world/              待实现的 World Skill 与工作流程参考
-contracts/mcp/             工具输入输出 schema 与契约示例
-api/                      接口规范与 schema
-migrations/               数据库迁移
+crates/world-cli/          已实现：CLI 入口
+crates/world-runtime/      已实现：策略、出站代理、进程监督、silo 状态
+vendor/silo-bind/          已接入：固定版本 silo 动态库，保留许可证与本地补丁说明
+crates/world-core/         待实现：身份、Network、元信息、付费、Operation
+crates/world-mcp/          待实现：Agent 工具与共享授权入口
+crates/world-forkfs/       待实现：版本化 RPC 客户端与领域映射
+contracts/                待实现：forkfs/MCP 协议规格
+skills/world/             待实现：Agent 使用流程
+migrations/               待实现：控制面数据库迁移
+tests/                    真实进程与 macOS 集成测试
 docs/                     设计与使用说明
 ```
 
-以上是职责组织建议，尚未决定实现语言。技术选型应结合现有运行环境 SDK 与部署方式，不影响四个核心模块的边界。
+World 已从 Go 原型迁移到 Rust。当前实际 workspace 仅包含 CLI、运行时与 silo 动态库，其余列出的 crate 是后续规划。系统 socket 拦截需要 OS C 调用约定，forkfs 仍只通过 RPC 接入。
 
 ## 9. 实现顺序与验收
 
@@ -744,6 +740,8 @@ Skill 的编码流程改为：确定 Network、节点与 Store → 选择或初�
 Linux 当前沙箱保留宿主网络，宿主可读文件也不是保密边界；macOS 使用允许默认访问的 seatbelt 策略，主要保护当前 Store 和其他 Workspace 的写入，且未指定 `--require-sandbox` 时可能降级为无沙箱。依据：[Linux 执行隔离说明](https://github.com/forks-world/forkfs/blob/6a89c15e121f0f42d50a72437ae5088e93af6b5b/docs/LINUX_XFS.md)、[CLI 沙箱实现](https://github.com/forks-world/forkfs/blob/6a89c15e121f0f42d50a72437ae5088e93af6b5b/cli/main.cpp)。
 
 因此 World 受管执行必须禁止静默降级，并额外部署 Network 流量策略及跨 Network 文件访问限制。只传 `--require-sandbox` 不足以完成这些保证。节点未提供所需隔离能力时拒绝受管执行，Network 不标为可执行状态。授权撤销也需要终止或隔离已有执行进程，不能仅删除控制面授权记录。
+
+macOS 本地出站访问限制已有首版实现与内核集成测试：`world network exec` 使用默认拒绝的 Seatbelt 网络策略、每次执行独立且带凭证的 HTTP/CONNECT 代理、不可变目标白名单和有限执行期限。该出站模式禁止监听。另提供 `world silo exec`，使用固定版本的 silo 动态库透明映射 localhost，支持同端口开发服务；它的注入兼容性有限，不能作为恶意任务的内核隔离边界。此入口尚未接入组织授权、forkfs RPC、远程租约和跨 Network 文件保密边界，不能据此将节点标为完整受管执行就绪。具体能力、限制和验证方法见 [macOS 网络隔离](macos-network-isolation.md)。
 
 forkfs 底层状态保留 `CREATING / ACTIVE / TRASHING / TRASHED / DEAD`，World Operation 单独表示任务进度。discard 后仍占空间，restore 可能因 GC 已开始或基线消失而失败。删除 Network 前处理运行中的 Execution、活跃资源、trash 和 pool；不能将 discard 成功解释为清理完成。
 
