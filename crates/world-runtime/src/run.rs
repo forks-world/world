@@ -207,6 +207,94 @@ pub(crate) struct Workload {
     guard: ProcessGroup,
     out: Forward,
     err: Forward,
+    relay: Option<StdinRelay>,
+}
+
+/// Copies the caller's stdin into the workload's stdin pipe on a thread
+/// that reads only when poll reports input, so cancelling it never leaves
+/// a read pending that would consume input meant for someone else.
+#[cfg(unix)]
+struct StdinRelay {
+    cancel: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl StdinRelay {
+    fn start(input: tokio::process::ChildStdin) -> Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let source = {
+            use std::os::fd::AsFd;
+            std::io::stdin().as_fd().try_clone_to_owned()?
+        };
+        let target = input.into_owned_fd()?;
+        // Our own pipe end: block on writes instead of spinning.
+        // SAFETY: fcntl on an owned descriptor with integer arguments.
+        unsafe {
+            let flags = libc::fcntl(target.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(target.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+        let mut fds = [0; 2];
+        // SAFETY: pipe writes two new descriptors into fds on success.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: both descriptors are new and exclusively owned here.
+        let wake = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let cancel = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        for fd in [&wake, &cancel] {
+            // SAFETY: fcntl on an owned descriptor with integer arguments.
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let mut target = std::fs::File::from(target);
+            let mut buf = [0u8; 16384];
+            loop {
+                let mut polls = [
+                    libc::pollfd {
+                        fd: source.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: wake.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                // SAFETY: polls is a live array of two pollfd structures.
+                if unsafe { libc::poll(polls.as_mut_ptr(), 2, -1) } < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return;
+                }
+                if polls[1].revents != 0 {
+                    return;
+                }
+                let (fd, len) = (source.as_raw_fd(), buf.len());
+                // SAFETY: buf is a live, writable buffer of the given length.
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), len) };
+                // EOF, error, or the workload stopped reading (EPIPE).
+                if n <= 0 || target.write_all(&buf[..n as usize]).is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(Self { cancel })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StdinRelay {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // Wakes the relay's poll. A write blocked on a full pipe ends with
+        // EPIPE once the workload, which holds the other end, is killed.
+        // SAFETY: writes one byte from a static buffer to an owned pipe.
+        unsafe { libc::write(self.cancel.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+    }
 }
 
 /// `relay_stdin`: pass stdin through a pipe instead of the inherited
@@ -224,16 +312,7 @@ pub(crate) fn spawn(mut cmd: Command, relay_stdin: bool) -> Result<Workload> {
     cmd.as_std_mut().process_group(0);
     let mut child = cmd.spawn().context("start workload")?;
     let pid = child.id().context("child PID unavailable")?;
-    if let Some(mut input) = child.stdin.take() {
-        #[cfg(unix)]
-        let source = {
-            use std::os::fd::AsFd;
-            std::io::stdin().as_fd().try_clone_to_owned()?
-        };
-        let mut source = tokio::fs::File::from_std(std::fs::File::from(source));
-        // Ends with EPIPE once the workload exits without reading it all.
-        tokio::spawn(async move { tokio::io::copy(&mut source, &mut input).await });
-    }
+    let relay = child.stdin.take().map(StdinRelay::start).transpose()?;
     let guard = ProcessGroup(pid);
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
@@ -246,6 +325,7 @@ pub(crate) fn spawn(mut cmd: Command, relay_stdin: bool) -> Result<Workload> {
         guard,
         out,
         err,
+        relay,
     })
 }
 
@@ -275,6 +355,7 @@ pub(crate) async fn wait(
         guard,
         out,
         err,
+        relay,
     } = workload;
     let injection_failure = async {
         if let Some(path) = ack {
@@ -295,6 +376,7 @@ pub(crate) async fn wait(
         proxy.close().await;
     }
     drop(guard);
+    drop(relay);
     if status.is_none() {
         let _ = child.kill().await;
         let _ = child.wait().await;

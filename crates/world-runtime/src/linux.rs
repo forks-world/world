@@ -937,7 +937,16 @@ pub(crate) fn stop_holder(holder: &Holder) -> Result<()> {
     // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, holder.pid as libc::pid_t, 0u32) };
     if pidfd < 0 {
-        return Err(Error::last_os_error()).context("open holder pidfd");
+        let error = Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ENOSYS) {
+            return Err(error).context("open holder pidfd");
+        }
+        // Before Linux 5.3: verify, then signal by PID. Only a PID reused
+        // between these two calls could be hit.
+        let _namespaces = holder.open()?;
+        // SAFETY: kill takes plain integers.
+        check(unsafe { libc::kill(holder.pid as libc::pid_t, libc::SIGKILL) })?;
+        return Ok(());
     }
     // SAFETY: the kernel returned a new descriptor we exclusively own.
     let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
