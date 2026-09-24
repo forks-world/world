@@ -1004,8 +1004,7 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
     let deadline = Instant::now() + options.timeout;
     // Before this function opens any descriptor that could land on a
     // closed fd 0 and make it look like an unsupported stdin.
-    run::check_stdin()?;
-    run::check_linux_stdin()?;
+    let stdin = run::pin_linux_stdin()?;
     let dir = run::workdir(&options.workdir)?;
     // The private /dev hides anything beneath the host /dev.
     if dir.starts_with("/dev") {
@@ -1103,6 +1102,12 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
     if cancel.is_cancelled() || Instant::now() >= deadline {
         return Ok(124);
     }
+    // The validated descriptor itself, never whatever fd 0 is now. A
+    // closed stdin becomes the null device, reopened inside the sandbox.
+    cmd.stdin(match stdin {
+        Some(fd) => std::process::Stdio::from(fd),
+        None => std::process::Stdio::null(),
+    });
     let workload = run::spawn(cmd)?;
     drop(ruleset);
     let mut proxy = match (prepared, channel) {

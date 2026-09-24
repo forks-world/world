@@ -123,34 +123,45 @@ async fn seatbelt(options: RunOptions, cancel: CancellationToken) -> Result<i32>
 }
 
 /// Linux network exec accepts stdin only as the read end of an anonymous
-/// pipe, the null device (replaced inside the sandbox) or closed. Any other file, FIFO,
-/// terminal or device is an inode the workload could modify through the
-/// inherited descriptor (fchmod, fchown, futimens, fsetxattr, ioctl).
+/// pipe, the null device (replaced inside the sandbox) or closed. Any other
+/// file, FIFO, terminal or device is an inode the workload could modify
+/// through the inherited descriptor (fchmod, fchown, futimens, fsetxattr,
+/// ioctl). The descriptor is duplicated before it is checked and that
+/// exact duplicate becomes the child's stdin, so another thread replacing
+/// fd 0 afterwards cannot bypass the check. `None` means stdin is closed.
 #[cfg(target_os = "linux")]
-pub(crate) fn check_linux_stdin() -> Result<()> {
+pub(crate) fn pin_linux_stdin() -> Result<Option<std::os::fd::OwnedFd>> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     const PIPEFS_MAGIC: u32 = 0x5049_5045;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: fstat initializes the provided stat structure only on success.
-    if unsafe { libc::fstat(libc::STDIN_FILENO, stat.as_mut_ptr()) } != 0 {
+    // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor we exclusively own.
+    let fd = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    if fd < 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::EBADF) {
-            return Ok(());
+            return Ok(None);
         }
         return Err(error.into());
+    }
+    // SAFETY: as above.
+    let pinned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat initializes the provided stat structure only on success.
+    if unsafe { libc::fstat(pinned.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
     let stat = unsafe { stat.assume_init() };
     let accepted = match stat.st_mode & libc::S_IFMT {
         libc::S_IFIFO => {
             let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
             // SAFETY: fstatfs initializes the structure only on success.
-            if unsafe { libc::fstatfs(libc::STDIN_FILENO, fs.as_mut_ptr()) } != 0 {
+            if unsafe { libc::fstatfs(pinned.as_raw_fd(), fs.as_mut_ptr()) } != 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
             // f_type's integer type differs between C libraries.
             let pipe = unsafe { fs.assume_init() }.f_type as u32 == PIPEFS_MAGIC;
             // Only a read end: a write end would be a channel to the host.
             // SAFETY: F_GETFL takes no pointer argument.
-            let flags = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL) };
+            let flags = unsafe { libc::fcntl(pinned.as_raw_fd(), libc::F_GETFL) };
             pipe && flags >= 0 && flags & libc::O_ACCMODE == libc::O_RDONLY
         }
         libc::S_IFCHR => is_null_device(stat.st_rdev),
@@ -162,7 +173,7 @@ pub(crate) fn check_linux_stdin() -> Result<()> {
              e.g. `cat FILE | world network exec ...`"
         );
     }
-    Ok(())
+    Ok(Some(pinned))
 }
 
 #[cfg(target_os = "linux")]
@@ -228,8 +239,8 @@ pub(crate) struct Workload {
 }
 
 pub(crate) fn spawn(mut cmd: Command) -> Result<Workload> {
-    cmd.stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
+    // stdin is the caller's choice (inherited in supervise).
+    cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
@@ -254,7 +265,7 @@ pub(crate) fn spawn(mut cmd: Command) -> Result<Workload> {
 }
 
 pub(crate) async fn supervise(
-    cmd: Command,
+    mut cmd: Command,
     deadline: Instant,
     cancel: CancellationToken,
     proxy: &mut Option<Proxy>,
@@ -264,6 +275,7 @@ pub(crate) async fn supervise(
     if cancel.is_cancelled() || Instant::now() >= deadline {
         return Ok(124);
     }
+    cmd.stdin(Stdio::inherit());
     wait(spawn(cmd)?, deadline, cancel, proxy, ack).await
 }
 
