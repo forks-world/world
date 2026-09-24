@@ -41,7 +41,8 @@ def run(*args, **kwargs):
 
 @contextlib.contextmanager
 def serving(args):
-    process = subprocess.Popen([str(x) for x in args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    process = subprocess.Popen([str(x) for x in args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True)
     try:
         if not select.select([process.stdout], [], [], 10)[0]:
             raise AssertionError("listener startup timed out")

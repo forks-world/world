@@ -1221,16 +1221,44 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
 }
 
 /// After killing a holder, reap it if it became our child: a caller that
-/// is a child subreaper adopts the double-forked holder. Only our own
-/// child can be waited for by PID, and a killed child keeps its PID as a
-/// zombie until reaped, so this cannot touch an unrelated process; for
-/// anyone else it returns ECHILD and init (or the real subreaper) reaps.
-fn reap_pid_if_child(pid: libc::pid_t) {
-    let mut status = 0;
-    // SAFETY: status is a live int.
-    while unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
-        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return;
+/// is a child subreaper adopts the double-forked holder. With a pidfd on
+/// Linux 5.4+ the wait targets exactly the holder. Otherwise the PID alone
+/// is polled without blocking for a bounded time: if another reaper took
+/// the holder and the PID was reused, this can neither hang on nor (in
+/// practice) reap an unrelated child. For non-children waitpid reports
+/// ECHILD immediately, and init (or the real subreaper) reaps the holder.
+fn reap_if_child(pid: libc::pid_t, pidfd: Option<&OwnedFd>) {
+    const P_PIDFD: libc::idtype_t = 3;
+    let interrupted = || {
+        let error = std::io::Error::last_os_error();
+        error.kind() == std::io::ErrorKind::Interrupted
+    };
+    if let Some(fd) = pidfd {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let id = fd.as_raw_fd() as libc::id_t;
+        loop {
+            // SAFETY: info is a live siginfo_t; the pidfd is open.
+            let result = unsafe { libc::waitid(P_PIDFD, id, info.as_mut_ptr(), libc::WEXITED) };
+            if result == 0 {
+                return;
+            }
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                // P_PIDFD needs Linux 5.4: fall back to the bounded poll.
+                Some(libc::EINVAL) => break,
+                _ => return,
+            }
+        }
+    }
+    for _ in 0..100 {
+        let mut status = 0;
+        // SAFETY: status is a live int.
+        match unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } {
+            0 => std::thread::sleep(std::time::Duration::from_millis(10)),
+            n if n > 0 => return,
+            _ if interrupted() => {}
+            _ => return,
         }
     }
 }
@@ -1261,7 +1289,7 @@ impl StartedHolder {
             }
         };
         check(result)?;
-        reap_pid_if_child(self.pid);
+        reap_if_child(self.pid, self.pidfd.as_ref());
         Ok(())
     }
 }
@@ -1281,7 +1309,7 @@ pub(crate) fn stop_holder(holder: &Holder) -> Result<()> {
         let _namespaces = holder.open()?;
         // SAFETY: kill takes plain integers.
         check(unsafe { libc::kill(holder.pid as libc::pid_t, libc::SIGKILL) })?;
-        reap_pid_if_child(holder.pid as libc::pid_t);
+        reap_if_child(holder.pid as libc::pid_t, None);
         return Ok(());
     }
     // SAFETY: the kernel returned a new descriptor we exclusively own.
@@ -1300,7 +1328,7 @@ pub(crate) fn stop_holder(holder: &Holder) -> Result<()> {
     if result != 0 {
         return Err(Error::last_os_error()).context("stop holder");
     }
-    reap_pid_if_child(holder.pid as libc::pid_t);
+    reap_if_child(holder.pid as libc::pid_t, Some(&pidfd));
     Ok(())
 }
 
