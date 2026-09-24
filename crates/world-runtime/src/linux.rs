@@ -444,6 +444,27 @@ mod seccomp {
         filter
     }
 
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub fn socket_filter() -> Result<Vec<libc::sock_filter>> {
+        bail!("socket filter is not implemented for this architecture");
+    }
+
+    /// pre_exec: must be the last restriction before exec.
+    pub unsafe fn install(filter: &[libc::sock_filter]) -> IoResult<()> {
+        let program = libc::sock_fprog {
+            len: filter.len() as libc::c_ushort,
+            filter: filter.as_ptr() as *mut libc::sock_filter,
+        };
+        unsafe {
+            check(libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER,
+                &program as *const libc::sock_fprog,
+            ))?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -505,26 +526,6 @@ mod seccomp {
                 }
             }
         }
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    pub fn socket_filter() -> Result<Vec<libc::sock_filter>> {
-        bail!("socket filter is not implemented for this architecture");
-    }
-
-    /// pre_exec: must be the last restriction before exec.
-    pub unsafe fn install(filter: &[libc::sock_filter]) -> IoResult<()> {
-        let program = libc::sock_fprog {
-            len: filter.len() as libc::c_ushort,
-            filter: filter.as_ptr() as *mut libc::sock_filter,
-        };
-        unsafe {
-            check(libc::prctl(
-                libc::PR_SET_SECCOMP,
-                libc::SECCOMP_MODE_FILTER,
-                &program as *const libc::sock_fprog,
-            ))?;
-        }
-        Ok(())
     }
 }
 
