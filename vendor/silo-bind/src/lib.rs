@@ -1,6 +1,8 @@
 #![allow(unsafe_code)]
 
 pub mod rewrite;
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod tmp;
 #[cfg(target_os = "macos")]
 mod world;
 
@@ -114,7 +116,8 @@ static INIT_FN: unsafe extern "C" fn() = {
     unsafe extern "C" fn init() {
         let _ = get_silo_ip();
         let _ = debug_enabled();
-        crate::world::acknowledge();
+        let tmp_valid = crate::tmp::init();
+        crate::world::acknowledge(tmp_valid);
 
         if debug_enabled() {
             let pid = std::process::id();

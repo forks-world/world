@@ -13,6 +13,10 @@ Final child exec targets must be native binaries; unresolved shebangs and
 replacement interpreters that resolve to SIP-protected paths fail with EACCES.
 World also rejects setuid/setgid targets and tracks cwd-changing spawn actions
 through their public APIs, including handle relocation and both API spellings.
+World additionally redirects the shared host temp directories (`/tmp`,
+`/var/tmp` and their `/private` forms) below a per-workspace `WORLD_TMP` root
+in libSystem path calls, spawn paths and AF_UNIX addresses (`src/tmp.rs`,
+`src/platform/paths.rs`), and requires children to keep the same root.
 This remains a developer compatibility layer, not a hostile-code security
 boundary: raw syscalls and uninjected code can bypass interposition.
 

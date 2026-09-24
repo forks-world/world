@@ -271,6 +271,56 @@ fn run() -> std::io::Result<()> {
             use std::os::unix::process::CommandExt;
             return Err(std::process::Command::new(&args[2]).args(&args[3..]).exec());
         }
+        "temp-suite" => {
+            // Ordinary shared-temp usage below /tmp/<name> and /var/tmp/<name>.
+            use std::os::unix::net::{UnixListener, UnixStream};
+            let dir = std::path::PathBuf::from("/tmp").join(&args[2]);
+            std::fs::create_dir_all(dir.join("sub"))?;
+            std::fs::write(dir.join("draft"), "data")?;
+            std::fs::rename(dir.join("draft"), dir.join("file"))?;
+            std::os::unix::fs::symlink(dir.join("file"), dir.join("link"))?;
+            let listener = UnixListener::bind(dir.join("s.sock"))?;
+            UnixStream::connect(dir.join("s.sock"))?;
+            let socket = listener.local_addr()?;
+            let template =
+                std::ffi::CString::new(dir.join("mk.XXXXXX").into_os_string().into_encoded_bytes())
+                    .unwrap();
+            let template = template.into_raw();
+            let fd = unsafe { libc::mkstemp(template) };
+            let template = unsafe { std::ffi::CString::from_raw(template) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let var = std::path::PathBuf::from("/var/tmp").join(&args[2]);
+            std::fs::create_dir_all(&var)?;
+            std::fs::write(var.join("file"), "var")?;
+            std::env::set_current_dir(&dir)?;
+            let report = serde_json::json!({
+                "read": std::fs::read_to_string("/tmp/".to_owned() + &args[2] + "/link")?,
+                "readlink": std::fs::read_link(dir.join("link"))?,
+                "canonical": std::fs::canonicalize(dir.join("link"))?,
+                "cwd": std::env::current_dir()?,
+                "socket": socket.as_pathname(),
+                "mkstemp": template.to_string_lossy(),
+                "entries": std::fs::read_dir(&dir)?.count(),
+                "var": std::fs::read_to_string(var.join("file"))?,
+                "tmpdir": std::env::var("TMPDIR").ok(),
+            });
+            print!("{report}");
+        }
+        "temp-hold" => {
+            use std::os::fd::AsRawFd;
+            let path = std::path::Path::new(&args[2]);
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            let lock = std::fs::File::create(path.with_extension("lock"))?;
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let _ = std::fs::remove_file(path.with_extension("sock"));
+            let _listener = std::os::unix::net::UnixListener::bind(path.with_extension("sock"))?;
+            println!("READY 0");
+            std::thread::sleep(Duration::from_secs(30));
+        }
         "fd" => {
             let fd: i32 = args[2].parse().unwrap();
             #[cfg(unix)]

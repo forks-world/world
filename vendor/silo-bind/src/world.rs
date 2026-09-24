@@ -75,7 +75,7 @@ pub unsafe fn path_candidate(path: *const libc::c_char) -> Option<std::ffi::CStr
         return Some(unsafe { CStr::from_ptr(path) }.to_owned());
     }
     let candidate = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|p| p.join(name))
+        .map(|p| crate::tmp::map_path(&p.join(name)))
         .find(|p| executable_file(p))?;
     // Keep the selected pathname (including a symlink) as the script argv entry.
     let candidate = std::env::current_dir().ok()?.join(candidate);
@@ -160,6 +160,7 @@ pub unsafe fn spawn_allowed(path: *const libc::c_char, envp: *const *const libc:
         };
         let mut has_library = false;
         let mut has_ip = false;
+        let mut tmp = None;
         for i in 0..65536 {
             let entry = unsafe { *envp.add(i) };
             if entry.is_null() {
@@ -178,8 +179,13 @@ pub unsafe fn spawn_allowed(path: *const libc::c_char, envp: *const *const libc:
                 }
                 has_ip = true;
             }
+            if let Some(value) = value.strip_prefix("WORLD_TMP=") {
+                tmp = Some(value.to_owned());
+            }
         }
-        has_library && has_ip && !library.is_empty() && !ip.is_empty()
+        // A child without the same temp root would silently share host /tmp.
+        let same_tmp = tmp.as_deref().map(str::as_bytes) == crate::tmp::root();
+        has_library && has_ip && same_tmp && !library.is_empty() && !ip.is_empty()
     })();
     if !valid {
         unsafe {
@@ -189,7 +195,7 @@ pub unsafe fn spawn_allowed(path: *const libc::c_char, envp: *const *const libc:
     valid
 }
 
-pub fn acknowledge() {
+pub fn acknowledge(tmp_valid: bool) {
     // Constructor-time values cannot be replaced by later setenv calls.
     INJECTION.get_or_init(|| {
         Some((
@@ -200,7 +206,7 @@ pub fn acknowledge() {
     if std::env::var("WORLD_SILO_ACTIVE").as_deref() != Ok("1") {
         return;
     }
-    if crate::get_silo_ip().is_none() {
+    if crate::get_silo_ip().is_none() || !tmp_valid || crate::tmp::root().is_none() {
         unsafe {
             libc::_exit(125);
         }

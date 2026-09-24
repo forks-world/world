@@ -22,9 +22,9 @@ cargo build --workspace --locked
 ## 同端口 localhost
 
 ```sh
-mkdir -p /tmp/world-a /tmp/world-b
-./target/debug/world workspace create A --workdir /tmp/world-a
-./target/debug/world workspace create B --workdir /tmp/world-b
+mkdir -p ~/world-a ~/world-b
+./target/debug/world workspace create A --workdir ~/world-a
+./target/debug/world workspace create B --workdir ~/world-b
 ./target/debug/world workspace setup A
 ./target/debug/world workspace setup B
 ```
@@ -49,6 +49,19 @@ mkdir -p /tmp/world-a /tmp/world-b
 
 默认状态目录为 `~/.local/share/world/workspaces`，`--state-dir` 可指定一个受信任的独立运行时注册表。必须让需要相互协调的 Workspace 使用同一注册表。跨进程文件锁串行分配地址，元信息以临时文件、fsync、原子替换提交；同 ID 重复创建幂等，换工作目录被拒绝。地址不会自动回收给另一个 Workspace，避免仍存活的旧进程进入新 Workspace。
 
+## 临时目录
+
+多数服务把锁文件和 Unix socket 放在 `/tmp`，例如 Postgres 的 `/tmp/.s.PGSQL.5432` 及其 `.lock`。只隔离端口时，两个 Workspace 仍会在这些路径上冲突，因此 `world exec` 同时把 `/tmp`、`/private/tmp`、`/var/tmp`、`/private/var/tmp` 重定向到该 Workspace 的私有目录 `~/.world/tmp/<内部地址>/{tmp,var/tmp}`，并把 `TMPDIR` 设为其中的 `tmp/`。同一 Workspace 的多个进程和多次 `exec` 共享该目录，因此仍可用文件锁互斥；不同 Workspace 使用相同名字互不影响。宿主 `/tmp` 不可见，宿主上的非受管程序也看不到 Workspace 的 `/tmp`，需要通过 `world exec` 访问，与 localhost 一致。
+
+重定向由同一动态库在 libSystem 路径调用处完成：打开、创建、stat、目录、改名、链接、权限、时间、xattr、`getattrlist`、`clonefile`、`chdir`、`exec`/`posix_spawn`（含 file actions）以及 `AF_UNIX` 的 `bind/connect/sendto/sendmsg`。`getcwd`、`realpath`、`readlink`、`getsockname/getpeername` 返回宿主名称（`/private/tmp/...`）。程序创建指向 `/tmp/...` 的符号链接时，链接内容写为 Workspace 内的位置。
+
+限制：
+
+- Workspace 工作目录和 `HOME` 不能位于上述临时目录下，否则拒绝执行；私有目录必须在宿主临时目录之外，否则其自身路径会被再次重定向。
+- Unix socket 路径上限 104 字节，重定向后路径会加上私有目录前缀（例如 `/Users/me/.world/tmp/127.77.0.1/tmp/`）。超长时 `bind/connect` 返回 `ENAMETOOLONG`。
+- 已存在于 Workspace 之外、指向 `/tmp` 的符号链接由内核解析，不经过重定向；`fcntl(F_GETPATH)`、`accept/recvfrom` 返回的对端地址、原始系统调用和脚本 shebang 中位于 `/tmp` 的解释器不在覆盖范围内。
+- 私有目录不会随 Workspace 自动清理，也不像宿主 `/tmp` 那样在重启时清空；需要时停止任务后手动删除。
+
 `world workspace show A` 查看配置。Workspace 本地 ID 是开发用稳定标识，尚未对接 forkfs 全局 Workspace Resource ID 或组织授权。`create` 成功只表示元信息登记，不表示已配置地址或通过隔离验收。重启后需要重新 `setup`。停止所有关联任务后可以按 show 返回的地址手工执行 `sudo ifconfig lo0 -alias IP` 清理别名；这不会删除工作目录或注册表。
 
 ## 内部实现：silo 补丁与兼容边界
@@ -58,16 +71,17 @@ mkdir -p /tmp/world-a /tmp/world-b
 - localhost 始终重写，不保留上游“没有监听者就访问宿主”的回退，也不依赖存在竞争窗口的监听探测。
 - 拦截到的其他 Workspace loopback 地址访问被拒绝；IPv4-mapped localhost 也必须映射到当前 Workspace。
 - SIP 系统程序及带 setuid/setgid 位的程序直接拒绝；脚本需显式指定非 SIP 解释器。受拦截的子进程启动检查注入环境，不允许静默丢失；shebang 替代仅匹配同名解释器。`env -S` 支持普通空白分隔参数，含引号、转义或展开的形式明确拒绝，需显式调用解释器。带 chdir/fchdir spawn file actions 的相对目标或相对替代解释器也拒绝，以免目录切换改变实际执行目标。已有程序无需修改源码，但并不承诺所有 macOS 可执行文件都兼容。
+- 共享临时目录按 Workspace 重定向（见[临时目录](#临时目录)）；启用时缺少或无效的 `WORLD_TMP` 终止任务，子进程必须继承相同的值。
 - 动态库加载后写入本次执行确认文件；未确认会终止任务并报错。确认检查不能替代代码签名策略或证明每个 socket 调用都经过了拦截。
 - 状态管理、代理和一般 CLI 使用安全 Rust；系统调用边界与继承描述符处理集中在运行时/动态库中。不得将语言的内存安全等同于无逻辑竞争。
 
-**Workspace localhost 模式是可信开发任务的兼容层，不是恶意代码安全边界。** 原始系统调用、未被拦截的 API 或有意绕过注入的程序可能访问宿主网络。宿主非受管程序也能访问内部 alias；socket 返回的地址信息可能显示内部映射。它不提供跨 Workspace 文件保密、远程租约、配额、任意原生程序完整网络栈虚拟化。生产级受管节点不能仅据此标为完整隔离就绪。
+**Workspace localhost 模式是可信开发任务的兼容层，不是恶意代码安全边界。** 原始系统调用、未被拦截的 API 或有意绕过注入的程序可能访问宿主网络。宿主非受管程序也能访问内部 alias；socket 返回的地址信息可能显示内部映射。它按 Workspace 隔离临时目录，但不提供跨 Workspace 文件保密、远程租约、配额、任意原生程序完整网络栈虚拟化。生产级受管节点不能仅据此标为完整隔离就绪。
 
 ## 出站白名单模式
 
 ```sh
-./target/debug/world network exec --policy examples/network-offline.json --workdir /tmp/world-a -- /bin/echo offline
-./target/debug/world network exec --policy examples/network-web.json --workdir /tmp/world-a --timeout 30s -- /usr/bin/curl -fsS https://example.com/
+./target/debug/world network exec --policy examples/network-offline.json --workdir ~/world-a -- /bin/echo offline
+./target/debug/world network exec --policy examples/network-web.json --workdir ~/world-a --timeout 30s -- /usr/bin/curl -fsS https://example.com/
 ```
 
 策略结构保持 `{ "network_id": "web", "allow": [{ "host": "example.com", "port": 443 }] }`。空 allow 为断网；支持明确的 TCP 域名/IP 和端口，拒绝未知字段、通配符和非法端口。域名启动时解析并固定地址，特殊用途地址（含共享地址、基准测试、文档和地址转换前缀）保守拒绝，需改为可信配置中的显式 IP 授权。

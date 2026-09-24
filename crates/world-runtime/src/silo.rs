@@ -68,6 +68,7 @@ pub fn create(state: &Path, id: &str, workdir: &Path) -> Result<World> {
         bail!("invalid workspace ID");
     }
     let workdir = run::workdir(workdir)?;
+    reject_shared_temp(&workdir, "workdir")?;
     let _lock = lock(state)?;
     let mut worlds = registry(state)?;
     if let Some(world) = worlds.get(id) {
@@ -116,6 +117,46 @@ pub fn get(state: &Path, id: &str) -> Result<World> {
         bail!("invalid workspace registry entry");
     }
     Ok(world)
+}
+
+/// Host temp directories every process shares; `world exec` redirects them.
+const SHARED_TEMP: [&str; 2] = ["/private/tmp", "/private/var/tmp"];
+
+fn reject_shared_temp(path: &Path, what: &str) -> Result<()> {
+    if SHARED_TEMP.iter().any(|temp| path.starts_with(temp)) {
+        bail!(
+            "{what} must not be under /tmp or /var/tmp: they are redirected inside the workspace"
+        );
+    }
+    Ok(())
+}
+
+/// Per-workspace replacement for /tmp and /var/tmp, shared by all executions
+/// of the workspace. It must not be below a host temp directory, or its own
+/// path would be redirected. Keyed by the loopback address, which is already
+/// host-global, and kept short: Unix socket names are limited to 104 bytes.
+pub fn temp_root(world: &World) -> Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let home = PathBuf::from(std::env::var_os("HOME").context("HOME is required")?)
+        .canonicalize()
+        .context("HOME")?;
+    reject_shared_temp(&home, "HOME")?;
+    let root = home.join(".world/tmp").join(world.ip.to_string());
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&root)?;
+    let metadata = std::fs::symlink_metadata(&root)?;
+    if !metadata.is_dir() || metadata.uid() != unsafe { libc::getuid() } {
+        bail!("workspace temp directory is not a directory owned by this user");
+    }
+    for sub in ["tmp", "var/tmp"] {
+        let dir = root.join(sub);
+        std::fs::DirBuilder::new().recursive(true).create(&dir)?;
+        // Match host temp directory permissions; the parent keeps it private.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777))?;
+    }
+    Ok(root)
 }
 
 pub fn alias_ready(ip: Ipv4Addr) -> bool {
@@ -306,6 +347,8 @@ async fn macos_exec(
         );
     }
     let dir = run::workdir(&world.workdir)?;
+    reject_shared_temp(&dir, "workdir")?;
+    let temp = temp_root(&world)?;
     let executable = resolve_executable(&command[0], &dir)?;
     let library = std::env::current_exe()?
         .parent()
@@ -324,7 +367,10 @@ async fn macos_exec(
     cmd.args(&command[1..]).current_dir(&dir);
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        if name.starts_with("DYLD_") || name.starts_with("SILO_") || name.starts_with("WORLD_SILO_")
+        if name.starts_with("DYLD_")
+            || name.starts_with("SILO_")
+            || name.starts_with("WORLD_SILO_")
+            || name == "WORLD_TMP"
         {
             cmd.env_remove(&key);
         }
@@ -334,6 +380,8 @@ async fn macos_exec(
         .env("SILO_CONNECT", "1")
         .env("WORLD_SILO_ACTIVE", "1")
         .env("WORLD_SILO_ACK", ack.path())
+        .env("WORLD_TMP", &temp)
+        .env("TMPDIR", temp.join("tmp/"))
         .env("WORLD_ID", world.id);
     #[cfg(unix)]
     // SAFETY: after fork only async-signal-safe fcntl calls are made. Mark all

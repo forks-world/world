@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import select
+import shutil
 import ssl
 import socket
 import subprocess
@@ -20,6 +21,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORLD = ROOT / "target/debug/world"
@@ -40,9 +42,9 @@ def run(*args, **kwargs):
 
 
 @contextlib.contextmanager
-def serving(args):
-    process = subprocess.Popen([str(x) for x in args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, text=True)
+def serving(args, **kwargs):
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    process = subprocess.Popen([str(x) for x in args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kwargs)
     try:
         if not select.select([process.stdout], [], [], 10)[0]:
             raise AssertionError("listener startup timed out")
@@ -68,6 +70,23 @@ class CLI(unittest.TestCase):
         self.dir = pathlib.Path(self.temp.name)
         self.policy = self.dir / "policy.json"
         self.policy.write_text(json.dumps({"network_id": "test", "allow": []}))
+        # Redirected socket names include the root: keep it short (sun_path is 104 bytes).
+        self.short = tempfile.TemporaryDirectory(prefix=".wt-", dir=pathlib.Path.home())
+        self.addCleanup(self.short.cleanup)
+        self.world_tmp = self.temp_root("w")
+
+    def temp_root(self, name):
+        root = pathlib.Path(self.short.name) / name
+        for sub in ["tmp", "var/tmp"]:
+            (root / sub).mkdir(parents=True)
+        return root
+
+    def shim_env(self, root, **extra):
+        ack = self.dir / "ack"
+        ack.touch()
+        return dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
+                    SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack),
+                    WORLD_TMP=str(root), **extra)
 
     def network(self, *command, timeout="5s", **kwargs):
         return run(WORLD, "network", "exec", "--policy", self.policy,
@@ -408,7 +427,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         ack = self.dir / "ack"
         ack.touch()
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack))
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp))
         with serving([PROBE, "serve", "127.0.0.1:0", "HOST"]) as (_, port):
             result = run(PROBE, "get", f"127.0.0.1:{port}", env=env)
             self.assertNotEqual(result.returncode, 0)
@@ -425,7 +444,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         script.write_text("#!/bin/sh\necho escaped\n")
         script.chmod(0o755)
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack),
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp),
                    PATH=str(self.dir))
         for mode in ["launch", "exec"]:
             result = run(PROBE, mode, script, env=env)
@@ -451,7 +470,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
             (self.dir / name).symlink_to(PROBE)
         script = self.dir / "script"
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), PATH=str(self.dir))
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp), PATH=str(self.dir))
         for shebang, interpreter, options in [("/bin/zsh", "zsh", []),
                 ("/usr/bin/env -S python3 -u -B", "python3", ["-u", "-B"])]:
             script.write_text(f"#!{shebang}\n")
@@ -479,7 +498,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         script.write_text("#!/usr/bin/env python3\n")
         script.chmod(0o755)
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), PATH=str(parent))
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp), PATH=str(parent))
         bad_dir, bad_link = self.dir / "bad-dir", self.dir / "bad-link"
         bad_dir.mkdir()
         bad_link.mkdir()
@@ -506,7 +525,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         script.write_text("#!/usr/bin/env python3\n")
         script.chmod(0o755)
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack))
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp))
         for path in ["", ":/nonexistent", "/nonexistent:", "/nonexistent::/nonexistent"]:
             for mode in ["launch-envpath", "exec-envpath"]:
                 result = run(PROBE, mode, path, script, env=env, cwd=self.dir)
@@ -518,8 +537,9 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         ack = self.dir / "ack"
         ack.touch()
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack))
-        for key, value in [("SILO_IP", "127.77.254.253"), ("DYLD_INSERT_LIBRARIES", "/usr/lib/libSystem.B.dylib")]:
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp))
+        for key, value in [("SILO_IP", "127.77.254.253"), ("DYLD_INSERT_LIBRARIES", "/usr/lib/libSystem.B.dylib"),
+                           ("WORLD_TMP", str(self.temp_root("other-tmp")))]:
             for mode in ["launch", "exec"]:
                 result = run(PROBE, "tamper-child", mode, key, value, env=env)
                 self.assertEqual(result.returncode, 77, result.stderr)
@@ -534,7 +554,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         script.write_text("#!/usr/bin/env -S python3 -u\n")
         script.chmod(0o755)
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), PATH=str(self.dir))
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp), PATH=str(self.dir))
         result = run(PROBE, "launch", "path-script", "caller-arg", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), [str(self.dir / "python3"), "-u", str(script), "caller-arg"])
@@ -549,7 +569,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         (cwd / "candidate").symlink_to("/bin/echo")
         (path / "candidate").symlink_to(PROBE)
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), PATH=str(path))
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp), PATH=str(path))
         for mode in ["raw-spawn", "raw-exec"]:
             result = run(PROBE, mode, "candidate", "fd", "999", env=env, cwd=cwd)
             self.assertEqual(result.returncode, 77, result.stderr)
@@ -571,7 +591,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         (current / "candidate").symlink_to(PROBE)
         (other / "candidate").symlink_to("/bin/echo")
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack))
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp))
         import ctypes
         modes = ["raw-spawn-chdir", "raw-spawn-fchdir"]
         if hasattr(ctypes.CDLL(None), "posix_spawn_file_actions_addchdir"):
@@ -591,7 +611,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         program = self.dir / "privileged"
         program.write_bytes(PROBE.read_bytes())
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack))
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp))
         for mode in [0o4755, 0o2755]:
             program.chmod(mode)
             for launch in ["raw-spawn", "raw-exec"]:
@@ -600,6 +620,68 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         program.chmod(0o755)
         result = run(PROBE, "raw-spawn", program, "fd", "999", env=env)
         self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_shared_temp_paths_are_redirected(self):
+        name = f"wt-{uuid.uuid4().hex[:8]}"
+        result = run(PROBE, "temp-suite", name, env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        host = f"/private/tmp/{name}"
+        self.assertEqual(report["read"], "data")
+        self.assertEqual(report["readlink"], f"{host}/file")
+        self.assertEqual(report["canonical"], f"{host}/file")
+        self.assertEqual(report["cwd"], host)
+        self.assertEqual(report["socket"], f"{host}/s.sock")
+        self.assertTrue(report["mkstemp"].startswith(f"/tmp/{name}/mk."), report)
+        self.assertEqual((report["entries"], report["var"]), (5, "var"))
+        for leaked in [f"/tmp/{name}", f"/var/tmp/{name}"]:
+            self.assertFalse(os.path.lexists(leaked), leaked)
+        physical = self.world_tmp / "tmp" / name
+        self.assertEqual((physical / "file").read_text(), "data")
+        # Link targets are stored at the World location and resolved there.
+        self.assertEqual(os.readlink(physical / "link"), str(physical / "file"))
+        self.assertEqual((self.world_tmp / "var/tmp" / name / "file").read_text(), "var")
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_same_temp_lock_and_socket_names_do_not_conflict(self):
+        path = f"/tmp/wt-{uuid.uuid4().hex[:8]}/service"
+        a, b = self.temp_root("a"), self.temp_root("b")
+        with serving([PROBE, "temp-hold", path], env=self.shim_env(a)):
+            with serving([PROBE, "temp-hold", path], env=self.shim_env(b)):
+                for root in [a, b]:
+                    self.assertTrue((root / path.removeprefix("/")).with_suffix(".sock").exists())
+            # The same World still shares its lock between processes.
+            result = run(PROBE, "temp-hold", path, env=self.shim_env(a))
+            self.assertEqual(result.returncode, 78, result.stderr)
+        self.assertFalse(os.path.lexists(os.path.dirname(path)))
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_executable_below_shared_temp_is_redirected(self):
+        name = f"wt-{uuid.uuid4().hex[:8]}"
+        (self.world_tmp / "tmp" / name).mkdir()
+        (self.world_tmp / "tmp" / name / "probe").symlink_to(PROBE)
+        for mode in ["launch", "exec", "raw-spawn", "raw-exec"]:
+            result = run(PROBE, mode, f"/tmp/{name}/probe", "fd", "999", env=self.shim_env(self.world_tmp))
+            self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_active_shim_requires_private_temp_root(self):
+        env = self.shim_env(self.world_tmp)
+        for value in [None, "", "/private/tmp/world", "relative/world/tmp"]:
+            if value is None:
+                env.pop("WORLD_TMP")
+            else:
+                env["WORLD_TMP"] = value
+            result = run(PROBE, "fd", "999", env=env)
+            self.assertEqual(result.returncode, 125, value)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_workspace_rejects_shared_temp_workdir(self):
+        for workdir in ["/tmp", "/private/var/tmp"]:
+            result = run(WORLD, "workspace", "--state-dir", self.dir / "state", "create", "X", "--workdir", workdir)
+            self.assertEqual(result.returncode, 125)
+            self.assertIn("must not be under /tmp or /var/tmp", result.stderr)
 
     @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_slow_output_consumer_does_not_lose_tail(self):
@@ -691,6 +773,7 @@ class Silo(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         for world in cls.worlds.values():
+            shutil.rmtree(pathlib.Path.home() / ".world/tmp" / world["ip"], ignore_errors=True)
             subprocess.run(["sudo", "-n", "/sbin/ifconfig", "lo0", "-alias", world["ip"]], check=True, timeout=10)
         cls.temp.cleanup()
 
@@ -773,6 +856,19 @@ class Silo(unittest.TestCase):
             result = run(*command)
             self.assertEqual(result.returncode, 125, result.stderr)
             self.assertIn("privileged executable unsupported", result.stderr)
+
+    def test_temp_is_private_per_workspace(self):
+        path = f"/tmp/wt-{uuid.uuid4().hex[:8]}/service"
+        with serving(self.command("A", "temp-hold", path)):
+            with serving(self.command("B", "temp-hold", path)):
+                for name, world in self.worlds.items():
+                    root = pathlib.Path.home() / ".world/tmp" / world["ip"]
+                    self.assertTrue((root / path.removeprefix("/")).with_suffix(".sock").exists(), name)
+        self.assertFalse(os.path.lexists(os.path.dirname(path)))
+        result = run(*self.command("A", "temp-suite", f"wt-{uuid.uuid4().hex[:8]}"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tmpdir = json.loads(result.stdout)["tmpdir"]
+        self.assertEqual(tmpdir, str(pathlib.Path.home().resolve() / ".world/tmp" / self.worlds["A"]["ip"] / "tmp") + "/")
 
     def test_udp_disconnect_uses_kernel_semantics(self):
         baseline = run(PROBE, "udp-disconnect", "127.0.0.1:12345")
