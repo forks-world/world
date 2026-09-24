@@ -143,6 +143,17 @@ class CLI(unittest.TestCase):
             result = self.network("/usr/bin/truncate", "-s", "0", target)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(target.read_text(), "original")
+            before = target.stat()
+            for command in [["chmod", "600", target], ["touch", "-d", "2000-01-01", target],
+                            ["ln", "-s", "x", pathlib.Path(outside) / "link"]]:
+                result = self.network(*command)
+                self.assertNotEqual(result.returncode, 0, command)
+            after = target.stat()
+            self.assertEqual((after.st_mode, after.st_mtime_ns), (before.st_mode, before.st_mtime_ns))
+            self.assertFalse((pathlib.Path(outside) / "link").exists())
+        result = self.network("/bin/sh", "-c", 'echo in > inside && chmod 700 inside && touch -d 2000-01-01 inside && echo t > "$TMPDIR/t" && cat inside')
+        self.assertEqual((result.returncode, result.stdout), (0, "in\n"), result.stderr)
+        self.assertEqual((self.dir / "inside").stat().st_mode & 0o777, 0o700)
         # Only loopback exists, private to this execution.
         result = self.network("/bin/sh", "-c", "tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' '")
         self.assertEqual((result.returncode, result.stdout), (0, "lo\n"), result.stderr)
@@ -186,7 +197,9 @@ class CLI(unittest.TestCase):
             self.assertEqual(result.returncode, 125)
         with tempfile.TemporaryDirectory() as outside:
             result = self.network(PROBE, "write", str(pathlib.Path(outside) / "escape"))
-            self.assertEqual(result.returncode, 77, result.stderr)
+            # Linux refuses on the read-only mount (EROFS) before Landlock (EACCES).
+            self.assertIn(result.returncode, (77,) if MACOS else (77, 78), result.stderr)
+            self.assertFalse((pathlib.Path(outside) / "escape").exists())
         if MACOS:
             self.assertNotEqual(self.network("/bin/launchctl", "list").returncode, 0)
 

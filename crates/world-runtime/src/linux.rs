@@ -16,11 +16,11 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use rand::Rng;
 use std::{
-    ffi::CStr,
+    ffi::{CStr, CString},
     io::{Error, Result as IoResult},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-        unix::{fs::MetadataExt, process::CommandExt},
+        unix::{ffi::OsStrExt, fs::MetadataExt, process::CommandExt},
     },
     path::Path,
 };
@@ -96,6 +96,103 @@ pub(crate) unsafe fn enter_new_namespaces(maps: &IdMaps) -> IoResult<()> {
         if result != 0 {
             return Err(error);
         }
+    }
+    Ok(())
+}
+
+/// Paths that stay writable in a read-only mount view, and the directory
+/// to re-enter afterwards (the old working directory keeps the old mount).
+pub(crate) struct WritableView {
+    paths: Vec<CString>,
+    workdir: CString,
+}
+
+impl WritableView {
+    pub(crate) fn new(workdir: &Path, others: &[&Path]) -> Result<Self> {
+        let c = |p: &Path| CString::new(p.as_os_str().as_bytes()).context("path contains NUL");
+        Ok(Self {
+            paths: std::iter::once(workdir)
+                .chain(others.iter().copied())
+                .map(c)
+                .collect::<Result<_>>()?,
+            workdir: c(workdir)?,
+        })
+    }
+}
+
+#[repr(C)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+
+/// pre_exec (inside the new user namespace): a private mount namespace in
+/// which every mount is read-only except fresh writable binds of `view`.
+/// Read-only mounts refuse metadata changes (chmod, chown, utimes, xattr)
+/// that Landlock does not mediate.
+pub(crate) unsafe fn enter_read_only_view(view: &WritableView) -> IoResult<()> {
+    const MOUNT_ATTR_RDONLY: u64 = 1;
+    const AT_RECURSIVE: libc::c_uint = 0x8000;
+    const OPEN_TREE_CLONE: libc::c_uint = 1;
+    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 4;
+    let size = std::mem::size_of::<MountAttr>();
+    let set = |attr_set, attr_clr| MountAttr {
+        attr_set,
+        attr_clr,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    let syscall = |result: libc::c_long| check(result as libc::c_int);
+    unsafe {
+        check(libc::unshare(libc::CLONE_NEWNS))?;
+        check(libc::mount(
+            std::ptr::null(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        ))?;
+        let read_only = set(MOUNT_ATTR_RDONLY, 0);
+        syscall(libc::syscall(
+            libc::SYS_mount_setattr,
+            libc::AT_FDCWD,
+            c"/".as_ptr(),
+            AT_RECURSIVE,
+            &read_only as *const MountAttr,
+            size,
+        ))?;
+        let writable = set(0, MOUNT_ATTR_RDONLY);
+        for path in &view.paths {
+            let tree = syscall(libc::syscall(
+                libc::SYS_open_tree,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint | AT_RECURSIVE,
+            ))?;
+            let result = syscall(libc::syscall(
+                libc::SYS_mount_setattr,
+                tree,
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH as libc::c_uint | AT_RECURSIVE,
+                &writable as *const MountAttr,
+                size,
+            ))
+            .and_then(|_| {
+                syscall(libc::syscall(
+                    libc::SYS_move_mount,
+                    tree,
+                    c"".as_ptr(),
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    MOVE_MOUNT_F_EMPTY_PATH,
+                ))
+            });
+            libc::close(tree);
+            result?;
+        }
+        check(libc::chdir(view.workdir.as_ptr()))?;
     }
     Ok(())
 }
@@ -614,12 +711,14 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
         }
     }
     let maps = IdMaps::current();
+    let view = WritableView::new(&dir, &[&temp_path])?;
     let ruleset_fd = ruleset.as_raw_fd();
     let child_channel = channel.as_ref().map(|(_, child)| child.as_raw_fd());
     // SAFETY: the closure only makes raw system calls on data prepared above.
     unsafe {
         cmd.as_std_mut().pre_exec(move || {
             enter_new_namespaces(&maps)?;
+            enter_read_only_view(&view)?;
             if let Some(channel) = child_channel {
                 send_listeners(channel, port)?;
             }
