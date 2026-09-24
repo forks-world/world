@@ -207,6 +207,63 @@ pub(crate) unsafe fn join_namespaces(user: RawFd, net: RawFd) -> IoResult<()> {
     Ok(())
 }
 
+/// Exit like the child whose wait status is `status`. A namespace init
+/// cannot signal itself, so it falls back to the shell convention 128+n.
+unsafe fn relay_exit(status: libc::c_int) -> ! {
+    unsafe {
+        if libc::WIFSIGNALED(status) {
+            let signal = libc::WTERMSIG(status);
+            libc::signal(signal, libc::SIG_DFL);
+            libc::kill(libc::getpid(), signal);
+            libc::_exit(128 + signal);
+        }
+        libc::_exit(libc::WEXITSTATUS(status));
+    }
+}
+
+/// Wait for `child`, reaping any other exited processes on the way.
+unsafe fn wait_for(child: libc::pid_t) -> ! {
+    unsafe {
+        // Hold no pipes: spawn sees exec (or its error) from the workload,
+        // and output ends when the workload's descendants close it.
+        libc::syscall(libc::SYS_close_range, 0u32, u32::MAX, 0u32);
+        loop {
+            let mut status = 0;
+            let pid = libc::waitpid(-1, &mut status, 0);
+            if pid == child {
+                relay_exit(status);
+            }
+            if pid < 0 && *libc::__errno_location() != libc::EINTR {
+                libc::_exit(125);
+            }
+        }
+    }
+}
+
+/// pre_exec (with CAP_SYS_ADMIN in the current user namespace), last step:
+/// run the workload in a new PID namespace under a minimal init. When the
+/// workload exits, init exits with its status and the kernel kills every
+/// process left in the namespace, including descendants that left the
+/// process group. The workload is PID 2, so its own signal semantics are
+/// unchanged. The forked-off ancestors only relay the exit status.
+pub(crate) unsafe fn enter_pid_namespace() -> IoResult<()> {
+    unsafe {
+        check(libc::unshare(libc::CLONE_NEWPID))?;
+        let init = check(libc::fork())?;
+        if init != 0 {
+            wait_for(init);
+        }
+        let workload = libc::fork();
+        if workload < 0 {
+            libc::_exit(125);
+        }
+        if workload != 0 {
+            wait_for(workload);
+        }
+    }
+    Ok(())
+}
+
 /// pre_exec: no descriptor beyond stdio survives exec.
 pub(crate) unsafe fn close_extra_descriptors() -> IoResult<()> {
     const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
@@ -725,7 +782,8 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
             close_extra_descriptors()?;
             check(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))?;
             landlock::restrict_self(ruleset_fd)?;
-            seccomp::install(&filter)
+            seccomp::install(&filter)?;
+            enter_pid_namespace()
         });
     }
     run::check_stdin()?;

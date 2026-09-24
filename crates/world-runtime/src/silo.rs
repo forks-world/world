@@ -241,7 +241,8 @@ async fn linux_exec(
     unsafe {
         cmd.as_std_mut().pre_exec(move || {
             crate::linux::join_namespaces(user_fd, net_fd)?;
-            crate::linux::close_extra_descriptors()
+            crate::linux::close_extra_descriptors()?;
+            crate::linux::enter_pid_namespace()
         });
     }
     let result = run::supervise(cmd, Instant::now() + duration, cancel, &mut None, None).await;

@@ -23,13 +23,15 @@ Linux 与 macOS 使用同一个 CLI（`world network exec`、`world silo ...`）
 2. 有允许目标时，在该 namespace 的 `127.0.0.1`（以及可用时的 `::1`）上创建代理监听 socket，通过 `SCM_RIGHTS` 传回 World 进程。端口从 namespace 默认的临时端口范围（32768–60999）中随机选取；任务如果固定绑定同一端口，会得到 `EADDRINUSE`。代理在宿主侧接受连接并按策略转发。任务仍然通过 `http_proxy` 等变量使用代理。
 3. 在私有 mount namespace 中把所有挂载递归设为只读，只把工作目录和私有临时目录重新绑定为可写。只读挂载会拒绝修改文件元数据（`chmod`、`chown`、时间戳、xattr），这些是 Landlock 管不到的。然后设置 `no_new_privs`，再用 Landlock 禁止工作目录、私有临时目录和 `/dev/null` 之外的写入，作为第二层限制。内核支持 Landlock ABI 6（Linux 6.12+）时，还禁止向沙箱外发送信号和连接沙箱外的抽象 Unix socket。
 4. 用 seccomp 拒绝 `AF_INET`、`AF_INET6`、`AF_NETLINK` 之外的 `socket()`、数据报类型的 `socketpair()`，以及 `io_uring_setup`。network namespace 管不到文件系统 Unix socket（例如 Docker、D-Bus），这一步就是阻止借用它们出网。数据报 socket 对的一端可以被 `connect` 或 `sendto` 重新指向宿主 Unix socket，所以只允许 stream 和 seqpacket 类型的 `socketpair`，用于进程内部通信。
-5. 清空环境变量；拒绝 socket 标准输入，以及以可写方式打开的普通文件或块设备标准输入（Landlock 不限制沙箱建立前已打开的描述符）；关闭 0/1/2 之外继承的描述符。
+5. 在新的 PID namespace 中运行任务：由一个最小 init 担任 PID 1 并回收孤儿进程，任务是 PID 2，信号语义不变。任务退出、超时或被取消时，init 随之退出，内核会杀死该 namespace 中剩余的所有进程，包括用 `setsid`/`setpgid` 脱离进程组的后代。macOS 没有这项保证。
+6. 清空环境变量；拒绝 socket 标准输入，以及以可写方式打开的普通文件或块设备标准输入（Landlock 不限制沙箱建立前已打开的描述符）；关闭 0/1/2 之外继承的描述符。
 
 与 macOS 的差异：
 
 - **本地监听**：macOS 的 Seatbelt 禁止监听；Linux 允许任务在自己的私有 loopback 上监听。其他执行和宿主都访问不到它。
 - **错误码**：连接宿主监听端口时，得到的是 namespace 内的 `ECONNREFUSED`，而不是 `EPERM`；Unix socket 返回 `EACCES`。
 - **进程信息**：所有支持的 Landlock ABI 都会阻止对沙箱外进程的 ptrace 及相关访问（`pidfd_getfd`、`process_vm_readv`、受保护的 `/proc/<pid>` 数据），因此任务无法借用宿主进程的 socket；但任务仍能列出宿主进程和它们的命令行。Linux 6.12 以前，同一 uid 的宿主进程也可能收到任务发出的信号。
+- **进程回收**：Linux 的两种模式都在 PID namespace 中运行任务，脱离进程组的后代也会被回收；任务内看到的 PID 是 namespace 内的编号。
 - **读取**：与 macOS 一样，不限制读取宿主文件。
 
 ## 同端口 localhost（silo）

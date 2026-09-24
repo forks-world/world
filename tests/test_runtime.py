@@ -182,7 +182,23 @@ print("stolen" if got >= 0 else os.strerror(ctypes.get_errno()))
         if pathlib.Path("/proc/sys/kernel/yama/ptrace_scope").read_text().strip() in ("0", "1"):
             self.assertEqual(control.stdout.strip(), "stolen", control.stderr)
         result = self.network("/usr/bin/python3", "steal.py", target.pid, fd)
-        self.assertEqual(result.stdout.strip(), os.strerror(1), result.stderr)
+        # The PID namespace hides the host process (ESRCH); Landlock refuses
+        # the ptrace access check (EPERM) even when it is addressable.
+        self.assertIn(result.stdout.strip(), [os.strerror(1), os.strerror(3)], result.stderr)
+
+    @unittest.skipUnless(LINUX, "PID namespaces require Linux")
+    def test_escaped_descendants_are_killed(self):
+        self.assertEqual(self.network("/bin/sh", "-c", "kill -9 $$").returncode, 137)
+        script = 'setsid /bin/sh -c "sleep 2; echo escaped > marker" </dev/null >/dev/null 2>&1 & echo "$$"'
+        for timeout in ["5s", "300ms"]:
+            with self.subTest(timeout=timeout):
+                command = ["/bin/sh", "-c", script + ("" if timeout == "5s" else "; sleep 5")]
+                result = self.network(*command, timeout=timeout)
+                self.assertEqual(result.returncode, 0 if timeout == "5s" else 124, result.stderr)
+                if timeout == "5s":
+                    self.assertEqual(result.stdout, "2\n")  # PID 1 is the reaper
+                time.sleep(3)
+                self.assertFalse((self.dir / "marker").exists())
 
     @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_writable_file_stdin_is_refused(self):
@@ -721,6 +737,14 @@ class LinuxSilo(unittest.TestCase):
         with first as sock, second:
             result = run(*self.command("A", "fd", sock.fileno()), pass_fds=(sock.fileno(),))
             self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+    def test_escaped_descendants_are_killed(self):
+        work = self.root / "A"
+        command = [WORLD, "silo", "--state-dir", self.state, "exec", "--world", "A", "--", "/bin/sh", "-c",
+                   'setsid /bin/sh -c "sleep 2; echo escaped > marker" </dev/null >/dev/null 2>&1 &']
+        self.assertEqual(run(*command).returncode, 0)
+        time.sleep(3)
+        self.assertFalse((work / "marker").exists())
 
     def test_setup_idempotent_and_teardown(self):
         work = self.root / "C"
