@@ -1212,13 +1212,26 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
             if holder != 0 {
                 libc::_exit(0);
             }
-            // A setup error is still reported through spawn's status pipe.
-            enter_new_namespaces(&maps)?;
+            // The holder never execs, so close-on-exec does not apply: drop
+            // every inherited descriptor first, keeping only the report
+            // pipe (as fd 0), so it never keeps the caller's sockets or
+            // files alive. That also closes spawn's status pipe, so setup
+            // errors are reported through the report pipe as -errno.
+            if libc::dup2(report, 0) < 0 {
+                libc::_exit(125);
+            }
+            let send = |value: libc::pid_t| {
+                let size = std::mem::size_of_val(&value);
+                libc::write(0, (&value as *const libc::pid_t).cast(), size) == size as isize
+            };
+            let setup = close_from(1).and_then(|()| enter_new_namespaces(&maps));
+            if let Err(error) = setup {
+                send(-error.raw_os_error().unwrap_or(libc::EIO));
+                libc::_exit(125);
+            }
             libc::prctl(libc::PR_SET_NAME, c"world-holder".as_ptr());
-            let pid = libc::getpid();
-            let size = std::mem::size_of_val(&pid);
-            if libc::write(report, (&pid as *const libc::pid_t).cast(), size) != size as isize {
-                return Err(Error::last_os_error());
+            if !send(libc::getpid()) {
+                libc::_exit(125);
             }
             hold()
         });
@@ -1234,6 +1247,9 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
     std::io::Read::read_exact(&mut std::fs::File::from(read), &mut bytes)
         .context("World namespace holder did not start")?;
     let pid = libc::pid_t::from_ne_bytes(bytes);
+    if pid <= 0 {
+        return Err(Error::from_raw_os_error(-pid)).context("start World namespace holder");
+    }
     // Pin the holder before inspecting it. The holder only exits when
     // signalled, so its PID cannot have been reused yet.
     // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
