@@ -397,7 +397,6 @@ mod seccomp {
     const ARCH: u32 = 0xc000_00b7;
     const LD_W_ABS: u16 = 0x20;
     const JEQ_K: u16 = 0x15;
-    #[cfg(target_arch = "x86_64")]
     const JGE_K: u16 = 0x35;
     const RET_K: u16 = 0x06;
     const RET_KILL_PROCESS: u32 = 0x8000_0000;
@@ -413,15 +412,22 @@ mod seccomp {
     /// can create sockets without the socket system call.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub fn socket_filter() -> Result<Vec<libc::sock_filter>> {
+        // x32 system calls share the x86_64 audit architecture.
+        Ok(build(ARCH, cfg!(target_arch = "x86_64")))
+    }
+
+    /// Jump offsets are relative, so the optional x32 guard does not move
+    /// any other jump target.
+    fn build(arch: u32, x32_guard: bool) -> Vec<libc::sock_filter> {
         let mut filter = vec![
             op(LD_W_ABS, 4, 0, 0),
-            op(JEQ_K, ARCH, 1, 0),
+            op(JEQ_K, arch, 1, 0),
             op(RET_K, RET_KILL_PROCESS, 0, 0),
             op(LD_W_ABS, 0, 0, 0),
         ];
-        // x32 system calls share the x86_64 audit architecture.
-        #[cfg(target_arch = "x86_64")]
-        filter.push(op(JGE_K, 0x4000_0000, 9, 0));
+        if x32_guard {
+            filter.push(op(JGE_K, 0x4000_0000, 9, 0));
+        }
         filter.extend([
             op(JEQ_K, libc::SYS_socket as u32, 2, 0),
             op(JEQ_K, libc::SYS_io_uring_setup as u32, 7, 0),
@@ -435,7 +441,70 @@ mod seccomp {
             op(RET_K, RET_ALLOW, 0, 0),
             op(RET_K, RET_ERRNO | libc::EPERM as u32, 0, 0),
         ]);
-        Ok(filter)
+        filter
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Minimal classic-BPF evaluator for the instructions used above,
+        /// rejecting out-of-range jumps like the kernel verifier.
+        fn eval(filter: &[libc::sock_filter], arch: u32, nr: u32, arg0: u32) -> u32 {
+            let (mut pc, mut acc) = (0usize, 0u32);
+            loop {
+                let ins = filter[pc];
+                let (jt, jf) = (ins.jt as usize, ins.jf as usize);
+                pc += 1;
+                match ins.code {
+                    LD_W_ABS => {
+                        acc = match ins.k {
+                            0 => nr,
+                            4 => arch,
+                            16 => arg0,
+                            k => panic!("load {k}"),
+                        }
+                    }
+                    RET_K => return ins.k,
+                    JEQ_K | JGE_K => {
+                        let taken = if ins.code == JEQ_K {
+                            acc == ins.k
+                        } else {
+                            acc >= ins.k
+                        };
+                        pc += if taken { jt } else { jf };
+                    }
+                    code => panic!("opcode {code:#x}"),
+                }
+                assert!(pc < filter.len(), "jump beyond program end");
+            }
+        }
+
+        #[test]
+        fn filter_decisions_for_both_layouts() {
+            for x32_guard in [true, false] {
+                let filter = build(ARCH, x32_guard);
+                let socket = libc::SYS_socket as u32;
+                let eval = |arch, nr, arg0| eval(&filter, arch, nr, arg0);
+                assert_eq!(eval(ARCH ^ 1, socket, 0), RET_KILL_PROCESS);
+                for family in [libc::AF_INET, libc::AF_INET6, libc::AF_NETLINK] {
+                    assert_eq!(eval(ARCH, socket, family as u32), RET_ALLOW);
+                }
+                for family in [libc::AF_UNIX, libc::AF_VSOCK, libc::AF_PACKET] {
+                    assert_eq!(
+                        eval(ARCH, socket, family as u32),
+                        RET_ERRNO | libc::EACCES as u32
+                    );
+                }
+                let io_uring = libc::SYS_io_uring_setup as u32;
+                assert_eq!(eval(ARCH, io_uring, 0), RET_ERRNO | libc::EPERM as u32);
+                assert_eq!(eval(ARCH, libc::SYS_getpid as u32, 0), RET_ALLOW);
+                let x32 = eval(ARCH, 0x4000_0000 | socket, libc::AF_UNIX as u32);
+                if x32_guard {
+                    assert_eq!(x32, RET_ERRNO | libc::EPERM as u32);
+                }
+            }
+        }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub fn socket_filter() -> Result<Vec<libc::sock_filter>> {
