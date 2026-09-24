@@ -1167,7 +1167,28 @@ pub(crate) fn start_holder() -> Result<Holder> {
     if n != size as isize {
         bail!("World namespace holder did not start");
     }
-    Holder::observe(pid as u32)
+    // Pin the holder before inspecting it: if observing fails, stop it
+    // instead of leaving an unrecorded namespace running. The holder only
+    // exits when signalled, so its PID cannot have been reused yet.
+    // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+    // SAFETY: a non-negative result is a new descriptor we exclusively own.
+    let pidfd = (pidfd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) });
+    Holder::observe(pid as u32).inspect_err(|_| {
+        // SAFETY: signals the holder started above, by pidfd when available.
+        unsafe {
+            match &pidfd {
+                Some(fd) => {
+                    let null = std::ptr::null::<libc::siginfo_t>();
+                    let fd = fd.as_raw_fd();
+                    libc::syscall(libc::SYS_pidfd_send_signal, fd, libc::SIGKILL, null, 0u32);
+                }
+                None => {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    })
 }
 
 pub(crate) fn stop_holder(holder: &Holder) -> Result<()> {
