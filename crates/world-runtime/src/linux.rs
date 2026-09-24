@@ -569,7 +569,10 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
             p=Proxy::prepare(&options.policy)=>Some(p?),
         }
     };
-    let port: u16 = rand::thread_rng().gen_range(10000..60000);
+    // Every port is free in the new namespace; stay inside its default
+    // ephemeral range (the kernel's own choice for bind(0)), which services
+    // with fixed ports avoid, as the macOS backend's host proxy port does.
+    let port: u16 = rand::thread_rng().gen_range(32768..=60999);
     let channel = match prepared {
         None => None,
         Some(_) => {
