@@ -22,16 +22,16 @@ jobs:
         with:
           toolchain: 1.98.1
           components: rustfmt, clippy
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
-      - run: cargo build --workspace --locked && cargo build --workspace --examples --locked
       - name: Allow unprivileged user namespaces (Ubuntu AppArmor)
         if: runner.os == 'Linux'
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --workspace --locked && cargo build --workspace --examples --locked
       - run: python3 -m unittest discover -s tests -v
       - name: Native silo same-port acceptance (real macOS aliases)
         if: runner.os == 'macOS'
