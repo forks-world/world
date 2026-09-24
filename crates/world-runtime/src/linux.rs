@@ -1200,6 +1200,15 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
     let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
     let (read, write) = (above_stdio(read)?, above_stdio(write)?);
     let report = write.as_raw_fd();
+    // Parent -> holder: "pinned". The holder waits for it after reporting
+    // its PID, so it is alive (its PID not reusable) while it is pinned.
+    // SAFETY: pipe2 writes two new descriptors into fds on success.
+    check(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) })?;
+    // SAFETY: both descriptors are new and exclusively owned here.
+    let (ack_read, ack_write) =
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let (ack_read, ack_write) = (above_stdio(ack_read)?, above_stdio(ack_write)?);
+    let ack = ack_read.as_raw_fd();
     // The program is never executed: the holder stays in pre_exec forever,
     // so any embedding executable works, not only the world CLI.
     let mut cmd = std::process::Command::new("/proc/self/exe");
@@ -1223,7 +1232,7 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
             // pipe (as fd 0), so it never keeps the caller's sockets or
             // files alive. That also closes spawn's status pipe, so setup
             // errors are reported through the report pipe as -errno.
-            if libc::dup2(report, 0) < 0 {
+            if libc::dup2(report, 0) < 0 || libc::dup2(ack, 1) < 0 {
                 libc::_exit(125);
             }
             let send = |value: libc::pid_t| {
@@ -1235,7 +1244,23 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
             if !send(libc::getpid()) {
                 libc::_exit(125);
             }
-            let setup = close_from(1).and_then(|()| enter_new_namespaces(&maps));
+            // Only the report (0) and acknowledgment (1) pipes remain, so
+            // the wait below sees EOF if the caller dies before pinning.
+            if let Err(error) = close_from(2) {
+                send(-error.raw_os_error().unwrap_or(libc::EIO));
+                libc::_exit(125);
+            }
+            let mut byte = 0u8;
+            loop {
+                match libc::read(1, (&mut byte as *mut u8).cast(), 1) {
+                    1 => break,
+                    n if n < 0 && *libc::__errno_location() == libc::EINTR => {}
+                    // The caller gave up before pinning: never run unpinned.
+                    _ => libc::_exit(125),
+                }
+            }
+            libc::close(1);
+            let setup = enter_new_namespaces(&maps);
             if let Err(error) = setup {
                 send(-error.raw_os_error().unwrap_or(libc::EIO));
                 libc::_exit(125);
@@ -1252,7 +1277,7 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
     // children itself may already have done so (ECHILD); spawn returning
     // means the holder is running either way, so always read its PID.
     let _ = child.wait();
-    drop(write);
+    drop((write, ack_read));
     let mut report = std::fs::File::from(read);
     // read_exact retries EINTR and short reads.
     let mut next = || -> Result<libc::pid_t> {
@@ -1262,13 +1287,16 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
         Ok(libc::pid_t::from_ne_bytes(bytes))
     };
     let pid = next()?;
-    // Pin the holder before reading its result. It only exits by itself
-    // when setup fails (then it is a zombie until reaped), otherwise when
-    // signalled, so its PID cannot have been reused yet.
+    // Pin the holder before it continues: it is blocked waiting for the
+    // acknowledgment below, so it is alive and its PID cannot be reused.
     // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
     // SAFETY: a non-negative result is a new descriptor we exclusively own.
     let pidfd = (pidfd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) });
+    // Let the holder continue only now that it is pinned.
+    // SAFETY: writes one byte from a static buffer to an owned pipe.
+    unsafe { libc::write(ack_write.as_raw_fd(), b"p".as_ptr().cast(), 1) };
+    drop(ack_write);
     let status = next().inspect_err(|_| reap_if_child(pidfd.as_ref()))?;
     if status != 0 {
         // A subreaper caller adopted the failed holder: reap it.
