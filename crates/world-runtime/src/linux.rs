@@ -374,28 +374,17 @@ unsafe fn close_each_from(first: libc::c_int) -> IoResult<()> {
 /// pre_exec: call `f` for every open descriptor >= `first`, found through
 /// /proc/self/fd with raw getdents64 (no allocation). Unlike an
 /// RLIMIT_NOFILE bound, this sees descriptors opened before the limit was
-/// lowered. Without /proc it falls back to the larger of the rlimits. An
-/// incomplete listing is an error, never a silent success. Returns whether
-/// `f` was called at all.
+/// lowered. A listing that cannot start or is incomplete is an error,
+/// never a silent success. Returns whether `f` was called at all.
 unsafe fn for_each_open_descriptor(
     first: libc::c_int,
     mut f: impl FnMut(libc::c_int) -> IoResult<()>,
 ) -> IoResult<bool> {
     unsafe {
         let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
-        let dir = libc::open(c"/proc/self/fd".as_ptr(), flags);
-        if dir < 0 {
-            let mut limit = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            check(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit))?;
-            let bound = limit.rlim_cur.max(limit.rlim_max).min(1 << 20) as libc::c_int;
-            for fd in first..bound {
-                f(fd)?;
-            }
-            return Ok(false);
-        }
+        // No rlimit-bounded fallback: a descriptor may lie above even a
+        // lowered hard limit, so an unlistable table is an error.
+        let dir = check(libc::open(c"/proc/self/fd".as_ptr(), flags))?;
         let result = list_descriptors(dir, first, &mut f);
         libc::close(dir);
         result
