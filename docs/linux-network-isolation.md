@@ -50,7 +50,7 @@ mkdir -p /tmp/world-a /tmp/world-b
 ./target/debug/world silo exec --world A -- curl --noproxy '*' http://localhost:8080/
 ```
 
-- 在 Linux 上，`setup` 不需要 sudo：它启动一个脱离终端的 holder 进程（`world silo hold`），由它持有该 World 的 user namespace 和 network namespace。holder 的 PID、启动时间和 namespace inode 记录在状态目录的 `holders.json` 中；重复 `setup` 是幂等的。
+- 在 Linux 上，`setup` 不需要 sudo：它启动一个脱离终端的 holder 进程（进程名 `world-holder`，单线程，由 init 回收；不依赖 `world` 可执行文件，嵌入 `world_runtime` 的程序也能使用），由它持有该 World 的 user namespace 和 network namespace。holder 的 PID、启动时间和 namespace inode 记录在状态目录的 `holders.json` 中；重复 `setup` 是幂等的。
 - `exec` 校验 holder 身份后，用 `setns` 加入这两个 namespace，再执行命令。同一个 World 的多次 `exec` 共享同一个内核网络栈。不同 World 的 localhost 完全独立，都可以绑定同一地址和端口，包括 `127.0.0.1`、`0.0.0.0`、`::1`、`::`、UDP，以及 1024 以下的端口。
 - 程序形态不限：脚本、系统程序、静态链接程序和 setuid 程序都可以运行。其中 setuid 位在 namespace 中不会提升权限。注册表里的 `ip` 字段在 Linux 上只是标识，不参与网络。
 - World 内只有 loopback：宿主访问不到 World 内的监听，World 内也没有外网，客户端必须同样通过 `world silo exec` 启动。继承的 `http_proxy` 等变量指向宿主代理时，World 内同样无法连接，访问 localhost 时应设置 `no_proxy` 或使用 `--noproxy`。与 macOS silo 一样，文件系统 Unix socket 不受限制。

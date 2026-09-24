@@ -61,9 +61,6 @@ enum Silo {
         #[arg(long)]
         world: String,
     },
-    /// Internal: keeps a Linux World namespace alive.
-    #[command(hide = true)]
-    Hold,
     Exec {
         #[arg(long)]
         world: String,
@@ -83,16 +80,6 @@ fn main() {
             std::process::exit(code);
         }
     };
-    // The namespace holder keeps default signal dispositions: plain kill stops it.
-    #[cfg(target_os = "linux")]
-    if let Commands::Silo {
-        command: Silo::Hold,
-        ..
-    } = cli.command
-    {
-        // Before any runtime exists: the holder stays a single thread.
-        world_runtime::linux::hold();
-    }
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(err) => {
@@ -177,7 +164,6 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                     silo::teardown(&state, &silo::inspect(&state, &world)?)?;
                     Ok(0)
                 }
-                Silo::Hold => anyhow::bail!("hold is internal to Linux silo setup"),
                 Silo::Exec {
                     world,
                     timeout,

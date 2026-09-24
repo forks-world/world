@@ -381,6 +381,27 @@ fn resolve_executable(name: &std::ffi::OsStr, workdir: &Path) -> Result<PathBuf>
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
+    /// The library API must work from any executable, not only `world`:
+    /// this test binary would not understand a re-exec with CLI arguments.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_works_from_an_embedding_executable() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let world = create(state.path(), "embedded", work.path()).unwrap();
+        setup(state.path(), &world).unwrap();
+        let holder = holder(state.path(), "embedded").unwrap();
+        assert!(holder.verify().unwrap().is_some(), "holder did not survive setup");
+        teardown(state.path(), &world).unwrap();
+        for _ in 0..50 {
+            if holder.verify().unwrap().is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("holder still running after teardown");
+    }
+
     #[test]
     fn allocation_serializes_world_identity() {
         let state = tempfile::tempdir().unwrap();

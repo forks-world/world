@@ -1144,9 +1144,10 @@ pub(crate) fn start_holder() -> Result<Holder> {
     // SAFETY: both descriptors are new and exclusively owned here.
     let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
     let report = write.as_raw_fd();
-    let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.args(["silo", "hold"])
-        .current_dir("/")
+    // The program is never executed: the holder stays in pre_exec forever,
+    // so any embedding executable works, not only the world CLI.
+    let mut cmd = std::process::Command::new("/proc/self/exe");
+    cmd.current_dir("/")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -1156,19 +1157,20 @@ pub(crate) fn start_holder() -> Result<Holder> {
             check(libc::setsid())?;
             // Double fork: the holder is reparented to init (or a subreaper),
             // which reaps it after teardown, so a long-lived caller of setup
-            // never accumulates zombies. The holder still owns spawn's
-            // exec-status pipe, so spawn returns once it has exec'd.
+            // never accumulates zombies.
             let holder = check(libc::fork())?;
             if holder != 0 {
                 libc::_exit(0);
             }
+            // A setup error is still reported through spawn's status pipe.
             enter_new_namespaces(&maps)?;
+            libc::prctl(libc::PR_SET_NAME, c"world-holder".as_ptr());
             let pid = libc::getpid();
             let size = std::mem::size_of_val(&pid);
             if libc::write(report, (&pid as *const libc::pid_t).cast(), size) != size as isize {
                 return Err(Error::last_os_error());
             }
-            close_extra_descriptors()
+            hold()
         });
     }
     let mut child = cmd.spawn().context("start World namespace holder")?;
@@ -1247,11 +1249,21 @@ pub(crate) fn stop_holder(holder: &Holder) -> Result<()> {
     Ok(())
 }
 
-/// Body of the hidden `world silo hold` command.
-pub fn hold() -> ! {
-    loop {
-        // SAFETY: pause has no arguments.
-        unsafe { libc::pause() };
+/// pre_exec: the holder's whole life. Default signal handling (so plain
+/// kill stops it) and no descriptors: closing spawn's status pipe is what
+/// tells the caller that setup succeeded.
+unsafe fn hold() -> ! {
+    unsafe {
+        for signal in 1..libc::SIGRTMIN() {
+            libc::signal(signal, libc::SIG_DFL);
+        }
+        let mut empty = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&mut empty);
+        libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+        close_from(0);
+        loop {
+            libc::pause();
+        }
     }
 }
 

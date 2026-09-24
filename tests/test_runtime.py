@@ -845,7 +845,7 @@ class LinuxSilo(unittest.TestCase):
         pids = set()
         for entry in pathlib.Path("/proc").iterdir():
             try:
-                if entry.name.isdigit() and (entry / "cmdline").read_bytes().split(b"\0")[1:3] == [b"silo", b"hold"]:
+                if entry.name.isdigit() and (entry / "comm").read_text().strip() == "world-holder":
                     pids.add(int(entry.name))
             except OSError:
                 pass
