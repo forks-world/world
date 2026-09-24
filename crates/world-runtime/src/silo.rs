@@ -391,7 +391,10 @@ mod tests {
         let world = create(state.path(), "embedded", work.path()).unwrap();
         setup(state.path(), &world).unwrap();
         let holder = holder(state.path(), "embedded").unwrap();
-        assert!(holder.verify().unwrap().is_some(), "holder did not survive setup");
+        assert!(
+            holder.verify().unwrap().is_some(),
+            "holder did not survive setup"
+        );
         teardown(state.path(), &world).unwrap();
         for _ in 0..50 {
             if holder.verify().unwrap().is_none() {
