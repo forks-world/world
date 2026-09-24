@@ -1136,7 +1136,7 @@ impl Holder {
 }
 
 /// Start a detached process that keeps new namespaces alive.
-pub(crate) fn start_holder() -> Result<Holder> {
+pub(crate) fn start_holder() -> Result<StartedHolder> {
     let maps = IdMaps::current();
     let mut fds = [0; 2];
     // SAFETY: pipe2 writes two new descriptors into fds on success.
@@ -1176,41 +1176,62 @@ pub(crate) fn start_holder() -> Result<Holder> {
     let mut child = cmd.spawn().context("start World namespace holder")?;
     child.wait()?;
     drop(write);
-    let mut pid: libc::pid_t = 0;
-    let size = std::mem::size_of_val(&pid);
-    // SAFETY: pid is a live, writable buffer of the given size.
-    let n = unsafe {
-        libc::read(
-            read.as_raw_fd(),
-            (&mut pid as *mut libc::pid_t).cast(),
-            size,
-        )
-    };
-    if n != size as isize {
-        bail!("World namespace holder did not start");
-    }
-    // Pin the holder before inspecting it: if observing fails, stop it
-    // instead of leaving an unrecorded namespace running. The holder only
-    // exits when signalled, so its PID cannot have been reused yet.
+    let mut bytes = [0u8; std::mem::size_of::<libc::pid_t>()];
+    // read_exact retries EINTR and short reads.
+    std::io::Read::read_exact(&mut std::fs::File::from(read), &mut bytes)
+        .context("World namespace holder did not start")?;
+    let pid = libc::pid_t::from_ne_bytes(bytes);
+    // Pin the holder before inspecting it. The holder only exits when
+    // signalled, so its PID cannot have been reused yet.
     // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
     // SAFETY: a non-negative result is a new descriptor we exclusively own.
     let pidfd = (pidfd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) });
-    Holder::observe(pid as u32).inspect_err(|_| {
-        // SAFETY: signals the holder started above, by pidfd when available.
-        unsafe {
-            match &pidfd {
+    let started = |holder| StartedHolder { holder, pid, pidfd };
+    match Holder::observe(pid as u32) {
+        Ok(holder) => Ok(started(holder)),
+        Err(err) => {
+            let unrecorded = started(Holder {
+                pid: pid as u32,
+                start_time: 0,
+                user_ns: 0,
+                net_ns: 0,
+            });
+            match unrecorded.kill() {
+                Ok(()) => Err(err),
+                Err(kill) => Err(err.context(format!("could not stop holder {pid}: {kill}"))),
+            }
+        }
+    }
+}
+
+/// A holder this process just started, pinned by pidfd when available.
+pub(crate) struct StartedHolder {
+    pub holder: Holder,
+    pid: libc::pid_t,
+    pidfd: Option<OwnedFd>,
+}
+
+impl StartedHolder {
+    /// Stop the holder if it cannot be recorded. Signalling the pinned
+    /// pidfd opens nothing and reads nothing from /proc, so descriptor
+    /// pressure cannot make this fail; without pidfd (before Linux 5.3)
+    /// the PID is still ours, as the holder only exits when signalled.
+    pub(crate) fn kill(&self) -> IoResult<()> {
+        // SAFETY: plain-integer signalling; the pidfd is open when present.
+        let result = unsafe {
+            match &self.pidfd {
                 Some(fd) => {
                     let null = std::ptr::null::<libc::siginfo_t>();
                     let fd = fd.as_raw_fd();
-                    libc::syscall(libc::SYS_pidfd_send_signal, fd, libc::SIGKILL, null, 0u32);
+                    libc::syscall(libc::SYS_pidfd_send_signal, fd, libc::SIGKILL, null, 0u32)
+                        as libc::c_int
                 }
-                None => {
-                    libc::kill(pid, libc::SIGKILL);
-                }
+                None => libc::kill(self.pid, libc::SIGKILL),
             }
-        }
-    })
+        };
+        check(result).map(|_| ())
+    }
 }
 
 pub(crate) fn stop_holder(holder: &Holder) -> Result<()> {

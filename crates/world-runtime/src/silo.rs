@@ -144,11 +144,14 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
                 return Ok(());
             }
         }
-        let holder = crate::linux::start_holder()?;
-        holders.insert(world.id.clone(), holder);
+        let started = crate::linux::start_holder()?;
+        holders.insert(world.id.clone(), started.holder);
         if let Err(err) = persist(state, "holders.json", &holders) {
             // An unrecorded holder could never be torn down or reused.
-            let _ = crate::linux::stop_holder(&holder);
+            if let Err(kill) = started.kill() {
+                let pid = started.holder.pid;
+                return Err(err.context(format!("could not stop unrecorded holder {pid}: {kill}")));
+            }
             return Err(err);
         }
         Ok(())
