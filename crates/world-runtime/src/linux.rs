@@ -207,6 +207,34 @@ pub(crate) unsafe fn join_namespaces(user: RawFd, net: RawFd) -> IoResult<()> {
     Ok(())
 }
 
+/// pre_exec: the workload gets no capabilities, even when the caller is
+/// root and therefore maps to UID 0 inside the user namespace. Root's
+/// automatic capabilities are disabled and locked, ambient capabilities
+/// cleared and the bounding set emptied, so exec yields an empty set.
+pub(crate) unsafe fn drop_capabilities() -> IoResult<()> {
+    const SECBIT_NOROOT: libc::c_ulong = 1 << 0;
+    const SECBIT_NOROOT_LOCKED: libc::c_ulong = 1 << 1;
+    unsafe {
+        check(libc::prctl(
+            libc::PR_SET_SECUREBITS,
+            SECBIT_NOROOT | SECBIT_NOROOT_LOCKED,
+        ))?;
+        check(libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        ))?;
+        let mut cap = 0;
+        while libc::prctl(libc::PR_CAPBSET_READ, cap) >= 0 {
+            check(libc::prctl(libc::PR_CAPBSET_DROP, cap))?;
+            cap += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Exit like the child whose wait status is `status`. A namespace init
 /// cannot signal itself, so it falls back to the shell convention 128+n.
 unsafe fn relay_exit(status: libc::c_int) -> ! {
@@ -782,6 +810,7 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
             close_extra_descriptors()?;
             check(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))?;
             landlock::restrict_self(ruleset_fd)?;
+            drop_capabilities()?;
             seccomp::install(&filter)?;
             enter_pid_namespace()
         });

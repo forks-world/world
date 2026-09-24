@@ -186,6 +186,17 @@ print("stolen" if got >= 0 else os.strerror(ctypes.get_errno()))
         # the ptrace access check (EPERM) even when it is addressable.
         self.assertIn(result.stdout.strip(), [os.strerror(1), os.strerror(3)], result.stderr)
 
+    @unittest.skipUnless(LINUX, "user namespaces require Linux")
+    def test_workload_has_no_capabilities_even_for_root(self):
+        script = "grep -E '^Cap(Prm|Eff|Bnd|Amb)' /proc/self/status | cut -f2 | sort -u; mount -o remount,rw / 2>/dev/null"
+        # `unshare -r` makes the caller UID 0, as when root runs world.
+        for prefix in [[], ["unshare", "-r"]]:
+            with self.subTest(prefix=prefix):
+                result = run(*prefix, WORLD, "network", "exec", "--policy", self.policy,
+                             "--workdir", self.dir, "--", "/bin/sh", "-c", script)
+                self.assertNotEqual(result.returncode, 0, "remount must fail")
+                self.assertEqual(result.stdout, "0000000000000000\n", result.stderr)
+
     @unittest.skipUnless(LINUX, "PID namespaces require Linux")
     def test_escaped_descendants_are_killed(self):
         self.assertEqual(self.network("/bin/sh", "-c", "kill -9 $$").returncode, 137)
