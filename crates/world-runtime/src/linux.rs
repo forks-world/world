@@ -47,6 +47,24 @@ pub(crate) fn above_stdio(fd: OwnedFd) -> IoResult<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(moved) })
 }
 
+/// pidfd_open, moved above stdio when possible: with a closed stdio slot
+/// the kernel returns 0-2, where a concurrent caller could pin it as its
+/// stdin or dup2 over it. If moving fails, the low descriptor still works.
+fn open_pidfd(pid: libc::pid_t) -> IoResult<OwnedFd> {
+    // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
+    let fd = check(unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) } as RawFd)?;
+    // SAFETY: the kernel returned a new descriptor we exclusively own.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    if fd.as_raw_fd() > 2 {
+        return Ok(fd);
+    }
+    // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor we exclusively own.
+    match unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) } {
+        moved if moved >= 0 => Ok(unsafe { OwnedFd::from_raw_fd(moved) }),
+        _ => Ok(fd),
+    }
+}
+
 /// Maps the caller's own uid/gid into a new user namespace.
 pub(crate) struct IdMaps {
     uid: Vec<u8>,
@@ -1306,7 +1324,12 @@ pub(crate) fn spawn(mut spec: Spawn) -> Result<RawChild> {
                     break;
                 }
             }
-            report(if denied && try_next_candidate(last) { libc::EACCES } else { last })
+            let error = if denied && try_next_candidate(last) {
+                libc::EACCES
+            } else {
+                last
+            };
+            report(error)
         }
     }
     // SAFETY: restores this thread's own previous mask.
@@ -1322,11 +1345,7 @@ pub(crate) fn spawn(mut spec: Spawn) -> Result<RawChild> {
         stderr: None,
     };
     drop((stdin, out_write, err_write, status_write));
-    // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
-    let raw_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
-    if raw_pidfd >= 0 {
-        // SAFETY: a new descriptor we exclusively own.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw_pidfd as RawFd) };
+    if let Ok(fd) = open_pidfd(pid) {
         child.pidfd = Some(tokio::io::unix::AsyncFd::new(fd)?);
     }
     // Closed on exec (CLOEXEC; setup wrappers close theirs): EOF means the
@@ -1693,19 +1712,14 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
     let pid = next()?;
     // Pin the holder before it continues: it is blocked waiting for the
     // acknowledgment below, so it is alive and its PID cannot be reused.
-    // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
-    if pidfd < 0 {
-        let error = Error::last_os_error();
+    let pidfd = match open_pidfd(pid) {
+        Ok(fd) => Some(fd),
         // Only a kernel without pidfds (before 5.3) may go on unpinned, as
         // teardown then does too. On any other failure, return without the
         // acknowledgment: the holder sees EOF and exits before setup.
-        if error.raw_os_error() != Some(libc::ENOSYS) {
-            return Err(error).context("pin World namespace holder");
-        }
-    }
-    // SAFETY: a non-negative result is a new descriptor we exclusively own.
-    let pidfd = (pidfd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) });
+        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => None,
+        Err(error) => return Err(error).context("pin World namespace holder"),
+    };
     // Let the holder continue only now that it is pinned. If that fails,
     // closing the pipe makes the waiting holder exit before any setup.
     if let Err(error) = send_byte(&ack_write, b'p') {
@@ -1771,13 +1785,9 @@ fn reap_if_child(pidfd: Option<&OwnedFd>) {
 /// the identity before waitid(P_PIDFD) reaps it without blocking. A
 /// reused PID fails the start-time check and nothing is reaped.
 pub(crate) fn reap_stale_holder(holder: &Holder) {
-    // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, holder.pid as libc::pid_t, 0u32) };
-    if fd < 0 {
+    let Ok(pidfd) = open_pidfd(holder.pid as libc::pid_t) else {
         return;
-    }
-    // SAFETY: the kernel returned a new descriptor we exclusively own.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+    };
     if start_time(holder.pid).ok() != Some(holder.start_time) {
         return;
     }
@@ -1858,23 +1868,21 @@ impl StartedHolder {
 pub(crate) fn stop_holder(holder: &Holder) -> Result<()> {
     // Pin the process first, then verify it: the signal cannot reach a
     // process that reused the PID after verification.
-    // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, holder.pid as libc::pid_t, 0u32) };
-    if pidfd < 0 {
-        let error = Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ENOSYS) {
+    let pidfd = match open_pidfd(holder.pid as libc::pid_t) {
+        Ok(fd) => fd,
+        Err(error) if error.raw_os_error() != Some(libc::ENOSYS) => {
             return Err(error).context("open holder pidfd");
         }
-        // Before Linux 5.3: verify, then signal by PID. Only a PID reused
-        // between these two calls could be hit.
-        let _namespaces = holder.open()?;
-        // SAFETY: kill takes plain integers.
-        check(unsafe { libc::kill(holder.pid as libc::pid_t, libc::SIGKILL) })?;
-        reap_if_child(None);
-        return Ok(());
-    }
-    // SAFETY: the kernel returned a new descriptor we exclusively own.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
+        Err(_) => {
+            // Before Linux 5.3: verify, then signal by PID. Only a PID
+            // reused between these two calls could be hit.
+            let _namespaces = holder.open()?;
+            // SAFETY: kill takes plain integers.
+            check(unsafe { libc::kill(holder.pid as libc::pid_t, libc::SIGKILL) })?;
+            reap_if_child(None);
+            return Ok(());
+        }
+    };
     let _namespaces = holder.open()?;
     // SAFETY: pidfd is open; no siginfo is passed.
     let result = unsafe {
