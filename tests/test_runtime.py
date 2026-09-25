@@ -828,6 +828,30 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
             self.assertEqual(result.returncode, 125)
             self.assertIn("must not be under /tmp or /var/tmp", result.stderr)
 
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_workspace_records_the_creating_home_and_reuses_it(self):
+        # sun_path is 104 bytes: keep both homes short, like self.short.
+        h1 = pathlib.Path(os.path.realpath(pathlib.Path(self.short.name) / "h1"))
+        h2 = pathlib.Path(os.path.realpath(pathlib.Path(self.short.name) / "h2"))
+        h1.mkdir()
+        h2.mkdir()
+        state = self.dir / "state"
+        work = self.dir / "work"
+        work.mkdir()
+        result = run(WORLD, "workspace", "--state-dir", state, "create", "X", "--workdir", work,
+                     env=dict(os.environ, HOME=str(h1)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        created = json.loads(result.stdout)
+        expected = f"{h1}/.world/tmp/{created['ip']}"
+        self.assertEqual(created["temp_root"], expected)
+
+        # A later `show` from a process with a different HOME must report
+        # the same, already-recorded temp root, not one under h2.
+        result = run(WORLD, "workspace", "--state-dir", state, "show", "X",
+                     env=dict(os.environ, HOME=str(h2)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["temp_root"], expected)
+
     @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_slow_output_consumer_does_not_lose_tail(self):
         for destination in ["stdout", "stderr"]:
@@ -918,7 +942,7 @@ class Silo(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         for world in cls.worlds.values():
-            shutil.rmtree(pathlib.Path.home() / ".world/tmp" / world["ip"], ignore_errors=True)
+            shutil.rmtree(pathlib.Path(world["temp_root"]), ignore_errors=True)
             subprocess.run(["sudo", "-n", "/sbin/ifconfig", "lo0", "-alias", world["ip"]], check=True, timeout=10)
         cls.temp.cleanup()
 
@@ -992,7 +1016,7 @@ class Silo(unittest.TestCase):
 
     def test_main_executable_below_temp_uses_workspace_root(self):
         n = f"wt-{uuid.uuid4().hex[:8]}"
-        root = pathlib.Path.home() / ".world/tmp" / self.worlds["A"]["ip"]
+        root = pathlib.Path(self.worlds["A"]["temp_root"])
         # An exec must have run at least once for the workspace root to exist.
         result = run(*self.command("A", "fd", "999"))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1052,13 +1076,24 @@ class Silo(unittest.TestCase):
         with serving(self.command("A", "temp-hold", path)):
             with serving(self.command("B", "temp-hold", path)):
                 for name, world in self.worlds.items():
-                    root = pathlib.Path.home() / ".world/tmp" / world["ip"]
+                    root = pathlib.Path(world["temp_root"])
                     self.assertTrue((root / path.removeprefix("/")).with_suffix(".sock").exists(), name)
         self.assertFalse(os.path.lexists(os.path.dirname(path)))
         result = run(*self.command("A", "temp-suite", f"wt-{uuid.uuid4().hex[:8]}"))
         self.assertEqual(result.returncode, 0, result.stderr)
         tmpdir = json.loads(result.stdout)["tmpdir"]
-        self.assertEqual(tmpdir, str(pathlib.Path.home().resolve() / ".world/tmp" / self.worlds["A"]["ip"] / "tmp") + "/")
+        self.assertEqual(tmpdir, self.worlds["A"]["temp_root"] + "/tmp/")
+
+    def test_exec_with_another_home_uses_the_recorded_temp_root(self):
+        # `world exec`'s own HOME must be irrelevant once a temp root is
+        # already recorded: it is never recomputed from the current HOME.
+        other_home = self.root / "otherhome"
+        other_home.mkdir(exist_ok=True)
+        result = run(*self.command("A", "temp-suite", f"wt-{uuid.uuid4().hex[:8]}"),
+                     env=dict(os.environ, HOME=str(other_home)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tmpdir = json.loads(result.stdout)["tmpdir"]
+        self.assertEqual(tmpdir, self.worlds["A"]["temp_root"] + "/tmp/")
 
     def test_udp_disconnect_uses_kernel_semantics(self):
         baseline = run(PROBE, "udp-disconnect", "127.0.0.1:12345")

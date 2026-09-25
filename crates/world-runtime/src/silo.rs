@@ -3,7 +3,7 @@
 //! sandbox). On Linux: a per-World kernel network namespace.
 //! Neither is a forkfs lifecycle implementation.
 use crate::run;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -26,6 +26,13 @@ pub struct World {
     pub id: String,
     pub ip: Ipv4Addr,
     pub workdir: PathBuf,
+    /// `home/.world/tmp/<ip>`, fixed at `create` time from that process's
+    /// `HOME` and persisted here so later executions -- possibly from a
+    /// process with a different `HOME` -- keep sharing the same directory.
+    /// `None` only for entries a pre-recording build of `world` created;
+    /// `get` fills it in on first access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_root: Option<PathBuf>,
 }
 
 pub fn default_state_dir() -> Result<PathBuf> {
@@ -64,7 +71,25 @@ fn persist<T: Serialize>(state: &Path, name: &str, value: &T) -> Result<()> {
     Ok(())
 }
 
+fn save(state: &Path, worlds: &BTreeMap<String, World>) -> Result<()> {
+    persist(state, "registry.json", worlds)
+}
+
 pub fn create(state: &Path, id: &str, workdir: &Path) -> Result<World> {
+    create_in(state, id, workdir, host_home)
+}
+
+/// `home` is taken as a callback, rather than read from the environment,
+/// so tests can exercise creation under a chosen `HOME` without mutating
+/// global process state; it is only invoked when a temp root actually needs
+/// computing (a brand-new entry, or filling in a legacy one), never for an
+/// already-recorded entry.
+fn create_in(
+    state: &Path,
+    id: &str,
+    workdir: &Path,
+    home: impl FnOnce() -> Result<PathBuf>,
+) -> Result<World> {
     supported()?;
     if id.is_empty() || id.len() > 128 || id.contains(['\0', '\r', '\n']) {
         bail!("invalid workspace ID");
@@ -77,7 +102,15 @@ pub fn create(state: &Path, id: &str, workdir: &Path) -> Result<World> {
         if world.workdir != workdir {
             bail!("workspace already belongs to another workdir");
         }
-        return Ok(world.clone());
+        // Never recompute a stored root from the current process's HOME:
+        // only a legacy entry (predating this field) still has none.
+        let mut world = world.clone();
+        if cfg!(target_os = "macos") && world.temp_root.is_none() {
+            world.temp_root = Some(root_for(&home()?, world.ip));
+            worlds.insert(id.into(), world.clone());
+            save(state, &worlds)?;
+        }
+        return Ok(world);
     }
     let used: std::collections::HashSet<_> = worlds.values().map(|w| w.ip).collect();
     let ip = (1..=65534u32)
@@ -90,9 +123,15 @@ pub fn create(state: &Path, id: &str, workdir: &Path) -> Result<World> {
         id: id.into(),
         ip,
         workdir,
+        // Only macOS redirects /tmp; Linux records no temp root.
+        temp_root: if cfg!(target_os = "macos") {
+            Some(root_for(&home()?, ip))
+        } else {
+            None
+        },
     };
     worlds.insert(id.into(), world.clone());
-    persist(state, "registry.json", &worlds)?;
+    save(state, &worlds)?;
     Ok(world)
 }
 
@@ -112,13 +151,41 @@ fn read_map<T: serde::de::DeserializeOwned>(
 }
 
 pub fn get(state: &Path, id: &str) -> Result<World> {
-    let world = registry(state)?
-        .remove(id)
-        .context("unknown workspace; run world workspace create first")?;
+    get_in(state, id, host_home)
+}
+
+fn valid(world: &World, id: &str) -> Result<()> {
     if world.id != id || world.ip.octets()[..2] != [127, 77] {
         bail!("invalid workspace registry entry");
     }
-    Ok(world)
+    Ok(())
+}
+
+/// `home` is only invoked for a legacy entry (one predating the `temp_root`
+/// field) that still needs one filled in; a registry that already records a
+/// temp root never calls it.
+fn get_in(state: &Path, id: &str, home: impl FnOnce() -> Result<PathBuf>) -> Result<World> {
+    let world = registry(state)?
+        .remove(id)
+        .context("unknown workspace; run world workspace create first")?;
+    valid(&world, id)?;
+    if !cfg!(target_os = "macos") || world.temp_root.is_some() {
+        return Ok(world);
+    }
+    // Legacy entry: fill in the temp root under lock, re-reading first in
+    // case another process already did.
+    let _lock = lock(state)?;
+    let mut worlds = registry(state)?;
+    let mut stored = worlds
+        .remove(id)
+        .context("unknown workspace; run world workspace create first")?;
+    valid(&stored, id)?;
+    if cfg!(target_os = "macos") && stored.temp_root.is_none() {
+        stored.temp_root = Some(root_for(&home()?, stored.ip));
+        worlds.insert(id.into(), stored.clone());
+        save(state, &worlds)?;
+    }
+    Ok(stored)
 }
 
 /// Host temp directories every process shares; `world exec` redirects them.
@@ -133,16 +200,76 @@ fn reject_shared_temp(path: &Path, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Per-workspace replacement for /tmp and /var/tmp, shared by all executions
-/// of the workspace. It must not be below a host temp directory, or its own
-/// path would be redirected. Keyed by the loopback address, which is already
-/// host-global, and kept short: Unix socket names are limited to 104 bytes.
-pub fn temp_root(world: &World) -> Result<PathBuf> {
+/// Canonical `HOME` of the process running `world`, rejecting one below a
+/// host temp directory (where the workspace's own temp tree would end up
+/// redirected right back into itself).
+fn host_home() -> Result<PathBuf> {
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is required")?)
         .canonicalize()
         .context("HOME")?;
     reject_shared_temp(&home, "HOME")?;
-    temp_root_in(&home, world.ip)
+    Ok(home)
+}
+
+/// Where a workspace's temp tree lives under `home`. Pure and cheap: it
+/// performs no I/O and is used both to compute a fresh root and to validate
+/// one already recorded in the registry.
+fn root_for(home: &Path, ip: Ipv4Addr) -> PathBuf {
+    home.join(".world/tmp").join(ip.to_string())
+}
+
+/// Per-workspace replacement for /tmp and /var/tmp, shared by all executions
+/// of the workspace. It must not be below a host temp directory, or its own
+/// path would be redirected. Keyed by the loopback address, which is already
+/// host-global, and kept short: Unix socket names are limited to 104 bytes.
+///
+/// The root itself is *not* derived from the calling process's `HOME`: it was
+/// fixed once, in `world.temp_root`, when the workspace was created (or, for
+/// a legacy entry, on first access afterward), so executions from a process
+/// with a different `HOME` still land in the same tree instead of getting
+/// their own. This only rebuilds/hardens it under the home that root implies.
+pub fn temp_root(world: &World) -> Result<PathBuf> {
+    let root = world
+        .temp_root
+        .as_deref()
+        .context("workspace has no temp root")?;
+    let ip_name = world.ip.to_string();
+    let shape_ok = root.is_absolute()
+        && !root.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+        && root.file_name() == Some(std::ffi::OsStr::new(&ip_name))
+        && root.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("tmp"))
+        && root
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            == Some(std::ffi::OsStr::new(".world"));
+    if !shape_ok {
+        bail!(
+            "workspace temp root has an unexpected shape: {}",
+            root.display()
+        );
+    }
+    let home = root
+        .ancestors()
+        .nth(3)
+        .context("workspace temp root is too shallow")?;
+    reject_shared_temp(home, "workspace temp root")?;
+    let got = temp_root_in(home, world.ip).with_context(|| {
+        format!(
+            "workspace temp root {} is unavailable (fixed when the workspace was created)",
+            root.display()
+        )
+    })?;
+    ensure!(
+        got == root,
+        "workspace temp root resolved to an unexpected location"
+    );
+    Ok(got)
 }
 
 /// Open (creating if absent) a single path component below `parent`, never
@@ -247,10 +374,10 @@ fn temp_root_in(home: &Path, ip: Ipv4Addr) -> Result<PathBuf> {
     // SAFETY: `home_fd` was just returned by `open` above.
     let home_fd = unsafe { OwnedFd::from_raw_fd(home_fd) };
 
-    let world_fd = step(&home_fd, ".world", 0o700, "~/.world")?;
-    require_private(&world_fd, "~/.world")?;
-    let tmp_root_fd = step(&world_fd, "tmp", 0o700, "~/.world/tmp")?;
-    require_private(&tmp_root_fd, "~/.world/tmp")?;
+    let world_fd = step(&home_fd, ".world", 0o700, "temp root .world")?;
+    require_private(&world_fd, "temp root .world")?;
+    let tmp_root_fd = step(&world_fd, "tmp", 0o700, "temp root .world/tmp")?;
+    require_private(&tmp_root_fd, "temp root .world/tmp")?;
 
     let ip_name = ip.to_string();
     let ip_fd = step(&tmp_root_fd, &ip_name, 0o700, "workspace temp root")?;
@@ -374,6 +501,197 @@ mod temp_root_tests {
         let err = temp_root_in(&home, ip()).unwrap_err();
         assert!(err.to_string().contains("group or other"), "{err}");
         assert_eq!(mode(&world_dir), 0o770);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod registry_tests {
+    use super::*;
+
+    fn home() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        (dir, home)
+    }
+
+    fn fixed(home: PathBuf) -> impl FnOnce() -> Result<PathBuf> {
+        move || Ok(home)
+    }
+
+    /// A `home` callback that fails the test if it is ever invoked: used
+    /// where the registry already has a recorded temp root, which must be
+    /// returned without recomputing it.
+    fn unreachable_home() -> Result<PathBuf> {
+        panic!("a registry with a recorded temp root must never call home()");
+    }
+
+    #[test]
+    fn create_in_stores_the_root_for_the_creating_home() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let (_h, home) = home();
+        let world = create_in(state.path(), "A", work.path(), fixed(home.clone())).unwrap();
+        assert_eq!(world.temp_root, Some(root_for(&home, world.ip)));
+    }
+
+    #[test]
+    fn create_in_keeps_the_stored_root_across_different_homes() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let (_h1, home1) = home();
+        let (_h2, _home2) = home();
+        let first = create_in(state.path(), "A", work.path(), fixed(home1.clone())).unwrap();
+        // A second create for the same id+workdir must never recompute the
+        // root from `home`, so a `home` that panics if called still passes.
+        let second = create_in(state.path(), "A", work.path(), unreachable_home).unwrap();
+        assert_eq!(second.temp_root, first.temp_root);
+        assert_eq!(first.temp_root, Some(root_for(&home1, first.ip)));
+    }
+
+    #[test]
+    fn get_in_fills_and_persists_a_legacy_entry_once() {
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(state.path()).unwrap();
+        let legacy = serde_json::json!({
+            "A": {"id": "A", "ip": "127.77.0.9", "workdir": "/tmp/nonexistent"},
+        });
+        std::fs::write(
+            state.path().join("registry.json"),
+            serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        let (_h1, home1) = home();
+        let filled = get_in(state.path(), "A", fixed(home1.clone())).unwrap();
+        let expected = root_for(&home1, filled.ip);
+        assert_eq!(filled.temp_root, Some(expected.clone()));
+        let raw = std::fs::read_to_string(state.path().join("registry.json")).unwrap();
+        assert!(raw.contains(expected.to_str().unwrap()), "{raw}");
+
+        // Already filled: a `home` that panics if called still passes.
+        let again = get_in(state.path(), "A", unreachable_home).unwrap();
+        assert_eq!(again.temp_root, Some(expected));
+    }
+
+    #[test]
+    fn temp_root_builds_the_tree_for_a_stored_root() {
+        let (_h, home) = home();
+        let ip = Ipv4Addr::new(127, 77, 0, 5);
+        let world = World {
+            id: "A".into(),
+            ip,
+            workdir: home.clone(),
+            temp_root: Some(root_for(&home, ip)),
+        };
+        let root = temp_root(&world).unwrap();
+        assert_eq!(root, root_for(&home, ip));
+        assert!(root.join("tmp").is_dir());
+        assert!(root.join("var/tmp").is_dir());
+    }
+
+    #[test]
+    fn temp_root_rejects_a_mismatched_ip_name() {
+        let (_h, home) = home();
+        let ip = Ipv4Addr::new(127, 77, 0, 5);
+        let world = World {
+            id: "A".into(),
+            ip,
+            workdir: home.clone(),
+            temp_root: Some(home.join(".world/tmp").join("127.77.0.6")),
+        };
+        let err = temp_root(&world).unwrap_err();
+        assert!(err.to_string().contains("unexpected shape"), "{err}");
+    }
+
+    #[test]
+    fn temp_root_rejects_a_root_missing_the_dot_world_tmp_structure() {
+        let (_h, home) = home();
+        let ip = Ipv4Addr::new(127, 77, 0, 5);
+        let mut world = World {
+            id: "A".into(),
+            ip,
+            workdir: home.clone(),
+            temp_root: Some(home.join("elsewhere").join(ip.to_string())),
+        };
+        assert!(
+            temp_root(&world)
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected shape")
+        );
+        world.temp_root = Some(home.join("other/tmp").join(ip.to_string()));
+        assert!(
+            temp_root(&world)
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected shape")
+        );
+    }
+
+    #[test]
+    fn temp_root_rejects_a_relative_root() {
+        let ip = Ipv4Addr::new(127, 77, 0, 5);
+        let world = World {
+            id: "A".into(),
+            ip,
+            workdir: PathBuf::from("."),
+            temp_root: Some(PathBuf::from(".world/tmp").join(ip.to_string())),
+        };
+        let err = temp_root(&world).unwrap_err();
+        assert!(err.to_string().contains("unexpected shape"), "{err}");
+    }
+
+    #[test]
+    fn temp_root_rejects_a_root_containing_dotdot() {
+        let (_h, home) = home();
+        let ip = Ipv4Addr::new(127, 77, 0, 5);
+        let world = World {
+            id: "A".into(),
+            ip,
+            workdir: home.clone(),
+            temp_root: Some(home.join(".world/tmp/../tmp").join(ip.to_string())),
+        };
+        let err = temp_root(&world).unwrap_err();
+        assert!(err.to_string().contains("unexpected shape"), "{err}");
+    }
+
+    #[test]
+    fn temp_root_rejects_a_root_under_a_host_temp_directory() {
+        let ip = Ipv4Addr::new(127, 77, 0, 5);
+        let world = World {
+            id: "A".into(),
+            ip,
+            workdir: PathBuf::from("/private/tmp/x"),
+            temp_root: Some(PathBuf::from("/private/tmp/x/.world/tmp").join(ip.to_string())),
+        };
+        let err = temp_root(&world).unwrap_err();
+        assert!(err.to_string().contains("must not be under"), "{err}");
+    }
+
+    #[test]
+    fn temp_root_reports_a_deleted_home_as_unavailable() {
+        let (dir, home) = home();
+        let ip = Ipv4Addr::new(127, 77, 0, 5);
+        let world = World {
+            id: "A".into(),
+            ip,
+            workdir: home.clone(),
+            temp_root: Some(root_for(&home, ip)),
+        };
+        drop(dir);
+        let err = temp_root(&world).unwrap_err();
+        assert!(err.to_string().contains("unavailable"), "{err}");
+    }
+
+    #[test]
+    fn unknown_field_is_still_rejected() {
+        let json = serde_json::json!({
+            "id": "A",
+            "ip": "127.77.0.1",
+            "workdir": "/some/dir",
+            "bogus": true,
+        });
+        let err = serde_json::from_value::<World>(json).unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err}");
     }
 }
 
