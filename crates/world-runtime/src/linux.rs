@@ -1051,6 +1051,20 @@ fn wait_status(info: &libc::siginfo_t) -> std::process::ExitStatus {
     })
 }
 
+/// Block until the child has exited, leaving it unreaped (a zombie).
+fn wait_exited(pid: libc::pid_t) -> IoResult<()> {
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    let flags = libc::WEXITED | libc::WNOWAIT;
+    // SAFETY: info is a live siginfo_t; pid is our unreaped child.
+    while unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) } < 0 {
+        let error = Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 impl RawChild {
     pub(crate) async fn wait(&mut self) -> IoResult<std::process::ExitStatus> {
         const P_PIDFD: libc::idtype_t = 3;
@@ -1076,25 +1090,30 @@ impl RawChild {
                 ready.clear_ready();
             }
         }
+        // Without a pidfd, a thread waits for the exit but leaves the zombie
+        // (WNOWAIT): if this future is cancelled, the detached thread cannot
+        // reap the child, so its PID stays ours until this side reaps it.
         let pid = self.pid;
-        let status = tokio::task::spawn_blocking(move || {
-            let mut status = 0;
-            loop {
-                // SAFETY: status is a live int; pid is our unreaped child.
-                if unsafe { libc::waitpid(pid, &mut status, 0) } >= 0 {
-                    return Ok(status);
-                }
-                let error = Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            }
-        })
-        .await
-        .map_err(Error::other)??;
-        self.reaped = true;
+        tokio::task::spawn_blocking(move || wait_exited(pid))
+            .await
+            .map_err(Error::other)??;
+        let status = self.reap()?;
         use std::os::unix::process::ExitStatusExt;
         Ok(std::process::ExitStatus::from_raw(status))
+    }
+
+    /// Reap the child (blocking until it exits) and return its raw status.
+    fn reap(&mut self) -> IoResult<i32> {
+        let mut status = 0;
+        // SAFETY: status is a live int; pid is our unreaped child.
+        while unsafe { libc::waitpid(self.pid, &mut status, 0) } < 0 {
+            let error = Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        self.reaped = true;
+        Ok(status)
     }
 
     pub(crate) fn kill(&self) {
@@ -1118,11 +1137,7 @@ impl Drop for RawChild {
     fn drop(&mut self) {
         if !self.reaped {
             self.kill();
-            let mut status = 0;
-            // SAFETY: status is a live int; pid is our unreaped child.
-            while unsafe { libc::waitpid(self.pid, &mut status, 0) } < 0
-                && Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-            {}
+            let _ = self.reap();
         }
     }
 }
@@ -1271,27 +1286,32 @@ pub(crate) fn spawn(mut spec: Spawn) -> Result<RawChild> {
     // SAFETY: restores this thread's own previous mask.
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) };
     let pid = check(pid).context("start workload")?;
+    // Own the child before anything else can fail: dropping it kills and
+    // reaps, so no early return leaves the workload unsupervised.
+    let mut child = RawChild {
+        pid,
+        pidfd: None,
+        reaped: false,
+        stdout: None,
+        stderr: None,
+    };
     drop((stdin, out_write, err_write, status_write));
+    // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
+    let raw_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+    if raw_pidfd >= 0 {
+        // SAFETY: a new descriptor we exclusively own.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_pidfd as RawFd) };
+        child.pidfd = Some(tokio::io::unix::AsyncFd::new(fd)?);
+    }
     // Closed on exec (CLOEXEC; setup wrappers close theirs): EOF means the
     // workload is running, four bytes are the errno of a failed setup/exec.
     let mut bytes = [0u8; 4];
     let mut status = std::fs::File::from(status_read);
-    let read = std::io::Read::read(&mut status, &mut bytes).context("start workload")?;
-    // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
-    let raw_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
-    let pidfd = if raw_pidfd >= 0 {
-        // SAFETY: a new descriptor we exclusively own.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw_pidfd as RawFd) };
-        Some(tokio::io::unix::AsyncFd::new(fd)?)
-    } else {
-        None
-    };
-    let mut child = RawChild {
-        pid,
-        pidfd,
-        reaped: false,
-        stdout: None,
-        stderr: None,
+    let read = loop {
+        match std::io::Read::read(&mut status, &mut bytes) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => break result.context("start workload")?,
+        }
     };
     if read != 0 {
         // Dropping the child reaps it.
@@ -1358,7 +1378,10 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
         }
     };
     let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = vec![
-        ("PATH".into(), "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".into()),
+        (
+            "PATH".into(),
+            "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".into(),
+        ),
         ("HOME".into(), temp_path.clone().into()),
         ("TMPDIR".into(), temp_path.clone().into()),
         ("PWD".into(), dir.clone().into()),
@@ -1894,6 +1917,34 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         panic!("uncommitted holder is still running");
+    }
+
+    /// Without a pidfd, a cancelled wait must not let its detached thread
+    /// reap the child: the PID stays ours until the owner collects it.
+    #[test]
+    fn cancelled_fallback_wait_leaves_the_child_to_its_owner() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut child = super::spawn(super::Spawn {
+                program: "sleep".into(),
+                args: vec!["0.3".into()],
+                cwd: "/".into(),
+                env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+                stdin: None,
+                setup: Box::new(|| Ok(())),
+            })
+            .unwrap();
+            child.pidfd = None;
+            let short = std::time::Duration::from_millis(50);
+            assert!(tokio::time::timeout(short, child.wait()).await.is_err());
+            // The detached waiter sees the exit but leaves a zombie.
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            assert!(!child.reaped);
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", child.pid)).unwrap();
+            assert!(stat.rsplit_once(')').unwrap().1.trim_start().starts_with('Z'));
+            assert!(child.wait().await.unwrap().success());
+            assert!(child.reaped);
+        });
     }
 
     #[test]

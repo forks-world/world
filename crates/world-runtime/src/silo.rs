@@ -264,8 +264,9 @@ async fn linux_exec(
         crate::linux::above_stdio(net)?,
     );
     let (user_fd, net_fd) = (user.as_raw_fd(), net.as_raw_fd());
-    let mut env: Vec<(OsString, OsString)> =
-        std::env::vars_os().filter(|(key, _)| key != "WORLD_ID").collect();
+    let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
+        .filter(|(key, _)| key != "WORLD_ID")
+        .collect();
     env.push(("WORLD_ID".into(), world.id.clone().into()));
     let setup = move || -> std::io::Result<()> {
         // SAFETY: raw system calls on open descriptors (see linux::Spawn).
