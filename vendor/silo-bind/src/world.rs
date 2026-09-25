@@ -40,11 +40,17 @@ pub unsafe fn address_allowed(
         }
     };
     let allowed = match unsafe { (*addr).sa_family as i32 } {
+        // `addr` is caller memory of only the checked size, not necessarily
+        // aligned for these structs: read unaligned rather than through a
+        // place reference to the whole (possibly wider, possibly misaligned)
+        // type.
         libc::AF_INET if (len as usize) >= std::mem::size_of::<libc::sockaddr_in>() => {
-            check(unsafe { (*(addr as *const libc::sockaddr_in)).sin_addr.s_addr })
+            let sin = unsafe { std::ptr::read_unaligned(addr as *const libc::sockaddr_in) };
+            check(sin.sin_addr.s_addr)
         }
         libc::AF_INET6 if (len as usize) >= std::mem::size_of::<libc::sockaddr_in6>() => {
-            let bytes = unsafe { (*(addr as *const libc::sockaddr_in6)).sin6_addr.s6_addr };
+            let sin6 = unsafe { std::ptr::read_unaligned(addr as *const libc::sockaddr_in6) };
+            let bytes = sin6.sin6_addr.s6_addr;
             let ip = std::net::Ipv6Addr::from(bytes);
             if let Some(ip) = ip.to_ipv4_mapped() {
                 check(u32::from(ip).to_be())

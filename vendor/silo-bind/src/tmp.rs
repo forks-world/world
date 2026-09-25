@@ -145,6 +145,14 @@ pub unsafe fn unmap_cstr(path: *mut c_char) {
     }
 }
 
+// `sockaddr_un` holds only `u8`/`c_char` fields, so it has no alignment
+// requirement above 1: a byte slice can stand in for it without ever forming
+// a reference wider than what the caller actually guarantees.
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::align_of::<libc::sockaddr_un>() == 1);
+#[cfg(target_os = "macos")]
+const SUN_MAX: usize = std::mem::size_of::<libc::sockaddr_un>(); // 106
+
 /// Map an `AF_UNIX` address. Returns the address to use, possibly `storage`.
 #[cfg(target_os = "macos")]
 pub unsafe fn map_unix(
@@ -162,10 +170,12 @@ pub unsafe fn map_unix(
     {
         return Ok((addr, len));
     }
-    let un = unsafe { &*(addr as *const libc::sockaddr_un) };
-    let available = (len as usize - offset).min(un.sun_path.len());
-    let raw = unsafe { std::slice::from_raw_parts(un.sun_path.as_ptr().cast::<u8>(), available) };
-    let path = raw.split(|&b| b == 0).next().unwrap_or_default();
+    // Only `len` bytes are guaranteed readable; cap at a full sockaddr_un so a
+    // bogus huge len (which the kernel would reject) can't widen the read.
+    let sa = unsafe { std::slice::from_raw_parts(addr.cast::<u8>(), (len as usize).min(SUN_MAX)) };
+    let Some(path) = world_tmp_path::unix_path(sa) else {
+        return Ok((addr, len));
+    };
     let mut buf = [0u8; PATH_MAX];
     // A relative sun_path (bind/connect resolve it against the cwd) can also
     // reach a host temp root.

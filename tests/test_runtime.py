@@ -16,6 +16,7 @@ import select
 import shutil
 import ssl
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -712,6 +713,20 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         self.assertTrue(report["guard_intact"], report)
         self.assertEqual(report["prefix"], host[:18])
         self.assertEqual(report["len"], 2 + len(host) + 1)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_exactly_sized_sockaddr_un_is_mapped(self):
+        # bind/connect with a sockaddr_un buffer sized to exactly SUN_LEN(path)
+        # (no padding to the full 106-byte struct): map_unix must bound its
+        # read by the caller's socklen_t rather than the whole struct type.
+        name = f"wt-{uuid.uuid4().hex[:8]}"
+        (self.world_tmp / "tmp" / name).mkdir()
+        result = run(PROBE, "unix-sunlen", f"/tmp/{name}/s.sock", env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "ok")
+        physical = self.world_tmp / "tmp" / name / "s.sock"
+        self.assertTrue(stat.S_ISSOCK(os.lstat(physical).st_mode))
+        self.assertFalse(os.path.lexists(f"/tmp/{name}"))
 
     @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
     def test_dotdot_escapes_a_redirected_temp_root_through_a_symlink(self):

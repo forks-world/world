@@ -643,6 +643,21 @@ pub const SUN_PATH_OFFSET: usize = 2;
 #[cfg(target_os = "macos")]
 const _: () = assert!(SUN_PATH_OFFSET == std::mem::offset_of!(libc::sockaddr_un, sun_path));
 
+/// The path bytes of a raw macOS `sockaddr_un` (`sun_len`, `sun_family`,
+/// `sun_path`), bounded by `sa.len()` and ending at the first NUL; None when
+/// it is not AF_UNIX or has no path region.
+pub fn unix_path(sa: &[u8]) -> Option<&[u8]> {
+    if sa.len() <= SUN_PATH_OFFSET || sa[1] as c_int != libc::AF_UNIX {
+        return None;
+    }
+    Some(
+        sa[SUN_PATH_OFFSET..]
+            .split(|&b| b == 0)
+            .next()
+            .unwrap_or_default(),
+    )
+}
+
 /// Rewrite a physical `AF_UNIX` address to its host name in place. `sa` holds
 /// raw `sockaddr_un` bytes in macOS layout (`sun_len`, `sun_family`, then
 /// `sun_path`) and `reported` is the kernel's address length, which must fit
@@ -1310,6 +1325,26 @@ mod tests {
         ] {
             assert!(!valid_root(root), "{}", String::from_utf8_lossy(root));
         }
+    }
+
+    #[test]
+    fn unix_path_reads_bounded_by_len_and_the_first_nul() {
+        let sa = [5u8, libc::AF_UNIX as u8, b'/', b'a', 0];
+        assert_eq!(unix_path(&sa), Some(&b"/a"[..]));
+
+        let mut wrong_family = sa;
+        wrong_family[1] = libc::AF_INET as u8;
+        assert_eq!(unix_path(&wrong_family), None);
+
+        assert_eq!(unix_path(&sa[..SUN_PATH_OFFSET]), None);
+        assert_eq!(unix_path(&sa[..1]), None);
+
+        // A full-width path region (104 bytes, as in a real sockaddr_un) with
+        // no NUL at all is returned whole.
+        let mut no_nul = [b'x'; 106];
+        no_nul[0] = 106;
+        no_nul[1] = libc::AF_UNIX as u8;
+        assert_eq!(unix_path(&no_nul), Some(&no_nul[SUN_PATH_OFFSET..]));
     }
 
     #[test]

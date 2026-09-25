@@ -78,6 +78,55 @@ fn run() -> std::io::Result<()> {
                 std::os::unix::net::UnixStream::connect(&args[2])?;
             }
         }
+        "unix-sunlen" => {
+            // Bind and connect through a heap-allocated sockaddr_un sized to
+            // exactly SUN_LEN(path) -- no padding out to the full 106-byte
+            // struct -- so the interposer sees a buffer only as large as the
+            // caller actually promised via its socklen_t.
+            let path = &args[2];
+            let sockaddr_un = |path: &str| -> Vec<u8> {
+                let total = 2 + path.len() + 1;
+                let mut v = vec![0u8; total];
+                v[0] = total as u8;
+                v[1] = libc::AF_UNIX as u8;
+                v[2..2 + path.len()].copy_from_slice(path.as_bytes());
+                v
+            };
+            unsafe {
+                let listener = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                if listener < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let bind_addr = sockaddr_un(path);
+                if libc::bind(
+                    listener,
+                    bind_addr.as_ptr().cast(),
+                    bind_addr.len() as libc::socklen_t,
+                ) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::listen(listener, 1) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let dialer = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                if dialer < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let connect_addr = sockaddr_un(path);
+                if libc::connect(
+                    dialer,
+                    connect_addr.as_ptr().cast(),
+                    connect_addr.len() as libc::socklen_t,
+                ) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::close(dialer);
+                libc::close(listener);
+            }
+            print!("ok");
+        }
         "pair" => {
             let (mut a, mut b) = std::os::unix::net::UnixStream::pair()?;
             a.write_all(b"pair")?;
