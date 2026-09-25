@@ -1153,16 +1153,19 @@ fn cstring(value: &std::ffi::OsStr) -> Result<CString> {
     CString::new(value.as_bytes()).context("argument or environment contains NUL")
 }
 
-/// Resolve the program like execvp, but before fork: a name with a slash
-/// is used as given (relative to the child's cwd), otherwise the first
-/// executable PATH entry wins (relative entries resolve against the cwd).
-fn resolve_program(
+/// The paths execvp would try, prepared before fork: a name with a slash
+/// is used as given (relative to the child's cwd), otherwise each PATH
+/// entry in order (relative entries resolve against the cwd).
+fn program_candidates(
     program: &std::ffi::OsStr,
     cwd: &Path,
     env: &[(std::ffi::OsString, std::ffi::OsString)],
-) -> Result<std::path::PathBuf> {
+) -> Result<Vec<CString>> {
+    if program.is_empty() {
+        return Err(Error::from_raw_os_error(libc::ENOENT)).context("start workload");
+    }
     if program.as_bytes().contains(&b'/') {
-        return Ok(program.into());
+        return Ok(vec![cstring(program)?]);
     }
     let path = env
         .iter()
@@ -1170,17 +1173,15 @@ fn resolve_program(
         .map(|(_, value)| value.clone())
         // glibc execvp's default (confstr _CS_PATH) when PATH is unset.
         .unwrap_or_else(|| "/bin:/usr/bin".into());
-    for dir in std::env::split_paths(&path) {
-        let candidate = cwd.join(dir).join(program);
-        let Ok(c) = CString::new(candidate.as_os_str().as_bytes()) else {
-            continue;
-        };
-        // SAFETY: a NUL-terminated path and an integer mode.
-        if candidate.is_file() && unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0 {
-            return Ok(candidate);
-        }
-    }
-    Err(Error::from_raw_os_error(libc::ENOENT).into())
+    std::env::split_paths(&path)
+        .map(|dir| cstring(cwd.join(dir).join(program).as_os_str()))
+        .collect()
+}
+
+/// Whether execvp moves on to the next PATH entry after this exec error.
+fn try_next_candidate(errno: i32) -> bool {
+    matches!(errno, libc::EACCES | libc::ENOENT | libc::ENOTDIR)
+        || matches!(errno, libc::ESTALE | libc::ENODEV | libc::ETIMEDOUT)
 }
 
 fn pipe_pair() -> Result<(OwnedFd, OwnedFd)> {
@@ -1206,17 +1207,21 @@ fn receiver(fd: OwnedFd) -> Result<tokio::net::unix::pipe::Receiver> {
 /// setup is done, so no caller handler can ever run in it (std clears the
 /// mask before its pre_exec hooks, leaving a window).
 pub(crate) fn spawn(mut spec: Spawn) -> Result<RawChild> {
-    let path = resolve_program(&spec.program, &spec.cwd, &spec.env).context("start workload")?;
-    let program = cstring(path.as_os_str())?;
+    let candidates = program_candidates(&spec.program, &spec.cwd, &spec.env)?;
     let cwd = cstring(spec.cwd.as_os_str())?;
     let argv: Vec<CString> = std::iter::once(&spec.program)
         .chain(&spec.args)
         .map(|arg| cstring(arg))
         .collect::<Result<_>>()?;
     // execvp's fallback for a script without a shebang line (ENOEXEC).
-    let sh_argv: Vec<CString> = [c"/bin/sh".to_owned(), program.clone()]
-        .into_iter()
-        .chain(argv[1..].iter().cloned())
+    let sh_argvs: Vec<Vec<CString>> = candidates
+        .iter()
+        .map(|program| {
+            [c"/bin/sh".to_owned(), program.clone()]
+                .into_iter()
+                .chain(argv[1..].iter().cloned())
+                .collect()
+        })
         .collect();
     let env: Vec<CString> = spec
         .env
@@ -1233,7 +1238,8 @@ pub(crate) fn spawn(mut spec: Spawn) -> Result<RawChild> {
         out.push(std::ptr::null());
         out
     };
-    let (argv_ptr, sh_ptr, env_ptr) = (pointers(&argv), pointers(&sh_argv), pointers(&env));
+    let (argv_ptr, env_ptr) = (pointers(&argv), pointers(&env));
+    let sh_ptrs: Vec<_> = sh_argvs.iter().map(|list| pointers(list)).collect();
     let stdin = match spec.stdin.take() {
         Some(fd) => above_stdio(fd)?,
         None => above_stdio(std::fs::File::open("/dev/null")?.into())?,
@@ -1284,11 +1290,23 @@ pub(crate) fn spawn(mut spec: Spawn) -> Result<RawChild> {
             let mut empty = std::mem::zeroed::<libc::sigset_t>();
             libc::sigemptyset(&mut empty);
             libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
-            libc::execve(program.as_ptr(), argv_ptr.as_ptr(), env_ptr.as_ptr());
-            if errno() == libc::ENOEXEC {
-                libc::execve(c"/bin/sh".as_ptr(), sh_ptr.as_ptr(), env_ptr.as_ptr());
+            // execvp's search: skip entries that fail for path reasons,
+            // report EACCES if any entry had it, else the last error.
+            let mut denied = false;
+            let mut last = libc::ENOENT;
+            for (program, sh_ptr) in candidates.iter().zip(&sh_ptrs) {
+                libc::execve(program.as_ptr(), argv_ptr.as_ptr(), env_ptr.as_ptr());
+                last = errno();
+                if last == libc::ENOEXEC {
+                    libc::execve(c"/bin/sh".as_ptr(), sh_ptr.as_ptr(), env_ptr.as_ptr());
+                    last = errno();
+                }
+                denied |= last == libc::EACCES;
+                if !try_next_candidate(last) {
+                    break;
+                }
             }
-            report(errno())
+            report(if denied && try_next_candidate(last) { libc::EACCES } else { last })
         }
     }
     // SAFETY: restores this thread's own previous mask.
@@ -1988,6 +2006,45 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         panic!("descendant {descendant} survived its dropped leader");
+    }
+
+    /// Like execvp: an entry whose exec fails for path reasons (here a
+    /// missing shebang interpreter) falls through to the next PATH entry,
+    /// and EACCES is reported when no entry could run.
+    #[test]
+    fn path_search_continues_like_execvp() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let (first, second) = (temp.path().join("a"), temp.path().join("b"));
+        for (dir, script, mode) in [
+            (&first, "#!/nonexistent/interpreter\n", 0o755),
+            (&second, "#!/bin/sh\nexit 7\n", 0o755),
+        ] {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::write(dir.join("tool"), script).unwrap();
+            let permissions = std::fs::Permissions::from_mode(mode);
+            std::fs::set_permissions(dir.join("tool"), permissions).unwrap();
+        }
+        let spec = |path: &std::path::Path| super::Spawn {
+            program: "tool".into(),
+            args: vec![],
+            cwd: "/".into(),
+            env: vec![("PATH".into(), path.as_os_str().to_owned())],
+            stdin: None,
+            setup: Box::new(|| Ok(())),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let both = std::env::join_paths([&first, &second]).unwrap();
+            let mut child = super::spawn(spec(both.as_ref())).unwrap();
+            assert_eq!(child.wait().await.unwrap().code(), Some(7));
+            let script = second.join("tool");
+            let permissions = std::fs::Permissions::from_mode(0o644);
+            std::fs::set_permissions(&script, permissions).unwrap();
+            let error = super::spawn(spec(&second)).err().unwrap();
+            let errno = error.root_cause().downcast_ref::<std::io::Error>();
+            assert_eq!(errno.and_then(|e| e.raw_os_error()), Some(libc::EACCES));
+        });
     }
 
     #[test]
