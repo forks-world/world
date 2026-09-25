@@ -852,6 +852,35 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["temp_root"], expected)
 
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_workspace_migrates_the_legacy_default_registry_once(self):
+        # HOME must not be under /tmp, like h1/h2 above.
+        h = pathlib.Path(os.path.realpath(pathlib.Path(self.short.name) / "h"))
+        h.mkdir()
+        workdir = self.dir / "work"
+        workdir.mkdir()
+        old_registry = h / ".local/share/world/silo/registry.json"
+        old_registry.parent.mkdir(parents=True)
+        old_registry.write_text(json.dumps({
+            "X": {"id": "X", "ip": "127.77.0.9", "workdir": str(workdir)},
+        }))
+        env = dict(os.environ, HOME=str(h))
+
+        result = run(WORLD, "workspace", "show", "X", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        shown = json.loads(result.stdout)
+        self.assertEqual(shown["ip"], "127.77.0.9")
+        self.assertEqual(shown["temp_root"], f"{h}/.world/tmp/127.77.0.9")
+        self.assertIn("moved workspace registry", result.stderr)
+        new_registry = h / ".local/share/world/workspaces/registry.json"
+        self.assertTrue(new_registry.exists())
+        self.assertFalse(old_registry.exists())
+
+        # A second run finds the registry already migrated: no notice, no error.
+        result = run(WORLD, "workspace", "show", "X", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("moved workspace registry", result.stderr)
+
     @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_slow_output_consumer_does_not_lose_tail(self):
         for destination in ["stdout", "stderr"]:

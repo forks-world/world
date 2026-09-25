@@ -35,11 +35,224 @@ pub struct World {
     pub temp_root: Option<PathBuf>,
 }
 
+/// Directory holding the workspace registry when `--state-dir` is not given
+/// (main.rs only calls this when that flag is absent; an explicit
+/// `--state-dir` is used as-is and never migrated).
+///
+/// This directory was renamed from `~/.local/share/world/silo` to
+/// `~/.local/share/world/workspaces` (the internal backend name must never
+/// show up in a CLI-visible path), so anyone upgrading still has their
+/// registry sitting under the old name. The first call after upgrading
+/// migrates it in place, under both directories' locks, taken new-then-old
+/// -- the same order every other multi-lock path here would use, so this
+/// can never deadlock against a concurrent `create`/`get`. Only the
+/// `registry.json` *file* is moved; `old` itself is left behind holding
+/// nothing but its own `registry.lock`, and no compatibility symlink is put
+/// back in its place. `old` is trusted only when it is a real directory (not
+/// a symlink) owned by the calling user and its `registry.json` is a
+/// regular file, so a symlinked or other-owned `old`, or one whose
+/// `registry.json` was swapped for something else, is left untouched rather
+/// than migrated. Any failure -- including the rename itself -- surfaces as
+/// an error naming both paths, rather than silently starting a fresh, empty
+/// registry at `new` and losing every workspace someone already registered.
 pub fn default_state_dir() -> Result<PathBuf> {
-    Ok(
-        PathBuf::from(std::env::var_os("HOME").context("HOME is required")?)
-            .join(".local/share/world/workspaces"),
-    )
+    default_state_dir_in(Path::new(
+        &std::env::var_os("HOME").context("HOME is required")?,
+    ))
+}
+
+fn default_state_dir_in(home: &Path) -> Result<PathBuf> {
+    let base = home.join(".local/share/world");
+    let (new, old) = (base.join("workspaces"), base.join("silo"));
+    if new.join("registry.json").symlink_metadata().is_ok() || !legacy_registry(&old) {
+        return Ok(new);
+    }
+    let _new_lock = lock(&new)?;
+    let _old_lock = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(old.join("registry.lock"))?;
+        f.lock_exclusive()?;
+        f
+    };
+    // Re-check under both locks: another process may have raced us to the
+    // migration, or created a fresh registry at `new`, since the check above.
+    if new.join("registry.json").symlink_metadata().is_err() && legacy_registry(&old) {
+        std::fs::rename(old.join("registry.json"), new.join("registry.json")).with_context(
+            || {
+                format!(
+                    "moving workspace registry from {} to {}",
+                    old.display(),
+                    new.display()
+                )
+            },
+        )?;
+        File::open(&new)?.sync_all()?;
+        eprintln!(
+            "world: moved workspace registry from {} to {}",
+            old.display(),
+            new.display()
+        );
+    }
+    Ok(new)
+}
+
+/// Whether `old` is a genuine pre-rename registry worth migrating: a real
+/// directory (never a symlink) owned by the calling user, holding a regular
+/// `registry.json`. Anything else -- missing, a symlink, owned by someone
+/// else, or a `registry.json` that isn't a plain file -- is left alone.
+fn legacy_registry(old: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let euid = unsafe { libc::geteuid() };
+    matches!(old.symlink_metadata(), Ok(m) if m.is_dir() && m.uid() == euid)
+        && matches!(old.join("registry.json").symlink_metadata(), Ok(m) if m.is_file())
+}
+
+#[cfg(all(test, unix))]
+mod state_dir_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn home() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        (dir, home)
+    }
+
+    fn new_dir(home: &Path) -> PathBuf {
+        home.join(".local/share/world/workspaces")
+    }
+
+    fn old_dir(home: &Path) -> PathBuf {
+        home.join(".local/share/world/silo")
+    }
+
+    /// Write an old-layout registry (`.../silo/registry.json`) under `home`
+    /// holding a single entry, `X`, with no `temp_root` -- as a genuinely
+    /// pre-migration registry would.
+    fn write_old_registry(home: &Path, workdir: &Path) -> PathBuf {
+        let old = old_dir(home);
+        std::fs::create_dir_all(&old).unwrap();
+        let entry = serde_json::json!({
+            "X": {"id": "X", "ip": "127.77.0.9", "workdir": workdir.to_string_lossy()},
+        });
+        std::fs::write(
+            old.join("registry.json"),
+            serde_json::to_string_pretty(&entry).unwrap(),
+        )
+        .unwrap();
+        old
+    }
+
+    #[test]
+    fn migrates_an_old_only_registry() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        let old = write_old_registry(&home, work.path());
+        let new = default_state_dir_in(&home).unwrap();
+        assert_eq!(new, new_dir(&home));
+        let worlds = registry(&new).unwrap();
+        assert_eq!(worlds["X"].ip, Ipv4Addr::new(127, 77, 0, 9));
+        assert!(!old.join("registry.json").exists());
+    }
+
+    #[test]
+    fn leaves_a_new_only_registry_untouched() {
+        let (_h, home) = home();
+        let new = new_dir(&home);
+        std::fs::create_dir_all(&new).unwrap();
+        let worlds = serde_json::json!({
+            "Y": {"id": "Y", "ip": "127.77.0.1", "workdir": "/tmp/y"},
+        });
+        let bytes = serde_json::to_vec_pretty(&worlds).unwrap();
+        std::fs::write(new.join("registry.json"), &bytes).unwrap();
+
+        let result = default_state_dir_in(&home).unwrap();
+        assert_eq!(result, new);
+        assert_eq!(std::fs::read(new.join("registry.json")).unwrap(), bytes);
+        assert!(!old_dir(&home).exists());
+    }
+
+    #[test]
+    fn prefers_an_existing_new_registry_over_the_old_one() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        let old = write_old_registry(&home, work.path());
+        let old_bytes = std::fs::read(old.join("registry.json")).unwrap();
+        let new = new_dir(&home);
+        std::fs::create_dir_all(&new).unwrap();
+        let new_worlds = serde_json::json!({
+            "Y": {"id": "Y", "ip": "127.77.0.1", "workdir": "/tmp/y"},
+        });
+        let new_bytes = serde_json::to_vec_pretty(&new_worlds).unwrap();
+        std::fs::write(new.join("registry.json"), &new_bytes).unwrap();
+
+        let result = default_state_dir_in(&home).unwrap();
+        assert_eq!(result, new);
+        assert_eq!(std::fs::read(new.join("registry.json")).unwrap(), new_bytes);
+        assert_eq!(std::fs::read(old.join("registry.json")).unwrap(), old_bytes);
+    }
+
+    #[test]
+    fn does_not_migrate_through_a_symlinked_old_directory() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        let (_real, real_home) = self::home();
+        write_old_registry(&real_home, work.path());
+        std::fs::create_dir_all(home.join(".local/share/world")).unwrap();
+        symlink(old_dir(&real_home), old_dir(&home)).unwrap();
+
+        let result = default_state_dir_in(&home).unwrap();
+        assert_eq!(result, new_dir(&home));
+        assert!(!new_dir(&home).join("registry.json").exists());
+        assert!(old_dir(&real_home).join("registry.json").exists());
+    }
+
+    #[test]
+    fn migrates_when_new_holds_only_a_lock_file() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        write_old_registry(&home, work.path());
+        let new = new_dir(&home);
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("registry.lock"), b"").unwrap();
+
+        let result = default_state_dir_in(&home).unwrap();
+        assert_eq!(result, new);
+        assert!(registry(&new).unwrap().contains_key("X"));
+    }
+
+    #[test]
+    fn is_idempotent() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        write_old_registry(&home, work.path());
+        let new = default_state_dir_in(&home).unwrap();
+        let bytes = std::fs::read(new.join("registry.json")).unwrap();
+
+        assert_eq!(default_state_dir_in(&home).unwrap(), new);
+        assert_eq!(std::fs::read(new.join("registry.json")).unwrap(), bytes);
+    }
+
+    // `get_in`'s legacy fill only recomputes `root_for(home, ip)`, doing no
+    // I/O against `home`/`workdir` itself, so it does not strictly need
+    // macOS; it is still gated here to match the rest of this crate's
+    // registry tests (`registry_tests`, below), which assume macOS.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fills_in_the_temp_root_for_a_migrated_entry() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        write_old_registry(&home, work.path());
+        let new = default_state_dir_in(&home).unwrap();
+        let world = get_in(&new, "X", || Ok(home.clone())).unwrap();
+        assert_eq!(world.temp_root, Some(root_for(&home, world.ip)));
+    }
 }
 
 fn supported() -> Result<()> {
