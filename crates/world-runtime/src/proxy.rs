@@ -463,6 +463,16 @@ mod tests {
         proxy.close().await;
         assert_eq!(c.read(&mut buf).await.unwrap_or(0), 0);
         server.await.unwrap();
-        assert!(TcpStream::connect(("::1", proxy.port())).await.is_err());
+        // A child forked concurrently by another test can briefly hold a
+        // copy of the listener; it must be refused once that is gone.
+        let mut refused = false;
+        for _ in 0..50 {
+            if TcpStream::connect(("::1", proxy.port())).await.is_err() {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(refused, "closed proxy still accepts connections");
     }
 }

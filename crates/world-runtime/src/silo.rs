@@ -271,6 +271,7 @@ async fn linux_exec(
     // SAFETY: the closure only makes raw system calls on open descriptors.
     unsafe {
         cmd.as_std_mut().pre_exec(move || {
+            crate::linux::reset_caught_handlers();
             crate::linux::join_namespaces(user_fd, net_fd)?;
             crate::linux::close_extra_descriptors()?;
             crate::linux::enter_pid_namespace()

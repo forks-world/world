@@ -320,6 +320,23 @@ unsafe fn private_dev() -> IoResult<()> {
     Ok(())
 }
 
+/// pre_exec, first step: caught handlers inherited from the caller must
+/// not run in the forked child (locks held by vanished threads); reset them
+/// to the default. Ignored signals stay ignored, as exec would keep them.
+pub(crate) unsafe fn reset_caught_handlers() {
+    unsafe {
+        for signal in 1..=libc::SIGRTMAX() {
+            let mut action = std::mem::zeroed::<libc::sigaction>();
+            if libc::sigaction(signal, std::ptr::null(), &mut action) == 0
+                && action.sa_sigaction != libc::SIG_DFL
+                && action.sa_sigaction != libc::SIG_IGN
+            {
+                libc::signal(signal, libc::SIG_DFL);
+            }
+        }
+    }
+}
+
 /// pre_exec: join namespaces held by another process. User namespace first:
 /// it grants the capability needed to join the network namespace it owns.
 pub(crate) unsafe fn join_namespaces(user: RawFd, net: RawFd) -> IoResult<()> {
@@ -1086,6 +1103,7 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
     // SAFETY: the closure only makes raw system calls on data prepared above.
     unsafe {
         cmd.as_std_mut().pre_exec(move || {
+            reset_caught_handlers();
             enter_new_namespaces(&maps)?;
             // Private System V IPC and POSIX message queues.
             check(libc::unshare(libc::CLONE_NEWIPC))?;
@@ -1216,7 +1234,6 @@ unsafe fn holder_process(
         if holder != 0 {
             libc::_exit(if holder > 0 { 0 } else { 125 });
         }
-        reset_signals();
         libc::chdir(c"/".as_ptr());
         // The report pipe becomes fd 0 and the acknowledgment pipe fd 1.
         // The other ends are closed explicitly, so the wait below sees EOF
@@ -1236,6 +1253,9 @@ unsafe fn holder_process(
         // sockets or files alive. A failure is reported only after the PID
         // has been pinned, so the caller can always identify and reap us.
         let cleanup = close_from(2);
+        // Signals are still blocked (see start_holder); reset every
+        // disposition before unblocking them.
+        reset_signals();
         // PID first, so the caller can pin (and, if we fail and it adopted
         // us as a subreaper, reap) the holder; then the result.
         if !send(libc::getpid()) {

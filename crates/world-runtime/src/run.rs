@@ -289,7 +289,28 @@ pub(crate) fn spawn(mut cmd: Command) -> Result<Workload> {
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.as_std_mut().process_group(0);
-    let mut child = cmd.spawn().context("start workload")?;
+    // No caller signal handler may run in the forked child before its
+    // setup has reset them: block every signal in this thread across the
+    // fork (std unblocks in the child just before the pre_exec steps, whose
+    // first action on Linux resets caught handlers) and restore afterwards.
+    #[cfg(unix)]
+    let previous = {
+        // SAFETY: sigset operations on live local sets, this thread only.
+        unsafe {
+            let mut all = std::mem::zeroed::<libc::sigset_t>();
+            let mut previous = std::mem::zeroed::<libc::sigset_t>();
+            libc::sigfillset(&mut all);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &all, &mut previous);
+            previous
+        }
+    };
+    let spawned = cmd.spawn();
+    #[cfg(unix)]
+    // SAFETY: restores this thread's own previous mask.
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+    }
+    let mut child = spawned.context("start workload")?;
     let pid = child.id().context("child PID unavailable")?;
     // Armed first: any later error kills the whole group, including the
     // PID-namespace init and workload behind the spawned wrapper.
