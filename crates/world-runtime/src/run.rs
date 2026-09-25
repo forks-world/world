@@ -238,7 +238,8 @@ fn stdin_is_socket() -> Result<bool> {
 
 /// A process that ignores SIGCHLD (SIG_IGN or SA_NOCLDWAIT) has its
 /// children reaped automatically, so the workload's exit status could not
-/// be collected. The CLI resets it; library callers must not ignore it.
+/// be collected; a blocked SIGCHLD can delay noticing the exit. The CLI
+/// resets and unblocks it; library callers must do neither.
 pub(crate) fn check_sigchld() -> Result<()> {
     #[cfg(unix)]
     {
@@ -250,6 +251,14 @@ pub(crate) fn check_sigchld() -> Result<()> {
         let action = unsafe { action.assume_init() };
         if action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
             bail!("SIGCHLD is ignored in this process; the workload's exit status would be lost");
+        }
+        // A blocked SIGCHLD (inherited by the runtime's threads) can keep
+        // the child-exit notification from arriving until the deadline.
+        let mut mask = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        // SAFETY: reads this thread's mask into a live struct.
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), mask.as_mut_ptr()) };
+        if unsafe { libc::sigismember(mask.as_ptr(), libc::SIGCHLD) } == 1 {
+            bail!("SIGCHLD is blocked in this thread; the workload's exit status could be missed");
         }
     }
     Ok(())
@@ -462,4 +471,25 @@ fn seatbelt_profile(workdir: &Path, temp: &Path, port: Option<u16>) -> Result<St
         ));
     }
     Ok(profile)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[test]
+    fn blocked_sigchld_is_rejected() {
+        // The mask is per thread, so this does not affect other tests.
+        std::thread::spawn(|| {
+            assert!(super::check_sigchld().is_ok());
+            // SAFETY: sigset operations on a live local set; this thread only.
+            unsafe {
+                let mut set = std::mem::zeroed::<libc::sigset_t>();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGCHLD);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+            }
+            assert!(super::check_sigchld().is_err());
+        })
+        .join()
+        .unwrap();
+    }
 }

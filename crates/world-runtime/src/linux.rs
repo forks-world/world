@@ -1302,12 +1302,25 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
     // A raw double fork rather than Command: no exec and no exec-status
     // pipe, so the holder can report its PID and wait to be pinned even
     // when a later step fails, and any embedding executable works.
+    // Block every signal across the fork, so no caller handler can run in
+    // the child before the holder has reset all dispositions (it unblocks
+    // only afterwards); this thread's mask is restored right after.
+    // SAFETY: sigset operations on live local sets.
+    let mut all = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    let mut previous = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    unsafe {
+        libc::sigfillset(&mut all);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &all, &mut previous);
+    }
     // SAFETY: after fork the child makes only raw system calls on data
     // prepared above and never returns.
-    let intermediate = check(unsafe { libc::fork() })?;
+    let intermediate = unsafe { libc::fork() };
     if intermediate == 0 {
         unsafe { holder_process(&maps, report, ack, report_read, ack_write_fd) }
     }
+    // SAFETY: restores this thread's own previous mask.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) };
+    let intermediate = check(intermediate)?;
     // Reap the intermediate, which exits at once. A caller that ignores
     // SIGCHLD or reaps children itself may already have done so (ECHILD).
     let mut status = 0;
