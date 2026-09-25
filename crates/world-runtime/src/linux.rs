@@ -1240,16 +1240,19 @@ unsafe fn holder_process(
         if !send(libc::getpid()) {
             libc::_exit(125);
         }
-        let mut byte = 0u8;
-        loop {
-            match libc::read(1, (&mut byte as *mut u8).cast(), 1) {
-                1 => break,
-                n if n < 0 && *libc::__errno_location() == libc::EINTR => {}
-                // The caller gave up before pinning: never run unpinned.
-                _ => libc::_exit(125),
+        // One byte from the caller, or exit on EOF: the caller went away.
+        let expect = || {
+            let mut byte = 0u8;
+            loop {
+                match libc::read(1, (&mut byte as *mut u8).cast(), 1) {
+                    1 => return,
+                    n if n < 0 && *libc::__errno_location() == libc::EINTR => {}
+                    _ => libc::_exit(125),
+                }
             }
-        }
-        libc::close(1);
+        };
+        // Pinned: never run unpinned.
+        expect();
         if let Err(error) = cleanup.and_then(|()| enter_new_namespaces(maps)) {
             send(-error.raw_os_error().unwrap_or(libc::EIO));
             libc::_exit(125);
@@ -1258,6 +1261,10 @@ unsafe fn holder_process(
         if !send(0) {
             libc::_exit(125);
         }
+        // Recorded: a holder whose setup died before persisting its record
+        // could never be found or torn down, so it exits instead.
+        expect();
+        libc::close(1);
         hold()
     }
 }
@@ -1326,14 +1333,18 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
     // Let the holder continue only now that it is pinned.
     // SAFETY: writes one byte from a static buffer to an owned pipe.
     unsafe { libc::write(ack_write.as_raw_fd(), b"p".as_ptr().cast(), 1) };
-    drop(ack_write);
     let status = next().inspect_err(|_| reap_if_child(pidfd.as_ref()))?;
     if status != 0 {
         // A subreaper caller adopted the failed holder: reap it.
         reap_if_child(pidfd.as_ref());
         return Err(Error::from_raw_os_error(-status)).context("start World namespace holder");
     }
-    let started = |holder| StartedHolder { holder, pid, pidfd };
+    let started = |holder| StartedHolder {
+        holder,
+        pid,
+        pidfd,
+        commit: Some(ack_write),
+    };
     match Holder::observe(pid as u32) {
         Ok(holder) => Ok(started(holder)),
         Err(err) => {
@@ -1407,9 +1418,20 @@ pub(crate) struct StartedHolder {
     pub holder: Holder,
     pid: libc::pid_t,
     pidfd: Option<OwnedFd>,
+    /// Until `commit`, the holder waits here and exits if this closes.
+    commit: Option<OwnedFd>,
 }
 
 impl StartedHolder {
+    /// Tell the holder its record has been persisted; it starts holding.
+    /// Dropping without this (e.g. the process dies) makes it exit.
+    pub(crate) fn commit(mut self) {
+        if let Some(fd) = self.commit.take() {
+            // SAFETY: writes one byte from a static buffer to an owned pipe.
+            unsafe { libc::write(fd.as_raw_fd(), b"c".as_ptr().cast(), 1) };
+        }
+    }
+
     /// Stop the holder if it cannot be recorded. Signalling the pinned
     /// pidfd opens nothing and reads nothing from /proc, so descriptor
     /// pressure cannot make this fail; without pidfd (before Linux 5.3)
@@ -1493,6 +1515,26 @@ unsafe fn hold() -> ! {
 
 #[cfg(test)]
 mod tests {
+    /// A holder whose setup never committed its record (e.g. the setup
+    /// process died) must exit rather than run unrecorded.
+    #[test]
+    fn uncommitted_holder_exits() {
+        let started = super::start_holder().unwrap();
+        let pid = started.holder.pid;
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        drop(started);
+        for _ in 0..50 {
+            // Gone, or a zombie awaiting its reaper (state Z).
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            let state = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start());
+            if state.is_none_or(|rest| rest.starts_with('Z')) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("uncommitted holder is still running");
+    }
+
     #[test]
     fn close_fallback_sees_descriptors_above_a_lowered_limit() {
         let file = std::fs::File::open("/dev/null").unwrap();

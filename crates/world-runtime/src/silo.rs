@@ -155,6 +155,7 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
             }
             return Err(err);
         }
+        started.commit();
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]
