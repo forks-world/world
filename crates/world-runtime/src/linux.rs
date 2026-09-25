@@ -1216,6 +1216,7 @@ unsafe fn holder_process(
         if holder != 0 {
             libc::_exit(if holder > 0 { 0 } else { 125 });
         }
+        reset_signals();
         libc::chdir(c"/".as_ptr());
         // The report pipe becomes fd 0 and the acknowledgment pipe fd 1.
         // The other ends are closed explicitly, so the wait below sees EOF
@@ -1529,14 +1530,24 @@ pub(crate) fn stop_holder(holder: &Holder) -> Result<()> {
 /// pre_exec: the holder's whole life. Default signal handling (so plain
 /// kill stops it) and no descriptors: closing spawn's status pipe is what
 /// tells the caller that setup succeeded.
-unsafe fn hold() -> ! {
+/// Holder: default disposition for every signal, real-time ones included,
+/// and none blocked. The caller's handlers must never run in this post-fork
+/// process (locks held by vanished threads), and plain kill must stop it.
+unsafe fn reset_signals() {
     unsafe {
-        for signal in 1..libc::SIGRTMIN() {
+        // glibc's internal signals (32 and 33, just below SIGRTMIN) refuse
+        // the change with EINVAL; their handlers are glibc's own.
+        for signal in 1..=libc::SIGRTMAX() {
             libc::signal(signal, libc::SIG_DFL);
         }
         let mut empty = std::mem::zeroed::<libc::sigset_t>();
         libc::sigemptyset(&mut empty);
         libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+    }
+}
+
+unsafe fn hold() -> ! {
+    unsafe {
         if close_from(0).is_err() {
             libc::_exit(125);
         }
