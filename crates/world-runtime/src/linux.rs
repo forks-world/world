@@ -1136,6 +1136,11 @@ impl RawChild {
 impl Drop for RawChild {
     fn drop(&mut self) {
         if !self.reaped {
+            // The whole group, not just the leader: its PID namespace init
+            // and descendants outlive it otherwise. The unreaped leader keeps
+            // the group ID from being reused.
+            // SAFETY: plain-integer signalling of our child's process group.
+            unsafe { libc::kill(-self.pid, libc::SIGKILL) };
             self.kill();
             let _ = self.reap();
         }
@@ -1941,10 +1946,45 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(600)).await;
             assert!(!child.reaped);
             let stat = std::fs::read_to_string(format!("/proc/{}/stat", child.pid)).unwrap();
-            assert!(stat.rsplit_once(')').unwrap().1.trim_start().starts_with('Z'));
+            let state = stat.rsplit_once(')').unwrap().1.trim_start();
+            assert!(state.starts_with('Z'));
             assert!(child.wait().await.unwrap().success());
             assert!(child.reaped);
         });
+    }
+
+    /// Dropping a child that was never handed to a supervisor (a failed
+    /// spawn step) kills its descendants too, not only the leader.
+    #[test]
+    fn dropped_child_takes_its_process_group() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let descendant = runtime.block_on(async {
+            use tokio::io::AsyncBufReadExt;
+            let mut child = super::spawn(super::Spawn {
+                program: "sh".into(),
+                args: vec!["-c".into(), "sleep 30 & echo $!; wait".into()],
+                cwd: "/".into(),
+                env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+                stdin: None,
+                setup: Box::new(|| Ok(())),
+            })
+            .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let mut line = String::new();
+            let mut reader = tokio::io::BufReader::new(stdout);
+            reader.read_line(&mut line).await.unwrap();
+            drop(child);
+            line.trim().parse::<i32>().unwrap()
+        });
+        for _ in 0..50 {
+            let stat = std::fs::read_to_string(format!("/proc/{descendant}/stat"));
+            let state = stat.as_deref().unwrap_or("").rsplit_once(')');
+            if state.is_none_or(|(_, rest)| rest.trim_start().starts_with('Z')) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("descendant {descendant} survived its dropped leader");
     }
 
     #[test]
