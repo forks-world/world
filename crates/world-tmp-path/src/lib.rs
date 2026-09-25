@@ -148,6 +148,11 @@ fn has_tmp_component(path: &[u8]) -> bool {
     path.split(|&b| b == b'/').any(|c| c == b"tmp")
 }
 
+/// How many `..` components appear in `path`.
+fn dotdot_count(path: &[u8]) -> usize {
+    path.split(|&b| b == b'/').filter(|c| *c == b"..").count()
+}
+
 /// Write the World location for `path` into `out` as a NUL-terminated string.
 /// Ok(None) means the path is used unchanged. Uses the real kernel to resolve
 /// an escaping `..` that follows a named component (see `map_with`).
@@ -243,6 +248,8 @@ fn real_base(dirfd: c_int, out: &mut [u8]) -> Result<usize, c_int> {
 /// the redirected one. `resolve` (the real kernel for `map`, a fake one in
 /// tests) is asked where the physical prefix up to that `..` really
 /// resolves, so the escape can be rewritten and the scan restarted.
+/// Terminates because each restart strictly reduces the number of `..`
+/// components; a resolver whose answer contains `..` gets `ELOOP`.
 pub(crate) fn map_with(
     root: &[u8],
     path: &[u8],
@@ -257,8 +264,9 @@ pub(crate) fn map_with(
     cur[..path.len()].copy_from_slice(path);
     let mut cur_len = path.len();
     let mut rewritten = false;
+    let mut dotdots = dotdot_count(path);
 
-    for _ in 0..64 {
+    loop {
         let mut state = Scan::Base(Base::Root);
         let mut pos = 0;
         let mut escape = None;
@@ -439,6 +447,14 @@ pub(crate) fn map_with(
         next[next_len..next_len + remainder.len()].copy_from_slice(remainder);
         next_len += remainder.len();
 
+        // Termination: each rewrite must strictly reduce the `..` count. With a
+        // canonical resolver this always holds; otherwise fail closed.
+        let next_dotdots = dotdot_count(&next[..next_len]);
+        if next_dotdots >= dotdots {
+            return Err(libc::ELOOP);
+        }
+        dotdots = next_dotdots;
+
         cur[..next_len].copy_from_slice(&next[..next_len]);
         cur_len = next_len;
         // An `Other` escape's rewritten prefix is kernel-equivalent to the
@@ -449,7 +465,6 @@ pub(crate) fn map_with(
             rewritten = true;
         }
     }
-    Err(libc::ELOOP)
 }
 
 /// The first non-empty, non-`.` component of a relative path, or `""` when
@@ -1001,6 +1016,70 @@ mod tests {
             }),
             Err(libc::ENOTDIR)
         );
+    }
+
+    // The restart loop used to be capped at a fixed 64 iterations; a valid
+    // path needing one restart per named-component ".." could exceed that
+    // and be wrongly rejected with ELOOP. The bound is now the strictly
+    // decreasing ".." count instead, so these have no fixed limit.
+
+    #[test]
+    fn many_named_dotdots_before_tmp_still_map() {
+        let root = std::str::from_utf8(ROOT).unwrap();
+        // 65 "/a/.." pairs: one more than the old fixed cap of 64 restarts.
+        let path = format!("{}/tmp/x", "/a/..".repeat(65));
+        assert_eq!(
+            mapped_with(&path, &[]),
+            Ok(Some(format!("{root}/tmp/x"))),
+            "{path}"
+        );
+    }
+
+    #[test]
+    fn two_hundred_named_dotdots_before_tmp_still_map() {
+        let root = std::str::from_utf8(ROOT).unwrap();
+        let path = format!("{}/tmp/x", "/a/..".repeat(200));
+        assert!(path.len() < PATH_MAX, "test path must fit PATH_MAX");
+        assert_eq!(
+            mapped_with(&path, &[]),
+            Ok(Some(format!("{root}/tmp/x"))),
+            "{path}"
+        );
+    }
+
+    #[test]
+    fn many_temp_escapes_before_tmp_still_map() {
+        let root = std::str::from_utf8(ROOT).unwrap();
+        // Each "/a/../../tmp" unit, once already inside the temp root, pops
+        // the named "a" (needing the kernel, since it might be a symlink)
+        // and then the temp root itself, landing on its physical parent --
+        // and immediately walks back down through a literal "tmp" text,
+        // which restarts the scan right back at a fresh Temp entry. 65
+        // rounds is one more than the old fixed cap of 64 restarts.
+        let path = format!("/tmp{}/x", "/a/../../tmp".repeat(65));
+        assert_eq!(
+            mapped_with(&path, &[]),
+            Ok(Some(format!("{root}/tmp/x"))),
+            "{path}"
+        );
+    }
+
+    #[test]
+    fn misbehaving_resolver_cannot_loop() {
+        // A resolver whose answer itself contains ".." can never make
+        // progress; it must fail closed rather than loop forever.
+        let mut calls = 0;
+        let mut resolve = |_: &[u8], out: &mut [u8]| {
+            calls += 1;
+            let s: &[u8] = b"/a/../a";
+            out[..s.len()].copy_from_slice(s);
+            Ok(s.len())
+        };
+        assert_eq!(
+            mapped_with_resolver("/a/../tmp/x", &mut resolve),
+            Err(libc::ELOOP)
+        );
+        assert!(calls <= 1, "resolver called {calls} times");
     }
 
     #[test]
