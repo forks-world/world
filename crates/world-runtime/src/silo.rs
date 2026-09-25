@@ -15,7 +15,9 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::{process::Command, time::Instant};
+#[cfg(target_os = "macos")]
+use tokio::process::Command;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,14 +247,12 @@ async fn linux_exec(
     duration: Duration,
     cancel: CancellationToken,
 ) -> Result<i32> {
-    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+    use std::os::fd::AsRawFd;
+    let deadline = Instant::now() + duration;
     let dir = run::workdir(&world.workdir)?;
     // The checked descriptor itself, never whatever fd 0 is at spawn: a
     // host socket swapped in by another thread would cross into the World.
-    let stdin = match run::pin_stdin_with(false)? {
-        Some(fd) => std::process::Stdio::from(fd),
-        None => std::process::Stdio::null(),
-    };
+    let stdin = run::pin_stdin_with(false)?;
     let (user, net) = holder(state, &world.id)?.open().with_context(|| {
         format!(
             "World namespace is not running; run world silo setup --world {}",
@@ -264,28 +264,29 @@ async fn linux_exec(
         crate::linux::above_stdio(net)?,
     );
     let (user_fd, net_fd) = (user.as_raw_fd(), net.as_raw_fd());
-    let mut cmd = Command::new(&command[0]);
-    cmd.args(&command[1..])
-        .current_dir(&dir)
-        .env("WORLD_ID", &world.id);
-    // SAFETY: the closure only makes raw system calls on open descriptors.
-    unsafe {
-        cmd.as_std_mut().pre_exec(move || {
-            crate::linux::reset_caught_handlers();
+    let mut env: Vec<(OsString, OsString)> =
+        std::env::vars_os().filter(|(key, _)| key != "WORLD_ID").collect();
+    env.push(("WORLD_ID".into(), world.id.clone().into()));
+    let setup = move || -> std::io::Result<()> {
+        // SAFETY: raw system calls on open descriptors (see linux::Spawn).
+        unsafe {
             crate::linux::join_namespaces(user_fd, net_fd)?;
             crate::linux::close_extra_descriptors()?;
             crate::linux::enter_pid_namespace()
-        });
+        }
+    };
+    if cancel.is_cancelled() || Instant::now() >= deadline {
+        return Ok(124);
     }
-    let result = run::supervise(
-        cmd,
-        Some(stdin),
-        Instant::now() + duration,
-        cancel,
-        &mut None,
-        None,
-    )
-    .await;
+    let workload = run::raw_workload(crate::linux::spawn(crate::linux::Spawn {
+        program: command[0].clone(),
+        args: command[1..].to_vec(),
+        cwd: dir,
+        env,
+        stdin,
+        setup: Box::new(setup),
+    })?);
+    let result = run::wait(workload, deadline, cancel, &mut None, None).await;
     drop((user, net));
     result
 }
