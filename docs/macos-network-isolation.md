@@ -47,7 +47,7 @@ mkdir -p ~/world-a ~/world-b
 
 应用继续使用 localhost 和原端口，不需要配置隔离 IP。每个 Workspace 的内部地址由 World 分配，内部 silo 动态库在 `bind/connect/sendto/sendmsg` 等调用处进行透明重写。同一 Workspace 的不同进程及多次 `exec` 使用同一映射；支持 IPv4、通配绑定、双栈 socket 的 `::1`/`::` 和 UDP。显式 IPv6-only socket 不支持，返回失败而非使用宿主地址。
 
-默认状态目录为 `~/.local/share/world/workspaces`，`--state-dir` 可指定一个受信任的独立运行时注册表。若新位置尚无注册表而旧默认位置 `~/.local/share/world/silo` 中存在，首次使用时会自动将其迁移到新位置（连同 Linux holder 记录 `holders.json`，如果存在且新位置尚无同名文件）并在 stderr 提示一次；显式指定 `--state-dir` 时不做迁移。必须让需要相互协调的 Workspace 使用同一注册表。跨进程文件锁串行分配地址，元信息以临时文件、fsync、原子替换提交；同 ID 重复创建幂等，换工作目录被拒绝。地址不会自动回收给另一个 Workspace，避免仍存活的旧进程进入新 Workspace。
+默认状态目录为 `~/.local/share/world/workspaces`，`--state-dir` 可指定一个受信任的独立运行时注册表。若新位置尚无注册表而旧默认位置 `~/.local/share/world/silo` 中存在，首次使用时会自动将其迁移到新位置并在 stderr 提示一次；显式指定 `--state-dir` 时不做迁移。Linux holder 记录 `holders.json` 单独迁移：仅当旧注册表已迁走（或本次一并迁走）且新位置尚无该文件时移动；中途中断时下次运行会补完。必须让需要相互协调的 Workspace 使用同一注册表。跨进程文件锁串行分配地址，元信息以临时文件、fsync、原子替换提交；同 ID 重复创建幂等，换工作目录被拒绝。地址不会自动回收给另一个 Workspace，避免仍存活的旧进程进入新 Workspace。
 
 ## 临时目录
 
@@ -61,9 +61,10 @@ mkdir -p ~/world-a ~/world-b
 
 - Workspace 工作目录不能位于上述临时目录下，否则拒绝执行；用于确定私有目录的 `HOME`（`create` 时，或补录旧注册表条目时）同样不能位于其中。私有目录本身必须在宿主临时目录之外，否则其自身路径会被再次重定向。`WORLD_TMP` 必须是规范路径（不含符号链接分量）；`world exec` 已确保这一点，手动设置时需自行规范化，否则视为无效。
 - 记录的目录不可用（被删除、卸载）或属于其他用户时拒绝执行；共享注册表的不同用户不能共用同一 Workspace。
+- 私有目录路径（`HOME/.world/tmp/<地址>`）不得超过 512 字节；`create` 时超长会直接报错且不登记 Workspace。
 - Unix socket 路径上限 104 字节，重定向后路径会加上私有目录前缀（例如 `/Users/me/.world/tmp/127.77.0.1/tmp/`）。超长时 `bind/connect` 返回 `ENAMETOOLONG`。
 - 已存在于 Workspace 之外、指向 `/tmp` 的符号链接由内核解析，不经过重定向；`fcntl(F_GETPATH)`、`accept/recvfrom` 返回的对端地址、原始系统调用和脚本 shebang 中位于 `/tmp` 的解释器不在覆盖范围内。
-- 宿主前缀中的 `..` 只要其后仍有 `tmp` 分量，就由内核解析实际位置后再判断；含 `..` 的相对路径，以及首个有效分量为 `tmp`、`private` 或 `var` 的相对路径（如在 `/` 下的 `tmp/x`），先按物理工作目录或 dirfd 补全再判断。仍是限制的：相对符号链接目标、spawn file actions 中的路径、指向宿主临时目录且其后无 `tmp` 分量的符号链接、补全与实际调用之间其他线程 chdir 的竞争，以及工作目录或 dirfd 本身位于宿主临时目录内（仅可能来自 fd 传递或注入前打开的描述符，受管进程的 chdir/open 已被重定向）时的其他相对路径。
+- 宿主前缀中的 `..` 只要其后仍有 `tmp` 分量，就由内核解析实际位置后再判断；含 `..` 的相对路径，以及首个有效分量为 `tmp`、`private` 或 `var` 的相对路径（如在 `/` 下的 `tmp/x`），先按物理工作目录或 dirfd 补全再判断。无法取得工作目录或 dirfd 的物理路径（如目录已被删除）时，该调用直接以相应错误失败，不回退到未重定向的宿主路径。仍是限制的：相对符号链接目标、spawn file actions 中的路径、指向宿主临时目录且其后无 `tmp` 分量的符号链接、补全与实际调用之间其他线程 chdir 的竞争，以及工作目录或 dirfd 本身位于宿主临时目录内（仅可能来自 fd 传递或注入前打开的描述符，受管进程的 chdir/open 已被重定向）时的其他相对路径。
 - 私有目录不会随 Workspace 自动清理，也不像宿主 `/tmp` 那样在重启时清空；需要时停止任务后手动删除。
 - `~/.world`、`~/.world/tmp`、`<地址>`、`tmp`、`var`、`var/tmp` 必须是当前用户拥有的真实目录（非符号链接），前两级不可被组/其他用户写；否则拒绝执行且不修改任何权限。
 - `world exec` 的入口程序（绝对/相对路径或经 PATH 查找）同样先按该 Workspace 的临时目录重定向，再做 SIP/setuid/脚本校验并启动；argv[0] 保持用户写法。

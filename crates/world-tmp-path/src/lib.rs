@@ -8,6 +8,10 @@
 use std::os::raw::c_int;
 
 pub const PATH_MAX: usize = libc::PATH_MAX as usize;
+/// Longest a workspace temp root may be: `valid_root` enforces it, and
+/// world-runtime's registry rejects a root longer than this before it is
+/// ever persisted (see `world-runtime::silo::check_root`).
+pub const MAX_ROOT_LEN: usize = 512;
 
 /// Host temp roots, longest first, and their location below the workspace root.
 const HOST_ROOTS: [(&[u8], &[u8]); 4] = [
@@ -29,7 +33,7 @@ const CANONICAL: [(&[u8], &[u8]); 2] = [
 /// be rewritten in place.
 pub fn valid_root(root: &[u8]) -> bool {
     root.len() >= 8
-        && root.len() <= 512
+        && root.len() <= MAX_ROOT_LEN
         && root.starts_with(b"/")
         && !root.ends_with(b"/")
         && !root.contains(&0)
@@ -451,7 +455,8 @@ fn first_real_component(p: &[u8]) -> &[u8] {
 /// root, or, from a cwd already inside a workspace's private tree, escape it
 /// physically without escaping it logically; so can a relative path with no
 /// `..` at all, once its first real component is `tmp`, `private` or `var`
-/// (see `map_at_with`).
+/// (see `map_at_with`). If `base` fails, the error is returned; the relative
+/// path is never passed through unmapped.
 pub fn map_at(
     root: &[u8],
     dirfd: c_int,
@@ -483,7 +488,8 @@ pub fn map_at(
 /// through `map_with`; if that itself finds no redirect but `base` was under
 /// `root`, the joined text must still be reported (never the original
 /// relative one, which the kernel would instead resolve inside the private
-/// tree).
+/// tree). If `base` fails, the error is returned; the relative path is never
+/// passed through unmapped.
 pub(crate) fn map_at_with(
     root: &[u8],
     path: &[u8],
@@ -501,7 +507,8 @@ pub(crate) fn map_at_with(
     let mut base_buf = [0u8; PATH_MAX];
     let base_len = match base(&mut base_buf) {
         Ok(n) if n < base_buf.len() => n,
-        _ => return Ok(None),
+        Ok(_) => return Err(libc::ENAMETOOLONG),
+        Err(e) => return Err(e),
     };
     let under_root = unmap_in_place(root, &mut base_buf, base_len);
     let mut len = under_root.unwrap_or(base_len);
@@ -991,11 +998,24 @@ mod tests {
             Ok(Some(format!("{root}/tmp/b")))
         );
 
-        // A `base` failure (e.g. EBADF/ENOTDIR from a bad dirfd) just leaves
-        // the relative path for the kernel to report on itself.
+        // A `base` failure (e.g. EBADF/ENOTDIR from a bad dirfd) is returned
+        // directly: the relative path is never passed through unmapped.
         assert_eq!(
             mapped_at(|_: &mut [u8]| Err(libc::ENOENT), "../x"),
-            Ok(None)
+            Err(libc::ENOENT)
+        );
+        // Same for a path with no `..` whose first component forces `base`
+        // to be called at all.
+        assert_eq!(
+            mapped_at(|_: &mut [u8]| Err(libc::EBADF), "tmp/x"),
+            Err(libc::EBADF)
+        );
+        // A `base` that reports a length not strictly less than the buffer
+        // (here, exactly `PATH_MAX`) leaves no room for a NUL and is treated
+        // like any other overlong result.
+        assert_eq!(
+            mapped_at(|_: &mut [u8]| Ok(PATH_MAX), "../x"),
+            Err(libc::ENAMETOOLONG)
         );
     }
 

@@ -45,16 +45,24 @@ pub struct World {
 /// registry sitting under the old name. The first call after upgrading
 /// migrates it in place, under both directories' locks, taken new-then-old
 /// -- the same order every other multi-lock path here would use, so this
-/// can never deadlock against a concurrent `create`/`get`. Only the
-/// `registry.json` *file* is moved; `old` itself is left behind holding
-/// nothing but its own `registry.lock`, and no compatibility symlink is put
-/// back in its place. `old` is trusted only when it is a real directory (not
-/// a symlink) owned by the calling user and its `registry.json` is a
-/// regular file, so a symlinked or other-owned `old`, or one whose
-/// `registry.json` was swapped for something else, is left untouched rather
-/// than migrated. Any failure -- including the rename itself -- surfaces as
-/// an error naming both paths, rather than silently starting a fresh, empty
-/// registry at `new` and losing every workspace someone already registered.
+/// can never deadlock against a concurrent `create`/`get`. `registry.json`
+/// and (Linux only) `holders.json` are moved independently: each is moved
+/// only when `old` still has it and `new` doesn't already have one, so an
+/// interrupted migration (a crash or a killed process between the two
+/// renames) simply completes on the next run instead of being stuck or
+/// redone. Holders are keyed by workspace id, so a `holders.json` is only
+/// ever moved together with or after its `registry.json` -- never on its
+/// own while an unrelated (or not yet migrated) registry sits at `new`,
+/// which could otherwise pair holder records with the wrong workspace ids.
+/// `old` itself is left behind holding nothing but its own `registry.lock`,
+/// and no compatibility symlink is put back in its place. `old` is trusted
+/// only when it is a real directory (not a symlink) owned by the calling
+/// user, so a symlinked or other-owned `old` is left untouched rather than
+/// migrated; within it, only a regular file at each name is moved, so one
+/// swapped for something else is left alone too. Any failure -- including a
+/// rename itself -- surfaces as an error naming both paths, rather than
+/// silently starting a fresh, empty registry at `new` and losing every
+/// workspace someone already registered.
 pub fn default_state_dir() -> Result<PathBuf> {
     default_state_dir_in(Path::new(
         &std::env::var_os("HOME").context("HOME is required")?,
@@ -64,7 +72,7 @@ pub fn default_state_dir() -> Result<PathBuf> {
 fn default_state_dir_in(home: &Path) -> Result<PathBuf> {
     let base = home.join(".local/share/world");
     let (new, old) = (base.join("workspaces"), base.join("silo"));
-    if new.join("registry.json").symlink_metadata().is_ok() || !legacy_registry(&old) {
+    if pending(&old, &new) == (false, false) {
         return Ok(new);
     }
     let _new_lock = lock(&new)?;
@@ -82,7 +90,8 @@ fn default_state_dir_in(home: &Path) -> Result<PathBuf> {
     };
     // Re-check under both locks: another process may have raced us to the
     // migration, or created a fresh registry at `new`, since the check above.
-    if new.join("registry.json").symlink_metadata().is_err() && legacy_registry(&old) {
+    let (move_registry, move_holders) = pending(&old, &new);
+    if move_registry {
         std::fs::rename(old.join("registry.json"), new.join("registry.json")).with_context(
             || {
                 format!(
@@ -101,12 +110,8 @@ fn default_state_dir_in(home: &Path) -> Result<PathBuf> {
     }
     // Linux also keeps live holder records (`holders.json`) alongside the
     // registry; move them too so upgrading doesn't orphan a running
-    // namespace holder. Only a regular file is moved, and only when `new`
-    // doesn't already have one -- never overwrite state another process may
-    // already have started writing at the new location.
-    if matches!(old.join("holders.json").symlink_metadata(), Ok(m) if m.is_file())
-        && new.join("holders.json").symlink_metadata().is_err()
-    {
+    // namespace holder.
+    if move_holders {
         std::fs::rename(old.join("holders.json"), new.join("holders.json")).with_context(|| {
             format!(
                 "moving workspace holder records from {} to {}",
@@ -124,15 +129,41 @@ fn default_state_dir_in(home: &Path) -> Result<PathBuf> {
     Ok(new)
 }
 
-/// Whether `old` is a genuine pre-rename registry worth migrating: a real
-/// directory (never a symlink) owned by the calling user, holding a regular
-/// `registry.json`. Anything else -- missing, a symlink, owned by someone
-/// else, or a `registry.json` that isn't a plain file -- is left alone.
-fn legacy_registry(old: &Path) -> bool {
+/// Whether `old` is a genuine pre-rename registry directory worth migrating
+/// anything out of: a real directory (never a symlink) owned by the calling
+/// user. Anything else -- missing, a symlink, or owned by someone else -- is
+/// left alone entirely.
+fn trusted_old(old: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let euid = unsafe { libc::geteuid() };
     matches!(old.symlink_metadata(), Ok(m) if m.is_dir() && m.uid() == euid)
-        && matches!(old.join("registry.json").symlink_metadata(), Ok(m) if m.is_file())
+}
+
+/// Whether `p` is a regular file, never following a symlink at that name.
+fn is_file(p: &Path) -> bool {
+    matches!(p.symlink_metadata(), Ok(m) if m.is_file())
+}
+
+/// Which of `old`'s two files still need moving into `new`: `(registry,
+/// holders)`. Each is pending only when `old` holds a regular file at that
+/// name and `new` doesn't already have one there -- a `new` file, however it
+/// got there, is never overwritten. `holders.json` additionally requires the
+/// registry to be moved already or moving in this same call (`reg`), or to
+/// have been moved by some earlier, possibly interrupted run (`old`'s
+/// `registry.json` already gone): holders are keyed by workspace id, so
+/// moving them alongside a registry `new` already had of its own -- a
+/// different registry that happens to occupy `new` -- could pair a holder
+/// record with the wrong workspace.
+fn pending(old: &Path, new: &Path) -> (bool, bool) {
+    if !trusted_old(old) {
+        return (false, false);
+    }
+    let reg = is_file(&old.join("registry.json"))
+        && new.join("registry.json").symlink_metadata().is_err();
+    let hold = is_file(&old.join("holders.json"))
+        && new.join("holders.json").symlink_metadata().is_err()
+        && (reg || old.join("registry.json").symlink_metadata().is_err());
+    (reg, hold)
 }
 
 #[cfg(all(test, unix))]
@@ -236,7 +267,14 @@ mod state_dir_tests {
         let (_h, home) = home();
         let work = tempfile::tempdir().unwrap();
         let old = write_old_registry(&home, work.path());
-        let old_bytes = std::fs::read(old.join("registry.json")).unwrap();
+        // `old` also has holder records for the (never-migrated) registry it
+        // holds; since `new` already has a registry of its own -- a
+        // different one, with different workspace ids -- the holders must
+        // not be migrated either, or they would end up keyed against the
+        // wrong registry's ids.
+        std::fs::write(old.join("holders.json"), b"{\"X\": 1}\n").unwrap();
+        let old_registry_bytes = std::fs::read(old.join("registry.json")).unwrap();
+        let old_holders_bytes = std::fs::read(old.join("holders.json")).unwrap();
         let new = new_dir(&home);
         std::fs::create_dir_all(&new).unwrap();
         let new_worlds = serde_json::json!({
@@ -248,7 +286,104 @@ mod state_dir_tests {
         let result = default_state_dir_in(&home).unwrap();
         assert_eq!(result, new);
         assert_eq!(std::fs::read(new.join("registry.json")).unwrap(), new_bytes);
-        assert_eq!(std::fs::read(old.join("registry.json")).unwrap(), old_bytes);
+        assert_eq!(
+            std::fs::read(old.join("registry.json")).unwrap(),
+            old_registry_bytes
+        );
+        assert!(!new.join("holders.json").exists());
+        assert_eq!(
+            std::fs::read(old.join("holders.json")).unwrap(),
+            old_holders_bytes
+        );
+    }
+
+    #[test]
+    fn resumes_an_interrupted_holder_migration() {
+        // Simulates a crash between the two renames: `old`'s registry.json
+        // was already moved to `new` by an earlier run, but its
+        // holders.json never made it over.
+        let (_h, home) = home();
+        let old = old_dir(&home);
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("holders.json"), b"{\"X\": 1}\n").unwrap();
+        let new = new_dir(&home);
+        std::fs::create_dir_all(&new).unwrap();
+        let new_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "X": {"id": "X", "ip": "127.77.0.9", "workdir": "/tmp/y"},
+        }))
+        .unwrap();
+        std::fs::write(new.join("registry.json"), &new_bytes).unwrap();
+
+        let result = default_state_dir_in(&home).unwrap();
+        assert_eq!(result, new);
+        assert!(!old.join("holders.json").exists());
+        assert_eq!(
+            std::fs::read(new.join("holders.json")).unwrap(),
+            b"{\"X\": 1}\n"
+        );
+        assert_eq!(std::fs::read(new.join("registry.json")).unwrap(), new_bytes);
+    }
+
+    #[test]
+    fn nothing_changes_once_both_files_are_already_in_new() {
+        let (_h, home) = home();
+        let new = new_dir(&home);
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("registry.json"), b"{}\n").unwrap();
+        std::fs::write(new.join("holders.json"), b"{}\n").unwrap();
+        // `old` exists (a trusted, real directory) but holds neither file.
+        let old = old_dir(&home);
+        std::fs::create_dir_all(&old).unwrap();
+
+        let result = default_state_dir_in(&home).unwrap();
+        assert_eq!(result, new);
+        assert_eq!(std::fs::read(new.join("registry.json")).unwrap(), b"{}\n");
+        assert_eq!(std::fs::read(new.join("holders.json")).unwrap(), b"{}\n");
+        assert!(!old.join("registry.json").exists());
+        assert!(!old.join("holders.json").exists());
+    }
+
+    #[test]
+    fn migration_with_holders_is_idempotent() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        let old = write_old_registry(&home, work.path());
+        std::fs::write(old.join("holders.json"), b"{}\n").unwrap();
+        let new = default_state_dir_in(&home).unwrap();
+        let registry_bytes = std::fs::read(new.join("registry.json")).unwrap();
+        let holders_bytes = std::fs::read(new.join("holders.json")).unwrap();
+
+        assert_eq!(default_state_dir_in(&home).unwrap(), new);
+        assert_eq!(
+            std::fs::read(new.join("registry.json")).unwrap(),
+            registry_bytes
+        );
+        assert_eq!(
+            std::fs::read(new.join("holders.json")).unwrap(),
+            holders_bytes
+        );
+    }
+
+    #[test]
+    fn does_not_migrate_a_symlinked_holders_file() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        let old = write_old_registry(&home, work.path());
+        let (_real, real_home) = self::home();
+        let target = real_home.join("holders-target.json");
+        std::fs::write(&target, b"{\"X\": 1}\n").unwrap();
+        symlink(&target, old.join("holders.json")).unwrap();
+
+        let new = default_state_dir_in(&home).unwrap();
+        assert!(!old.join("registry.json").exists(), "registry not migrated");
+        assert!(
+            old.join("holders.json").symlink_metadata().is_ok(),
+            "symlink removed from old"
+        );
+        assert!(
+            !new.join("holders.json").exists(),
+            "symlinked holders migrated"
+        );
     }
 
     #[test]
@@ -346,7 +481,7 @@ fn create_in(
         // only a legacy entry (predating this field) still has none.
         let mut world = world.clone();
         if cfg!(target_os = "macos") && world.temp_root.is_none() {
-            world.temp_root = Some(root_for(&home()?, world.ip));
+            world.temp_root = Some(new_root(&home()?, world.ip)?);
             worlds.insert(id.into(), world.clone());
             save(state, &worlds)?;
         }
@@ -365,7 +500,7 @@ fn create_in(
         workdir,
         // Only macOS redirects /tmp; Linux records no temp root.
         temp_root: if cfg!(target_os = "macos") {
-            Some(root_for(&home()?, ip))
+            Some(new_root(&home()?, ip)?)
         } else {
             None
         },
@@ -453,7 +588,7 @@ fn get_in(state: &Path, id: &str, home: impl FnOnce() -> Result<PathBuf>) -> Res
         .context("unknown workspace; run world workspace create first")?;
     valid(&stored, id)?;
     if cfg!(target_os = "macos") && stored.temp_root.is_none() {
-        stored.temp_root = Some(root_for(&home()?, stored.ip));
+        stored.temp_root = Some(new_root(&home()?, stored.ip)?);
         worlds.insert(id.into(), stored.clone());
         save(state, &worlds)?;
     }
@@ -490,6 +625,41 @@ fn root_for(home: &Path, ip: Ipv4Addr) -> PathBuf {
     home.join(".world/tmp").join(ip.to_string())
 }
 
+/// Reject a temp root the silo-bind shim itself would refuse to use: too long
+/// for `WORLD_TMP` (Unix socket names below it are limited to 104 bytes, and
+/// `world_tmp_path::valid_root` caps it well under that), or otherwise not a
+/// usable root (relative, containing `.`/`..`, or itself under a host temp
+/// directory). Checked both when a root is first computed and whenever one
+/// already recorded is read back, so a root that was valid when written but
+/// would no longer pass (e.g. after this limit was tightened) is refused
+/// rather than silently trusted.
+fn check_root(root: &Path) -> Result<()> {
+    let b = root.as_os_str().as_bytes();
+    if b.len() > world_tmp_path::MAX_ROOT_LEN {
+        bail!(
+            "workspace temp root {} is {} bytes; it must be at most {} bytes (use a shorter HOME)",
+            root.display(),
+            b.len(),
+            world_tmp_path::MAX_ROOT_LEN
+        );
+    }
+    ensure!(
+        world_tmp_path::valid_root(b),
+        "workspace temp root {} is not usable: it must be absolute, normalized and outside host temp directories",
+        root.display()
+    );
+    Ok(())
+}
+
+/// `root_for`, validated before it is ever handed back to a caller (and, at
+/// the call sites below, before it is persisted): a root that the shim would
+/// reject must never be written into the registry in the first place.
+fn new_root(home: &Path, ip: Ipv4Addr) -> Result<PathBuf> {
+    let r = root_for(home, ip);
+    check_root(&r)?;
+    Ok(r)
+}
+
 /// Per-workspace replacement for /tmp and /var/tmp, shared by all executions
 /// of the workspace. It must not be below a host temp directory, or its own
 /// path would be redirected. Keyed by the loopback address, which is already
@@ -505,6 +675,7 @@ pub fn temp_root(world: &World) -> Result<PathBuf> {
         .temp_root
         .as_deref()
         .context("workspace has no temp root")?;
+    check_root(root)?;
     let ip_name = world.ip.to_string();
     let shape_ok = root.is_absolute()
         && !root.components().any(|c| {
@@ -820,6 +991,25 @@ mod registry_tests {
         assert_eq!(first.temp_root, Some(root_for(&home1, first.ip)));
     }
 
+    /// A `HOME` so deep that `root_for` produces a temp root longer than
+    /// `world_tmp_path::MAX_ROOT_LEN`, without needing any of it to exist:
+    /// `root_for` does no I/O.
+    fn long_home(home: &Path) -> PathBuf {
+        home.join("a".repeat(200))
+            .join("b".repeat(200))
+            .join("c".repeat(200))
+    }
+
+    #[test]
+    fn create_in_rejects_an_overlong_temp_root() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let (_h, home) = home();
+        let err = create_in(state.path(), "A", work.path(), fixed(long_home(&home))).unwrap_err();
+        assert!(err.to_string().contains("at most 512"), "{err}");
+        assert!(!registry(state.path()).unwrap().contains_key("A"));
+    }
+
     #[test]
     fn get_in_fills_and_persists_a_legacy_entry_once() {
         let state = tempfile::tempdir().unwrap();
@@ -842,6 +1032,25 @@ mod registry_tests {
         // Already filled: a `home` that panics if called still passes.
         let again = get_in(state.path(), "A", unreachable_home).unwrap();
         assert_eq!(again.temp_root, Some(expected));
+    }
+
+    #[test]
+    fn get_in_rejects_an_overlong_temp_root_and_does_not_persist_it() {
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(state.path()).unwrap();
+        let legacy = serde_json::json!({
+            "A": {"id": "A", "ip": "127.77.0.9", "workdir": "/tmp/nonexistent"},
+        });
+        std::fs::write(
+            state.path().join("registry.json"),
+            serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        let (_h, home) = home();
+        let err = get_in(state.path(), "A", fixed(long_home(&home))).unwrap_err();
+        assert!(err.to_string().contains("at most 512"), "{err}");
+        let raw = std::fs::read_to_string(state.path().join("registry.json")).unwrap();
+        assert!(!raw.contains("temp_root"), "{raw}");
     }
 
     #[test]
@@ -908,8 +1117,11 @@ mod registry_tests {
             workdir: PathBuf::from("."),
             temp_root: Some(PathBuf::from(".world/tmp").join(ip.to_string())),
         };
+        // `check_root` now runs before the shape check and rejects a
+        // relative root itself (`valid_root` requires an absolute path), so
+        // this never reaches the "unexpected shape" message.
         let err = temp_root(&world).unwrap_err();
-        assert!(err.to_string().contains("unexpected shape"), "{err}");
+        assert!(err.to_string().contains("not usable"), "{err}");
     }
 
     #[test]
@@ -922,8 +1134,10 @@ mod registry_tests {
             workdir: home.clone(),
             temp_root: Some(home.join(".world/tmp/../tmp").join(ip.to_string())),
         };
+        // As above: `check_root`'s `valid_root` rejects a `..` component
+        // before the shape check ever sees it.
         let err = temp_root(&world).unwrap_err();
-        assert!(err.to_string().contains("unexpected shape"), "{err}");
+        assert!(err.to_string().contains("not usable"), "{err}");
     }
 
     #[test]
@@ -935,8 +1149,24 @@ mod registry_tests {
             workdir: PathBuf::from("/private/tmp/x"),
             temp_root: Some(PathBuf::from("/private/tmp/x/.world/tmp").join(ip.to_string())),
         };
+        // As above: `check_root`'s `valid_root` already refuses a root under
+        // a host temp directory, before `reject_shared_temp` would.
         let err = temp_root(&world).unwrap_err();
-        assert!(err.to_string().contains("must not be under"), "{err}");
+        assert!(err.to_string().contains("not usable"), "{err}");
+    }
+
+    #[test]
+    fn temp_root_rejects_an_overlong_root() {
+        let ip = Ipv4Addr::new(127, 77, 0, 5);
+        let root = PathBuf::from(format!("/Users/{}/.world/tmp/{ip}", "a".repeat(520)));
+        let world = World {
+            id: "A".into(),
+            ip,
+            workdir: PathBuf::from("/some/workdir"),
+            temp_root: Some(root),
+        };
+        let err = temp_root(&world).unwrap_err();
+        assert!(err.to_string().contains("512"), "{err}");
     }
 
     #[test]
