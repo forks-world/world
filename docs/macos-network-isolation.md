@@ -47,7 +47,7 @@ mkdir -p ~/world-a ~/world-b
 
 应用继续使用 localhost 和原端口，不需要配置隔离 IP。每个 Workspace 的内部地址由 World 分配，内部 silo 动态库在 `bind/connect/sendto/sendmsg` 等调用处进行透明重写。同一 Workspace 的不同进程及多次 `exec` 使用同一映射；支持 IPv4、通配绑定、双栈 socket 的 `::1`/`::` 和 UDP。显式 IPv6-only socket 不支持，返回失败而非使用宿主地址。
 
-默认状态目录为 `~/.local/share/world/workspaces`，`--state-dir` 可指定一个受信任的独立运行时注册表。若新位置尚无注册表而旧默认位置 `~/.local/share/world/silo` 中存在，首次使用时会自动将其迁移到新位置并在 stderr 提示一次；显式指定 `--state-dir` 时不做迁移。必须让需要相互协调的 Workspace 使用同一注册表。跨进程文件锁串行分配地址，元信息以临时文件、fsync、原子替换提交；同 ID 重复创建幂等，换工作目录被拒绝。地址不会自动回收给另一个 Workspace，避免仍存活的旧进程进入新 Workspace。
+默认状态目录为 `~/.local/share/world/workspaces`，`--state-dir` 可指定一个受信任的独立运行时注册表。若新位置尚无注册表而旧默认位置 `~/.local/share/world/silo` 中存在，首次使用时会自动将其迁移到新位置（连同 Linux holder 记录 `holders.json`，如果存在且新位置尚无同名文件）并在 stderr 提示一次；显式指定 `--state-dir` 时不做迁移。必须让需要相互协调的 Workspace 使用同一注册表。跨进程文件锁串行分配地址，元信息以临时文件、fsync、原子替换提交；同 ID 重复创建幂等，换工作目录被拒绝。地址不会自动回收给另一个 Workspace，避免仍存活的旧进程进入新 Workspace。
 
 ## 临时目录
 

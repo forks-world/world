@@ -99,6 +99,28 @@ fn default_state_dir_in(home: &Path) -> Result<PathBuf> {
             new.display()
         );
     }
+    // Linux also keeps live holder records (`holders.json`) alongside the
+    // registry; move them too so upgrading doesn't orphan a running
+    // namespace holder. Only a regular file is moved, and only when `new`
+    // doesn't already have one -- never overwrite state another process may
+    // already have started writing at the new location.
+    if matches!(old.join("holders.json").symlink_metadata(), Ok(m) if m.is_file())
+        && new.join("holders.json").symlink_metadata().is_err()
+    {
+        std::fs::rename(old.join("holders.json"), new.join("holders.json")).with_context(|| {
+            format!(
+                "moving workspace holder records from {} to {}",
+                old.display(),
+                new.display()
+            )
+        })?;
+        File::open(&new)?.sync_all()?;
+        eprintln!(
+            "world: moved workspace holder records from {} to {}",
+            old.display(),
+            new.display()
+        );
+    }
     Ok(new)
 }
 
@@ -159,6 +181,37 @@ mod state_dir_tests {
         let worlds = registry(&new).unwrap();
         assert_eq!(worlds["X"].ip, Ipv4Addr::new(127, 77, 0, 9));
         assert!(!old.join("registry.json").exists());
+    }
+
+    #[test]
+    fn migrates_holder_records_alongside_the_registry() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        let old = write_old_registry(&home, work.path());
+        std::fs::write(old.join("holders.json"), b"{}\n").unwrap();
+        let new = default_state_dir_in(&home).unwrap();
+        assert!(!old.join("registry.json").exists());
+        assert!(!old.join("holders.json").exists());
+        assert_eq!(std::fs::read(new.join("holders.json")).unwrap(), b"{}\n");
+    }
+
+    #[test]
+    fn leaves_old_holder_records_when_new_already_has_some() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        let old = write_old_registry(&home, work.path());
+        std::fs::write(old.join("holders.json"), b"{\"X\": 1}\n").unwrap();
+        let new = new_dir(&home);
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("holders.json"), b"{}\n").unwrap();
+
+        default_state_dir_in(&home).unwrap();
+        assert!(old.join("holders.json").exists(), "old holders.json moved");
+        assert_eq!(
+            std::fs::read(new.join("holders.json")).unwrap(),
+            b"{}\n",
+            "new holders.json overwritten"
+        );
     }
 
     #[test]
@@ -262,32 +315,6 @@ fn supported() -> Result<()> {
     Ok(())
 }
 
-fn lock(state: &Path) -> Result<File> {
-    std::fs::create_dir_all(state)?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(state.join("registry.lock"))?;
-    lock.lock_exclusive()?;
-    Ok(lock)
-}
-
-fn persist<T: Serialize>(state: &Path, name: &str, value: &T) -> Result<()> {
-    let mut temp = tempfile::NamedTempFile::new_in(state)?;
-    serde_json::to_writer_pretty(&mut temp, value)?;
-    temp.write_all(b"\n")?;
-    temp.as_file().sync_all()?;
-    temp.persist(state.join(name))?;
-    File::open(state)?.sync_all()?;
-    Ok(())
-}
-
-fn save(state: &Path, worlds: &BTreeMap<String, World>) -> Result<()> {
-    persist(state, "registry.json", worlds)
-}
-
 pub fn create(state: &Path, id: &str, workdir: &Path) -> Result<World> {
     create_in(state, id, workdir, host_home)
 }
@@ -346,6 +373,38 @@ fn create_in(
     worlds.insert(id.into(), world.clone());
     save(state, &worlds)?;
     Ok(world)
+}
+
+/// Take the exclusive registry lock, creating `state` first if needed. The
+/// returned file must be kept alive for as long as the lock must be held;
+/// it is released when dropped.
+fn lock(state: &Path) -> Result<File> {
+    std::fs::create_dir_all(state)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(state.join("registry.lock"))?;
+    lock.lock_exclusive()?;
+    Ok(lock)
+}
+
+/// Commit `value` to `state/name` atomically: write to a temp file in the
+/// same directory, fsync it, rename it into place, then fsync the directory
+/// so the rename itself is durable.
+fn persist<T: Serialize>(state: &Path, name: &str, value: &T) -> Result<()> {
+    let mut temp = tempfile::NamedTempFile::new_in(state)?;
+    serde_json::to_writer_pretty(&mut temp, value)?;
+    temp.write_all(b"\n")?;
+    temp.as_file().sync_all()?;
+    temp.persist(state.join(name))?;
+    File::open(state)?.sync_all()?;
+    Ok(())
+}
+
+fn save(state: &Path, worlds: &BTreeMap<String, World>) -> Result<()> {
+    persist(state, "registry.json", worlds)
 }
 
 fn registry(state: &Path) -> Result<BTreeMap<String, World>> {
