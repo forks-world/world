@@ -261,6 +261,23 @@ fn run() -> std::io::Result<()> {
             }
             std::process::exit(cmd.status()?.code().unwrap_or(99));
         }
+        "launch-envpath-nocwd" | "exec-envpath-nocwd" => {
+            // Like "launch-envpath"/"exec-envpath", but the cwd is removed
+            // right after this process is placed in it, so our own (not
+            // interposed) getcwd fails ENOENT by the time PATH is searched:
+            // a redirected, absolute PATH entry must still be honored.
+            let dir = &args[2];
+            std::fs::create_dir(dir)?;
+            std::env::set_current_dir(dir)?;
+            std::fs::remove_dir(dir)?;
+            let mut cmd = std::process::Command::new(&args[4]);
+            cmd.env("PATH", &args[3]).args(&args[5..]);
+            if args[1] == "exec-envpath-nocwd" {
+                use std::os::unix::process::CommandExt;
+                return Err(cmd.exec());
+            }
+            std::process::exit(cmd.status()?.code().unwrap_or(99));
+        }
         "launch" => {
             let status = std::process::Command::new(&args[2])
                 .args(&args[3..])

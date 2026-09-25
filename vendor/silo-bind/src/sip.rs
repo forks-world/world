@@ -1,6 +1,8 @@
 #[cfg(test)]
 use std::env;
 use std::ffi::{CStr, CString};
+use std::os::raw::c_int;
+use std::path::{Path, PathBuf};
 
 pub fn is_sip_path(path: &str) -> bool {
     path.starts_with("/usr/bin/")
@@ -14,12 +16,54 @@ pub fn find_non_sip_in_path(name: &str) -> Option<CString> {
     find_non_sip_in(name, &env::var("PATH").ok()?)
 }
 
-fn find_non_sip_in(name: &str, path_var: &str) -> Option<CString> {
+/// Resolve one `dir/name` PATH candidate to the `CString` that should actually
+/// be checked and, if it passes, executed. `literal` is the (unmapped)
+/// `dir/name` text; `cwd` is the caller's physical (already redirected, for a
+/// cwd under a temp root) working directory, when it could be determined.
+///
+/// A relative `literal` (a relative PATH entry, or the empty-entry "."
+/// convention) needs `cwd` to become an absolute candidate for `map`; with no
+/// `cwd` available, it is skipped rather than handed to `map` bare (which
+/// would silently consult whatever the host happens to hold at that
+/// relative-looking name). An absolute `literal` needs no `cwd` at all: it is
+/// already a full candidate, `cwd` or not.
+///
+/// Mapping is exactly as for the primary posix_spawnp search: an escaping
+/// `..` is handled by `map` itself, so checks and the actual exec must see
+/// the workspace-private copy, never whatever the host's real /tmp happens to
+/// hold at that name. An unmapped result keeps the literal candidate text
+/// unchanged, so argv/exec are unaffected here for the common (non-temp)
+/// case -- see the env-shebang empty-PATH-component test, which asserts the
+/// literal "./name".
+fn interpreter_candidate(
+    literal: &str,
+    cwd: Option<&Path>,
+    map: impl Fn(&Path) -> Result<PathBuf, c_int>,
+) -> Option<CString> {
     use std::os::unix::ffi::OsStringExt;
+    let physical = match cwd {
+        Some(cwd) => cwd.join(literal),
+        None if literal.starts_with('/') => PathBuf::from(literal),
+        None => return None,
+    };
+    match map(&physical) {
+        Ok(mapped) if mapped == physical => CString::new(literal).ok(),
+        Ok(mapped) => CString::new(mapped.into_os_string().into_vec()).ok(),
+        // Either a skippable "does not exist" or some other mapping failure:
+        // neither is a reason to fall back to the literal, unmapped (and
+        // possibly host) path.
+        Err(_) => None,
+    }
+}
+
+fn find_non_sip_in(name: &str, path_var: &str) -> Option<CString> {
     // An interpreter name is part of the script's semantics, not an alias.
     let names = [name];
     // Our own calls are not interposed, so this is the physical (already
-    // redirected, for a cwd under a temp root) working directory.
+    // redirected, for a cwd under a temp root) working directory. It is
+    // unavailable once the cwd itself has been removed; a relative PATH
+    // entry is then skipped (see `interpreter_candidate`), never a
+    // non-relative one.
     let cwd = std::env::current_dir().ok();
     for try_name in names {
         for dir in path_var.split(':') {
@@ -35,34 +79,9 @@ fn find_non_sip_in(name: &str, path_var: &str) -> Option<CString> {
                 continue;
             }
             let literal = format!("{}/{}", if dir.is_empty() { "." } else { dir }, try_name);
-            let Ok(literal_c) = CString::new(literal.clone()) else {
+            let Some(c) = interpreter_candidate(&literal, cwd.as_deref(), crate::tmp::map_path)
+            else {
                 continue;
-            };
-            // Map the candidate when it lies under a temp root, even via a
-            // relative PATH entry resolved against `cwd` (an escaping `..`
-            // is handled by `map_path` itself, exactly as for the primary
-            // posix_spawnp search): checks and the actual exec must see the
-            // workspace-private copy, never whatever the host's real /tmp
-            // happens to hold at that name. An unmapped result keeps the
-            // literal candidate text unchanged, so argv/exec are unaffected
-            // here for the common (non-temp) case -- see the env-shebang
-            // empty-PATH-component test, which asserts the literal "./name".
-            let c = match cwd.as_deref() {
-                Some(cwd) => {
-                    let physical = cwd.join(&literal);
-                    match crate::tmp::map_path(&physical) {
-                        Ok(mapped) if mapped == physical => literal_c,
-                        Ok(mapped) => match CString::new(mapped.into_os_string().into_vec()) {
-                            Ok(c) => c,
-                            Err(_) => continue,
-                        },
-                        // Either a skippable "does not exist" or some other
-                        // mapping failure: neither is a reason to fall back
-                        // to the literal, unmapped (and possibly host) path.
-                        Err(_) => continue,
-                    }
-                }
-                None => literal_c,
             };
             if unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0
                 && unsafe { crate::world::native_target(c.as_ptr()) }
@@ -538,5 +557,65 @@ mod tests {
     fn find_non_sip_unknown_binary_uses_no_fallbacks() {
         let result = find_non_sip_in_path("unknown-binary-xyz-12345");
         assert!(result.is_none());
+    }
+
+    // A fake `map`, in the style of `world::search_path`'s tests: rewrites
+    // anything under "/tmp/" to "/root/tmp/...", and leaves everything else
+    // (an unmapped path, or one already mapped) unchanged.
+    fn fake_map(p: &Path) -> Result<PathBuf, c_int> {
+        let bytes = p.as_os_str().as_encoded_bytes();
+        match bytes.strip_prefix(b"/tmp/") {
+            Some(rest) => Ok(PathBuf::from(format!(
+                "/root/tmp/{}",
+                std::str::from_utf8(rest).unwrap()
+            ))),
+            None => Ok(p.to_owned()),
+        }
+    }
+
+    #[test]
+    fn interpreter_candidate_absolute_literal_without_cwd_is_mapped() {
+        let candidate = interpreter_candidate("/tmp/bin/python3", None, fake_map).unwrap();
+        assert_eq!(candidate.to_str().unwrap(), "/root/tmp/bin/python3");
+    }
+
+    #[test]
+    fn interpreter_candidate_absolute_literal_without_cwd_keeps_unmapped_text() {
+        let candidate = interpreter_candidate("/opt/bin/python3", None, fake_map).unwrap();
+        assert_eq!(candidate.to_str().unwrap(), "/opt/bin/python3");
+    }
+
+    #[test]
+    fn interpreter_candidate_relative_literal_without_cwd_fails_closed() {
+        // No cwd to resolve a relative literal against: skip it without ever
+        // calling `map`, rather than handing it a bare relative path.
+        let panicking = |_: &Path| -> Result<PathBuf, c_int> { panic!("map must not be called") };
+        assert!(interpreter_candidate("./python3", None, panicking).is_none());
+    }
+
+    #[test]
+    fn interpreter_candidate_relative_literal_with_cwd_under_temp_root_is_mapped() {
+        let cwd = Path::new("/tmp/wt");
+        let candidate = interpreter_candidate("./python3", Some(cwd), fake_map).unwrap();
+        assert_eq!(candidate.to_str().unwrap(), "/root/tmp/wt/./python3");
+    }
+
+    #[test]
+    fn interpreter_candidate_relative_literal_with_cwd_outside_temp_root_keeps_literal_text() {
+        let cwd = Path::new("/cwd");
+        let candidate = interpreter_candidate("./python3", Some(cwd), fake_map).unwrap();
+        assert_eq!(candidate.to_str().unwrap(), "./python3");
+    }
+
+    #[test]
+    fn interpreter_candidate_enoent_is_none() {
+        let map = |_: &Path| -> Result<PathBuf, c_int> { Err(libc::ENOENT) };
+        assert!(interpreter_candidate("/tmp/bin/python3", None, map).is_none());
+    }
+
+    #[test]
+    fn interpreter_candidate_eloop_is_none() {
+        let map = |_: &Path| -> Result<PathBuf, c_int> { Err(libc::ELOOP) };
+        assert!(interpreter_candidate("./python3", Some(Path::new("/cwd")), map).is_none());
     }
 }

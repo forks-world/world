@@ -534,6 +534,58 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
                 self.assertEqual(json.loads(result.stdout), ["./python3", str(script)])
 
     @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_envpath_search_without_a_cwd_still_redirects_absolute_entries(self):
+        # Once the caller's own working directory has been removed, our own
+        # (not interposed) getcwd fails: a relative PATH entry can then no
+        # longer be resolved and must be skipped, but an absolute one needs
+        # no cwd at all and must still be redirected below WORLD_TMP, never
+        # fall back to whatever the host's real /tmp holds at that name.
+        n = f"wt-{uuid.uuid4().hex[:8]}"
+        (self.world_tmp / "tmp" / n).mkdir()
+        self.addCleanup(shutil.rmtree, self.world_tmp / "tmp" / n, ignore_errors=True)
+        (self.world_tmp / "tmp" / n / "python3").symlink_to(PROBE)
+        script = pathlib.Path(self.short.name) / "script"
+        script.write_text("#!/usr/bin/env python3\n")
+        script.chmod(0o755)
+        # A decoy at the same PATH entry on the host: with a live cwd this
+        # would never be reached (the entry is absolute), so seeing it used
+        # instead of the private copy would prove the redirect was skipped.
+        host_decoy = pathlib.Path("/tmp") / n
+        host_decoy.mkdir()
+        self.addCleanup(shutil.rmtree, host_decoy, ignore_errors=True)
+        (host_decoy / "python3").symlink_to(PROBE)
+        gone = pathlib.Path(self.short.name) / "gone"
+        self.assertFalse(gone.exists())
+        for mode in ["launch-envpath-nocwd", "exec-envpath-nocwd"]:
+            result = run(PROBE, mode, gone, f"/tmp/{n}", script, env=self.shim_env(self.world_tmp))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            argv = json.loads(result.stdout)
+            self.assertEqual(argv[1], str(script))
+            self.assertTrue(argv[0].startswith(os.path.realpath(self.world_tmp)), argv)
+            self.assertFalse(argv[0].startswith(str(host_decoy)), argv)
+
+        # A relative PATH entry ("." meaning the now-gone cwd itself) has
+        # nothing to resolve against and is skipped, not handed to the mapper
+        # bare: the shebang interpreter is then never found, and, since the
+        # unresolved script itself is not a native binary, the spawn is
+        # refused (see socket_probe's PermissionDenied -> 77 mapping).
+        gone2 = pathlib.Path(self.short.name) / "gone2"
+        self.assertFalse(gone2.exists())
+        result = run(PROBE, "launch-envpath-nocwd", gone2, ".", script, env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 77, result.stderr)
+
+        # A plain (non-shebang) native executable reached only via PATH
+        # search, with no cwd at all: exercises `world::search_path`'s own
+        # absolute-entry branch directly, without going through the sip.rs
+        # interpreter lookup above.
+        (self.world_tmp / "tmp" / n / "probe").symlink_to(PROBE)
+        gone3 = pathlib.Path(self.short.name) / "gone3"
+        self.assertFalse(gone3.exists())
+        result = run(PROBE, "launch-envpath-nocwd", gone3, f"/tmp/{n}", "probe", "fd", "999",
+                     env=self.shim_env(self.world_tmp))
+        self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
     def test_child_injection_values_are_immutable(self):
         ack = self.dir / "ack"
         ack.touch()

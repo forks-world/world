@@ -75,17 +75,27 @@ fn executable_file(path: &Path) -> bool {
 /// entry means `cwd` itself, matching `posix_spawnp`) before asking `map` to
 /// redirect the candidate below a temp root. A `map` error that just means
 /// "this entry does not exist" (`skippable`) moves on to the next entry; any
-/// other error aborts the whole search. Pure and allocation-only, so it is
+/// other error aborts the whole search. An absolute entry needs no `cwd` and
+/// is used as-is; a relative one (including the empty-entry "cwd itself"
+/// case) is skipped without `cwd`, rather than handed to `map` bare -- see
+/// `path_candidate`, whose own cwd lookup can fail once the caller's working
+/// directory has been removed. Pure and allocation-only, so it is
 /// unit-testable without touching the filesystem.
 fn search_path(
     name: &OsStr,
-    cwd: &Path,
+    cwd: Option<&Path>,
     path_var: &OsStr,
     map: impl Fn(&Path) -> Result<PathBuf, c_int>,
     exec: impl Fn(&Path) -> bool,
 ) -> Result<PathBuf, c_int> {
     for entry in std::env::split_paths(path_var) {
-        let candidate = cwd.join(&entry).join(name);
+        let candidate = if entry.is_absolute() {
+            entry.join(name)
+        } else if let Some(cwd) = cwd {
+            cwd.join(&entry).join(name)
+        } else {
+            continue;
+        };
         let mapped = match map(&candidate) {
             Ok(p) => p,
             Err(e) if world_tmp_path::skippable(e) => continue,
@@ -112,10 +122,20 @@ pub unsafe fn path_candidate(path: *const libc::c_char) -> Result<std::ffi::CStr
     if name.as_bytes().contains(&b'/') {
         return Ok(unsafe { CStr::from_ptr(path) }.to_owned());
     }
-    // Our own image's calls are not interposed, so this is the physical cwd.
-    let cwd = std::env::current_dir().map_err(|_| libc::EACCES)?;
+    // Our own image's calls are not interposed, so this is the physical cwd,
+    // when one can still be determined at all (getcwd fails once the caller's
+    // working directory has itself been removed). An absolute PATH entry
+    // needs no cwd and is still redirected below; only a relative one is then
+    // skipped, in `search_path`, rather than falling back to the host path.
+    let cwd = std::env::current_dir().ok();
     let path_var = std::env::var_os("PATH").unwrap_or_default();
-    let found = search_path(name, &cwd, &path_var, crate::tmp::map_path, executable_file)?;
+    let found = search_path(
+        name,
+        cwd.as_deref(),
+        &path_var,
+        crate::tmp::map_path,
+        executable_file,
+    )?;
     std::ffi::CString::new(found.as_os_str().as_bytes()).map_err(|_| libc::EACCES)
 }
 
@@ -321,7 +341,7 @@ mod tests {
         };
         let found = search_path(
             OsStr::new("probe"),
-            cwd,
+            Some(cwd),
             OsStr::new("probe-dir"),
             map,
             |_| true,
@@ -340,8 +360,14 @@ mod tests {
                 Ok(p.to_owned())
             }
         };
-        let found =
-            search_path(OsStr::new("probe"), cwd, OsStr::new("a:b"), map, |_| true).unwrap();
+        let found = search_path(
+            OsStr::new("probe"),
+            Some(cwd),
+            OsStr::new("a:b"),
+            map,
+            |_| true,
+        )
+        .unwrap();
         assert_eq!(found, Path::new("/cwd/b/probe"));
     }
 
@@ -349,8 +375,10 @@ mod tests {
     fn search_path_propagates_a_non_skippable_error() {
         let cwd = Path::new("/cwd");
         let map = |_: &Path| -> Result<PathBuf, c_int> { Err(libc::ELOOP) };
-        let err =
-            search_path(OsStr::new("probe"), cwd, OsStr::new("a"), map, |_| true).unwrap_err();
+        let err = search_path(OsStr::new("probe"), Some(cwd), OsStr::new("a"), map, |_| {
+            true
+        })
+        .unwrap_err();
         assert_eq!(err, libc::ELOOP);
     }
 
@@ -358,8 +386,14 @@ mod tests {
     fn search_path_fails_with_eacces_when_nothing_is_found() {
         let cwd = Path::new("/cwd");
         let map = |p: &Path| -> Result<PathBuf, c_int> { Ok(p.to_owned()) };
-        let err =
-            search_path(OsStr::new("probe"), cwd, OsStr::new("a:b"), map, |_| false).unwrap_err();
+        let err = search_path(
+            OsStr::new("probe"),
+            Some(cwd),
+            OsStr::new("a:b"),
+            map,
+            |_| false,
+        )
+        .unwrap_err();
         assert_eq!(err, libc::EACCES);
     }
 
@@ -367,8 +401,57 @@ mod tests {
     fn search_path_empty_entry_means_cwd() {
         let cwd = Path::new("/cwd");
         let map = |p: &Path| -> Result<PathBuf, c_int> { Ok(p.to_owned()) };
-        let found = search_path(OsStr::new("probe"), cwd, OsStr::new(""), map, |_| true).unwrap();
+        let found = search_path(OsStr::new("probe"), Some(cwd), OsStr::new(""), map, |_| {
+            true
+        })
+        .unwrap();
         assert_eq!(found, Path::new("/cwd/probe"));
+    }
+
+    #[test]
+    fn search_path_absolute_entry_without_cwd_is_still_mapped() {
+        // No cwd is needed for an absolute entry: it is joined and mapped
+        // as-is, and `map` never has to see the (unavailable) name "a".
+        let map = |p: &Path| -> Result<PathBuf, c_int> {
+            assert_eq!(p, Path::new("/abs/probe"));
+            Ok(p.to_owned())
+        };
+        let found = search_path(OsStr::new("probe"), None, OsStr::new("a:/abs"), map, |_| {
+            true
+        })
+        .unwrap();
+        assert_eq!(found, Path::new("/abs/probe"));
+    }
+
+    #[test]
+    fn search_path_relative_entries_without_cwd_are_skipped() {
+        let map = |p: &Path| -> Result<PathBuf, c_int> { Ok(p.to_owned()) };
+        let err =
+            search_path(OsStr::new("probe"), None, OsStr::new(""), map, |_| true).unwrap_err();
+        assert_eq!(err, libc::EACCES);
+        let err =
+            search_path(OsStr::new("probe"), None, OsStr::new("a"), map, |_| true).unwrap_err();
+        assert_eq!(err, libc::EACCES);
+    }
+
+    #[test]
+    fn search_path_without_cwd_still_redirects_a_tmp_rooted_absolute_entry() {
+        let map = |p: &Path| -> Result<PathBuf, c_int> {
+            let bytes = p.as_os_str().as_encoded_bytes();
+            if let Some(rest) = bytes.strip_prefix(b"/tmp/") {
+                Ok(PathBuf::from(format!(
+                    "/root/tmp/{}",
+                    std::str::from_utf8(rest).unwrap()
+                )))
+            } else {
+                Ok(p.to_owned())
+            }
+        };
+        let found = search_path(OsStr::new("probe"), None, OsStr::new("/tmp/x"), map, |_| {
+            true
+        })
+        .unwrap();
+        assert_eq!(found, Path::new("/root/tmp/x/probe"));
     }
 
     #[test]

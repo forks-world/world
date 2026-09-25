@@ -69,7 +69,7 @@ mkdir -p ~/world-a ~/world-b
 - 私有目录不会随 Workspace 自动清理，也不像宿主 `/tmp` 那样在重启时清空；需要时停止任务后手动删除。
 - `~/.world`、`~/.world/tmp`、`<地址>`、`tmp`、`var`、`var/tmp` 必须是当前用户拥有的真实目录（非符号链接），前两级不可被组/其他用户写；否则拒绝执行且不修改任何权限。
 - `world exec` 的入口程序（绝对/相对路径或经 PATH 查找）同样先按该 Workspace 的临时目录重定向，再做 SIP/setuid/脚本校验并启动；argv[0] 保持用户写法。
-- 受管进程内 `posix_spawnp` 及 `env` 解释器按 PATH 查找时，相对 PATH 项先按进程实际（物理）工作目录补全再重定向；私有前缀不存在（ENOENT/ENOTDIR/EACCES）则跳过该项，其他错误直接返回，不回退宿主路径。
+- 受管进程内 `posix_spawnp` 及 `env` 解释器按 PATH 查找时，相对 PATH 项先按进程实际（物理）工作目录补全再重定向；私有前缀不存在（ENOENT/ENOTDIR/EACCES）则跳过该项，其他错误直接返回，不回退宿主路径。无法取得进程工作目录（如已被删除）时，绝对 PATH 项仍照常重定向，相对 PATH 项（含空项）一律跳过，不回退宿主路径。
 
 旧版本按 `/tmp/world-a` 创建的 Workspace 无法再执行；运行 `world workspace create <ID> --workdir </tmp 之外的目录>` 可改指新目录，内部地址和私有临时目录保持不变（旧目录中的文件不会被移动）。
 
