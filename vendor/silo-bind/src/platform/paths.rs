@@ -2,14 +2,22 @@
 //! Path results (getcwd, realpath, readlink, AF_UNIX names) report host names.
 //! Only libSystem entry points are covered: raw syscalls, pre-existing symlinks
 //! into host temp roots and `fcntl(F_GETPATH)` still observe physical paths.
-use crate::tmp::{PATH_MAX, copy_cwd, copy_link, map_ptr, root, unmap_cstr, unmap_unix};
+use crate::tmp::{
+    PATH_MAX, copy_cwd, copy_link, map_ptr, map_ptr_abs, map_ptr_at, root, unmap_cstr, unmap_unix,
+};
 use libc::{
     c_char, c_int, c_long, c_ulong, c_void, dev_t, gid_t, mode_t, off_t, size_t, sockaddr,
     socklen_t, ssize_t, uid_t,
 };
 
+// Each path argument in the list is one of:
+//   `path @ fd`     -- dirfd-relative (an *at variant's own dirfd argument)
+//   `path @ verbatim` -- mapped only when absolute, exactly as a symlink's
+//                        own target must be (a relative one resolves later,
+//                        against the link's directory, not this call's cwd)
+//   `path`          -- plain, resolved against the cwd
 macro_rules! redirect {
-    ($module:ident, $symbol:literal, ($($arg:ident: $ty:ty),*) -> $ret:ty, [$($path:ident),+], $fail:expr) => {
+    ($module:ident, $symbol:literal, ($($arg:ident: $ty:ty),*) -> $ret:ty, [$($spec:tt)+], $fail:expr) => {
         mod $module {
             #[allow(unused_imports)]
             use super::*;
@@ -19,20 +27,74 @@ macro_rules! redirect {
             }
             unsafe extern "C" fn entry($($arg: $ty),*) -> $ret {
                 // Shadowed buffers stay alive until the real call returns.
-                $(
-                    let mut buf = [0u8; PATH_MAX];
-                    let $path = match unsafe { map_ptr($path, &mut buf) } {
-                        Ok(path) => path,
-                        Err(error) => {
-                            unsafe { *crate::errno_ptr() = error };
-                            return $fail;
-                        }
-                    };
-                )+
+                redirect!(@args $fail; $($spec)+);
                 unsafe { real($($arg),*) }
             }
             interpose!(INTERPOSE, entry, real);
         }
+    };
+    (@args $fail:expr; $path:ident @ verbatim, $($rest:tt)+) => {
+        let mut buf = [0u8; PATH_MAX];
+        let $path = match unsafe { map_ptr_abs($path, &mut buf) } {
+            Ok(path) => path,
+            Err(error) => {
+                unsafe { *crate::errno_ptr() = error };
+                return $fail;
+            }
+        };
+        redirect!(@args $fail; $($rest)+);
+    };
+    (@args $fail:expr; $path:ident @ verbatim) => {
+        let mut buf = [0u8; PATH_MAX];
+        let $path = match unsafe { map_ptr_abs($path, &mut buf) } {
+            Ok(path) => path,
+            Err(error) => {
+                unsafe { *crate::errno_ptr() = error };
+                return $fail;
+            }
+        };
+    };
+    (@args $fail:expr; $path:ident @ $fd:ident, $($rest:tt)+) => {
+        let mut buf = [0u8; PATH_MAX];
+        let $path = match unsafe { map_ptr_at($fd, $path, &mut buf) } {
+            Ok(path) => path,
+            Err(error) => {
+                unsafe { *crate::errno_ptr() = error };
+                return $fail;
+            }
+        };
+        redirect!(@args $fail; $($rest)+);
+    };
+    (@args $fail:expr; $path:ident @ $fd:ident) => {
+        let mut buf = [0u8; PATH_MAX];
+        let $path = match unsafe { map_ptr_at($fd, $path, &mut buf) } {
+            Ok(path) => path,
+            Err(error) => {
+                unsafe { *crate::errno_ptr() = error };
+                return $fail;
+            }
+        };
+    };
+    (@args $fail:expr; $path:ident, $($rest:tt)+) => {
+        let mut buf = [0u8; PATH_MAX];
+        let $path = match unsafe { map_ptr($path, &mut buf) } {
+            Ok(path) => path,
+            Err(error) => {
+                unsafe { *crate::errno_ptr() = error };
+                return $fail;
+            }
+        };
+        redirect!(@args $fail; $($rest)+);
+    };
+    (@args $fail:expr; $path:ident) => {
+        let mut buf = [0u8; PATH_MAX];
+        let $path = match unsafe { map_ptr($path, &mut buf) } {
+            Ok(path) => path,
+            Err(error) => {
+                unsafe { *crate::errno_ptr() = error };
+                return $fail;
+            }
+        };
     };
 }
 
@@ -42,30 +104,30 @@ redirect!(stat, "stat", (path: Path, buf: *mut c_void) -> c_int, [path], -1);
 redirect!(lstat, "lstat", (path: Path, buf: *mut c_void) -> c_int, [path], -1);
 redirect!(stat64, "stat64", (path: Path, buf: *mut c_void) -> c_int, [path], -1);
 redirect!(lstat64, "lstat64", (path: Path, buf: *mut c_void) -> c_int, [path], -1);
-redirect!(fstatat, "fstatat", (fd: c_int, path: Path, buf: *mut c_void, flag: c_int) -> c_int, [path], -1);
+redirect!(fstatat, "fstatat", (fd: c_int, path: Path, buf: *mut c_void, flag: c_int) -> c_int, [path @ fd], -1);
 redirect!(statfs, "statfs", (path: Path, buf: *mut c_void) -> c_int, [path], -1);
 redirect!(statfs64, "statfs64", (path: Path, buf: *mut c_void) -> c_int, [path], -1);
 redirect!(access, "access", (path: Path, mode: c_int) -> c_int, [path], -1);
-redirect!(faccessat, "faccessat", (fd: c_int, path: Path, mode: c_int, flag: c_int) -> c_int, [path], -1);
+redirect!(faccessat, "faccessat", (fd: c_int, path: Path, mode: c_int, flag: c_int) -> c_int, [path @ fd], -1);
 redirect!(mkdir, "mkdir", (path: Path, mode: mode_t) -> c_int, [path], -1);
-redirect!(mkdirat, "mkdirat", (fd: c_int, path: Path, mode: mode_t) -> c_int, [path], -1);
+redirect!(mkdirat, "mkdirat", (fd: c_int, path: Path, mode: mode_t) -> c_int, [path @ fd], -1);
 redirect!(mkfifo, "mkfifo", (path: Path, mode: mode_t) -> c_int, [path], -1);
-redirect!(mkfifoat, "mkfifoat", (fd: c_int, path: Path, mode: mode_t) -> c_int, [path], -1);
+redirect!(mkfifoat, "mkfifoat", (fd: c_int, path: Path, mode: mode_t) -> c_int, [path @ fd], -1);
 redirect!(mknod, "mknod", (path: Path, mode: mode_t, dev: dev_t) -> c_int, [path], -1);
-redirect!(mknodat, "mknodat", (fd: c_int, path: Path, mode: mode_t, dev: dev_t) -> c_int, [path], -1);
+redirect!(mknodat, "mknodat", (fd: c_int, path: Path, mode: mode_t, dev: dev_t) -> c_int, [path @ fd], -1);
 redirect!(rmdir, "rmdir", (path: Path) -> c_int, [path], -1);
 redirect!(unlink, "unlink", (path: Path) -> c_int, [path], -1);
-redirect!(unlinkat, "unlinkat", (fd: c_int, path: Path, flag: c_int) -> c_int, [path], -1);
+redirect!(unlinkat, "unlinkat", (fd: c_int, path: Path, flag: c_int) -> c_int, [path @ fd], -1);
 redirect!(chdir, "chdir", (path: Path) -> c_int, [path], -1);
 redirect!(chmod, "chmod", (path: Path, mode: mode_t) -> c_int, [path], -1);
-redirect!(fchmodat, "fchmodat", (fd: c_int, path: Path, mode: mode_t, flag: c_int) -> c_int, [path], -1);
+redirect!(fchmodat, "fchmodat", (fd: c_int, path: Path, mode: mode_t, flag: c_int) -> c_int, [path @ fd], -1);
 redirect!(chown, "chown", (path: Path, owner: uid_t, group: gid_t) -> c_int, [path], -1);
 redirect!(lchown, "lchown", (path: Path, owner: uid_t, group: gid_t) -> c_int, [path], -1);
-redirect!(fchownat, "fchownat", (fd: c_int, path: Path, owner: uid_t, group: gid_t, flag: c_int) -> c_int, [path], -1);
+redirect!(fchownat, "fchownat", (fd: c_int, path: Path, owner: uid_t, group: gid_t, flag: c_int) -> c_int, [path @ fd], -1);
 redirect!(truncate, "truncate", (path: Path, length: off_t) -> c_int, [path], -1);
 redirect!(utimes, "utimes", (path: Path, times: *const c_void) -> c_int, [path], -1);
 redirect!(lutimes, "lutimes", (path: Path, times: *const c_void) -> c_int, [path], -1);
-redirect!(utimensat, "utimensat", (fd: c_int, path: Path, times: *const c_void, flag: c_int) -> c_int, [path], -1);
+redirect!(utimensat, "utimensat", (fd: c_int, path: Path, times: *const c_void, flag: c_int) -> c_int, [path @ fd], -1);
 redirect!(chflags, "chflags", (path: Path, flags: u32) -> c_int, [path], -1);
 redirect!(lchflags, "lchflags", (path: Path, flags: u32) -> c_int, [path], -1);
 redirect!(pathconf, "pathconf", (path: Path, name: c_int) -> c_long, [path], -1);
@@ -75,21 +137,23 @@ redirect!(removexattr, "removexattr", (path: Path, name: Path, options: c_int) -
 redirect!(listxattr, "listxattr", (path: Path, names: *mut c_char, size: size_t, options: c_int) -> ssize_t, [path], -1);
 redirect!(getattrlist, "getattrlist", (path: Path, attrs: *mut c_void, buf: *mut c_void, size: size_t, options: u32) -> c_int, [path], -1);
 redirect!(setattrlist, "setattrlist", (path: Path, attrs: *mut c_void, buf: *mut c_void, size: size_t, options: u32) -> c_int, [path], -1);
-redirect!(getattrlistat, "getattrlistat", (fd: c_int, path: Path, attrs: *mut c_void, buf: *mut c_void, size: size_t, options: c_ulong) -> c_int, [path], -1);
-redirect!(setattrlistat, "setattrlistat", (fd: c_int, path: Path, attrs: *mut c_void, buf: *mut c_void, size: size_t, options: u32) -> c_int, [path], -1);
+redirect!(getattrlistat, "getattrlistat", (fd: c_int, path: Path, attrs: *mut c_void, buf: *mut c_void, size: size_t, options: c_ulong) -> c_int, [path @ fd], -1);
+redirect!(setattrlistat, "setattrlistat", (fd: c_int, path: Path, attrs: *mut c_void, buf: *mut c_void, size: size_t, options: u32) -> c_int, [path @ fd], -1);
 redirect!(rename, "rename", (from: Path, to: Path) -> c_int, [from, to], -1);
-redirect!(renameat, "renameat", (from_fd: c_int, from: Path, to_fd: c_int, to: Path) -> c_int, [from, to], -1);
+redirect!(renameat, "renameat", (from_fd: c_int, from: Path, to_fd: c_int, to: Path) -> c_int, [from @ from_fd, to @ to_fd], -1);
 redirect!(renamex_np, "renamex_np", (from: Path, to: Path, flags: u32) -> c_int, [from, to], -1);
-redirect!(renameatx_np, "renameatx_np", (from_fd: c_int, from: Path, to_fd: c_int, to: Path, flags: u32) -> c_int, [from, to], -1);
+redirect!(renameatx_np, "renameatx_np", (from_fd: c_int, from: Path, to_fd: c_int, to: Path, flags: u32) -> c_int, [from @ from_fd, to @ to_fd], -1);
 redirect!(link, "link", (from: Path, to: Path) -> c_int, [from, to], -1);
-redirect!(linkat, "linkat", (from_fd: c_int, from: Path, to_fd: c_int, to: Path, flag: c_int) -> c_int, [from, to], -1);
+redirect!(linkat, "linkat", (from_fd: c_int, from: Path, to_fd: c_int, to: Path, flag: c_int) -> c_int, [from @ from_fd, to @ to_fd], -1);
 // A link target naming a host temp root is stored as its World location, so
-// the kernel resolves it there; readlink reports the host name again.
-redirect!(symlink, "symlink", (target: Path, path: Path) -> c_int, [target, path], -1);
-redirect!(symlinkat, "symlinkat", (target: Path, fd: c_int, path: Path) -> c_int, [target, path], -1);
+// the kernel resolves it there; readlink reports the host name again. A
+// relative target is left untouched either way: it resolves later, against
+// the link's own directory, never against this call's cwd or dirfd.
+redirect!(symlink, "symlink", (target: Path, path: Path) -> c_int, [target @ verbatim, path], -1);
+redirect!(symlinkat, "symlinkat", (target: Path, fd: c_int, path: Path) -> c_int, [target @ verbatim, path @ fd], -1);
 redirect!(clonefile, "clonefile", (from: Path, to: Path, flags: u32) -> c_int, [from, to], -1);
-redirect!(clonefileat, "clonefileat", (from_fd: c_int, from: Path, to_fd: c_int, to: Path, flags: u32) -> c_int, [from, to], -1);
-redirect!(fclonefileat, "fclonefileat", (from_fd: c_int, to_fd: c_int, to: Path, flags: u32) -> c_int, [to], -1);
+redirect!(clonefileat, "clonefileat", (from_fd: c_int, from: Path, to_fd: c_int, to: Path, flags: u32) -> c_int, [from @ from_fd, to @ to_fd], -1);
+redirect!(fclonefileat, "fclonefileat", (from_fd: c_int, to_fd: c_int, to: Path, flags: u32) -> c_int, [to @ to_fd], -1);
 redirect!(exchangedata, "exchangedata", (a: Path, b: Path, options: u32) -> c_int, [a, b], -1);
 
 // open and openat take their optional mode as a C variadic argument.
@@ -122,7 +186,7 @@ macro_rules! open_impl {
         #[unsafe(no_mangle)]
         unsafe extern "C" fn $impl(fd: c_int, path: Path, flags: c_int, mode: c_int) -> c_int {
             let mut buf = [0u8; PATH_MAX];
-            match unsafe { map_ptr(path, &mut buf) } {
+            match unsafe { map_ptr_at(fd, path, &mut buf) } {
                 Ok(path) => unsafe { $real(fd, path, flags, mode) },
                 Err(error) => {
                     unsafe { *crate::errno_ptr() = error };
@@ -238,7 +302,7 @@ unsafe extern "C" fn readlinkat_entry(
     size: size_t,
 ) -> ssize_t {
     let mut mapped = [0u8; PATH_MAX];
-    let path = match unsafe { map_ptr(path, &mut mapped) } {
+    let path = match unsafe { map_ptr_at(fd, path, &mut mapped) } {
         Ok(path) => path,
         Err(error) => {
             unsafe { *crate::errno_ptr() = error };

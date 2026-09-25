@@ -12,7 +12,7 @@ use std::os::raw::{c_char, c_int};
 use std::sync::OnceLock;
 
 pub(crate) use world_tmp_path::{
-    PATH_MAX, SUN_PATH_OFFSET, copy_cwd, copy_link, map, requeried_unix, unmap_in_place,
+    PATH_MAX, SUN_PATH_OFFSET, copy_cwd, copy_link, map, map_at, requeried_unix, unmap_in_place,
     unmap_sockaddr, valid_root,
 };
 
@@ -42,9 +42,46 @@ pub fn root() -> Option<&'static [u8]> {
     ROOT.get().and_then(Option::as_deref)
 }
 
-/// Map a C path for an interposed call. The returned pointer is either `path`
-/// or points into `buf`, which must outlive its use.
+/// Map a C path for an interposed call, exactly as the kernel would resolve
+/// it if relative to `dirfd` (or the cwd, for `AT_FDCWD`): a relative operand
+/// containing `..` can otherwise reach a host temp root, or, from a cwd
+/// already inside a workspace's private tree, escape it physically without
+/// escaping it logically. The returned pointer is either `path` or points
+/// into `buf`, which must outlive its use.
+pub unsafe fn map_ptr_at(
+    dirfd: c_int,
+    path: *const c_char,
+    buf: &mut [u8; PATH_MAX],
+) -> Result<*const c_char, c_int> {
+    let Some(root) = root() else {
+        return Ok(path);
+    };
+    if path.is_null() {
+        return Ok(path);
+    }
+    let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+    Ok(match map_at(root, dirfd, bytes, buf)? {
+        Some(_) => buf.as_ptr().cast(),
+        None => path,
+    })
+}
+
+/// `map_ptr_at` against the cwd.
 pub unsafe fn map_ptr(
+    path: *const c_char,
+    buf: &mut [u8; PATH_MAX],
+) -> Result<*const c_char, c_int> {
+    unsafe { map_ptr_at(libc::AT_FDCWD, path, buf) }
+}
+
+/// Map only an absolute C path, leaving a relative one untouched (today's
+/// plain behavior, kept where the caller must still see the original
+/// relative text): a spawn's exec target when file actions will change cwd
+/// before it runs (the relative-path guard must see what the kernel will
+/// actually resolve against the *child's* cwd), and a
+/// `posix_spawn_file_actions_add*` path, which the kernel itself resolves in
+/// the child, after any earlier chdir action.
+pub unsafe fn map_ptr_abs(
     path: *const c_char,
     buf: &mut [u8; PATH_MAX],
 ) -> Result<*const c_char, c_int> {
@@ -109,7 +146,9 @@ pub unsafe fn map_unix(
     let raw = unsafe { std::slice::from_raw_parts(un.sun_path.as_ptr().cast::<u8>(), available) };
     let path = raw.split(|&b| b == 0).next().unwrap_or_default();
     let mut buf = [0u8; PATH_MAX];
-    let Some(mapped) = map(root, path, &mut buf)? else {
+    // A relative sun_path (bind/connect resolve it against the cwd) can also
+    // reach a host temp root.
+    let Some(mapped) = map_at(root, libc::AT_FDCWD, path, &mut buf)? else {
         return Ok((addr, len));
     };
     let out = storage.write(unsafe { std::mem::zeroed() });

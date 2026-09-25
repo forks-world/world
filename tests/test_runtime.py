@@ -675,6 +675,28 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         self.assertEqual(report["missing"], errno.ENOENT)
 
     @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_relative_dotdot_reaches_and_escapes_a_redirected_temp_root(self):
+        # A relative path containing ".." can reach a host temp root just as
+        # an absolute one can (joined against the real, physical cwd), and,
+        # once the cwd is already inside a workspace's private tree, a
+        # further relative ".." must land on the *reported* (host) location
+        # rather than wherever it physically resolves inside that tree.
+        n = f"wt-{uuid.uuid4().hex[:8]}"
+        cwd = pathlib.Path(self.short.name) / "c"
+        cwd.mkdir()
+        k = os.path.realpath(cwd).count("/")
+        result = run(PROBE, "temp-relative", n, str(k), env=self.shim_env(self.world_tmp), cwd=cwd)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["absent_errno"], errno.ENOENT)
+        self.assertTrue(report["hosts_readable"], report)
+        physical = self.world_tmp / "tmp" / n
+        self.assertEqual((physical / "f").read_text(), "f")
+        self.assertEqual((physical / "f2").read_text(), "f2")
+        self.assertTrue((physical / "s").is_socket())
+        self.assertFalse(os.path.lexists(f"/tmp/{n}"))
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
     def test_getcwd_reports_the_host_name_even_in_a_small_buffer(self):
         name = f"wt-{uuid.uuid4().hex[:8]}"
         result = run(PROBE, "cwd-sized", name, env=self.shim_env(self.world_tmp))

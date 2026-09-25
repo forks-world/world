@@ -136,6 +136,14 @@ fn textual_parent(path: &[u8]) -> &[u8] {
     }
 }
 
+/// True when some component of `path` is literally `tmp`. Used to decide
+/// whether a `..` popping a named (`Other`) component could possibly reach a
+/// temp root, so a plain rename like `/src/../include/x.h` never asks the
+/// kernel anything.
+fn has_tmp_component(path: &[u8]) -> bool {
+    path.split(|&b| b == b'/').any(|c| c == b"tmp")
+}
+
 /// Write the World location for `path` into `out` as a NUL-terminated string.
 /// Ok(None) means the path is used unchanged. Uses the real kernel to resolve
 /// an escaping `..` that follows a named component (see `map_with`).
@@ -146,10 +154,13 @@ pub fn map(root: &[u8], path: &[u8], out: &mut [u8]) -> Result<Option<usize>, c_
 
 /// Ask the kernel where a physical path (which may cross symlinks and may
 /// still contain unresolved `..` components) really resolves, following
-/// symlinks. Our own image's libc calls are not interposed, so this reaches
-/// the real `getattrlist` rather than looping back through `map`.
+/// symlinks. `fd` is a directory to resolve `path` against, or `AT_FDCWD` to
+/// resolve against the cwd (a non-directory `fd` reports `ENOTDIR`, as
+/// `openat` itself would). Our own image's libc calls are not interposed, so
+/// this reaches the real `getattrlistat` rather than looping back through
+/// `map`.
 #[cfg(target_os = "macos")]
-fn kernel_full_path(path: &[u8], out: &mut [u8]) -> Result<usize, c_int> {
+fn kernel_full_path_at(fd: c_int, path: &[u8], out: &mut [u8]) -> Result<usize, c_int> {
     #[repr(C)]
     struct FullPathBuf {
         length: u32,
@@ -162,7 +173,8 @@ fn kernel_full_path(path: &[u8], out: &mut [u8]) -> Result<usize, c_int> {
     let mut buf: FullPathBuf = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<FullPathBuf>();
     let ret = unsafe {
-        libc::getattrlist(
+        libc::getattrlistat(
+            fd,
             path.as_ptr().cast(),
             (&mut list as *mut libc::attrlist).cast(),
             (&mut buf as *mut FullPathBuf).cast(),
@@ -188,8 +200,20 @@ fn kernel_full_path(path: &[u8], out: &mut [u8]) -> Result<usize, c_int> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn kernel_full_path(_path: &[u8], _out: &mut [u8]) -> Result<usize, c_int> {
+fn kernel_full_path_at(_fd: c_int, _path: &[u8], _out: &mut [u8]) -> Result<usize, c_int> {
     Err(libc::ENOSYS)
+}
+
+/// Resolve an absolute (already NUL-terminated) path against the cwd.
+fn kernel_full_path(path: &[u8], out: &mut [u8]) -> Result<usize, c_int> {
+    kernel_full_path_at(libc::AT_FDCWD, path, out)
+}
+
+/// The physical, absolute name of `dirfd` (or the cwd, for `AT_FDCWD`) via
+/// the kernel: `getattrlistat(dirfd, "./", ...)` reports the full path of the
+/// directory `dirfd` itself names.
+fn real_base(dirfd: c_int, out: &mut [u8]) -> Result<usize, c_int> {
+    kernel_full_path_at(dirfd, b"./\0", out)
 }
 
 /// Write the World location for `path` into `out` as a NUL-terminated string.
@@ -247,6 +271,16 @@ pub(crate) fn map_with(
                     named: false,
                 },
                 (Scan::Base(b), _) => Scan::Other { base: b, depth: 1 },
+                // A `..` popping a named (non-temp) component is only worth
+                // asking the kernel about when a `tmp` component still
+                // follows: only then could the answer ever be redirected, so
+                // a plain `/src/../include/x.h` stays lexical and syscall-free.
+                (Scan::Other { .. }, b"..")
+                    if has_tmp_component(&cur[pos.min(cur_len)..cur_len]) =>
+                {
+                    escape = Some((0, None, comp_start, end));
+                    break;
+                }
                 (Scan::Other { base, depth: 1 }, b"..") => Scan::Base(base),
                 (Scan::Other { base, depth }, b"..") => Scan::Other {
                     base,
@@ -275,7 +309,7 @@ pub(crate) fn map_with(
                     },
                     b"..",
                 ) => {
-                    escape = Some((sub, start, comp_start, end));
+                    escape = Some((start, Some(sub), comp_start, end));
                     break;
                 }
                 (
@@ -313,7 +347,7 @@ pub(crate) fn map_with(
             };
         }
 
-        let Some((sub, start, comp_start, dotdot_end)) = escape else {
+        let Some((start, sub, comp_start, dotdot_end)) = escape else {
             let Scan::Temp { sub, start, .. } = state else {
                 if !rewritten {
                     return Ok(None);
@@ -340,19 +374,28 @@ pub(crate) fn map_with(
         };
 
         // Build the physical path up to (not including) the escaping `..`,
-        // using `out` as scratch, and ask where it really resolves.
+        // using `out` as scratch, and ask where it really resolves. A `Temp`
+        // escape's prefix is temp-root-relative and is placed below `root`
+        // first; an `Other` escape's prefix is already the absolute text
+        // being scanned. Either way a trailing "/" is appended so a named
+        // component that is really a file fails with ENOTDIR, exactly as the
+        // kernel would if asked to descend into it.
+        let head_len = sub.map_or(0, |s| root.len() + s.len());
         let prefix = &cur[start..comp_start];
-        let total = root.len() + sub.len() + prefix.len();
-        if total >= out.len() {
+        let total = head_len + prefix.len();
+        if total + 1 >= out.len() {
             return Err(libc::ENAMETOOLONG);
         }
-        out[..root.len()].copy_from_slice(root);
-        out[root.len()..root.len() + sub.len()].copy_from_slice(sub);
-        out[root.len() + sub.len()..total].copy_from_slice(prefix);
-        out[total] = 0;
+        if let Some(sub) = sub {
+            out[..root.len()].copy_from_slice(root);
+            out[root.len()..head_len].copy_from_slice(sub);
+        }
+        out[head_len..total].copy_from_slice(prefix);
+        out[total] = b'/';
+        out[total + 1] = 0;
 
         let mut resolved = [0u8; PATH_MAX];
-        let resolved_len = resolve(&out[..total + 1], &mut resolved)?;
+        let resolved_len = resolve(&out[..total + 2], &mut resolved)?;
         let host_len = unmap_in_place(root, &mut resolved, resolved_len).unwrap_or(resolved_len);
         let parent = textual_parent(&resolved[..host_len]);
         let remainder_start = if dotdot_end < cur_len {
@@ -383,9 +426,132 @@ pub(crate) fn map_with(
 
         cur[..next_len].copy_from_slice(&next[..next_len]);
         cur_len = next_len;
-        rewritten = true;
+        // An `Other` escape's rewritten prefix is kernel-equivalent to the
+        // original text (it only resolved symlinks along the way), so unless
+        // the restarted scan lands in `Temp` there is nothing to force: the
+        // original text remains fine to use unchanged.
+        if sub.is_some() {
+            rewritten = true;
+        }
     }
     Err(libc::ELOOP)
+}
+
+/// Write the World location for a `dirfd`-relative `path` into `out`, exactly
+/// as `map` does for an absolute one. Below a directory `fd` (or the cwd, for
+/// `AT_FDCWD`), a relative path with a `..` component can reach a host temp
+/// root, or, from a cwd already inside a workspace's private tree, escape it
+/// physically without escaping it logically (see `map_at_with`).
+pub fn map_at(
+    root: &[u8],
+    dirfd: c_int,
+    path: &[u8],
+    out: &mut [u8],
+) -> Result<Option<usize>, c_int> {
+    let mut resolve = kernel_full_path;
+    map_at_with(root, path, out, |b| real_base(dirfd, b), &mut resolve)
+}
+
+/// Write the World location for `path`, resolved against `base` (the real,
+/// physical directory a relative `path` starts from) into `out`. `resolve` is
+/// the kernel (or a fake, in tests), used both by `base` (via `map_at`'s
+/// `real_base`) and to finish mapping the joined absolute text.
+///
+/// An absolute `path` is handled exactly as `map_with` already does,
+/// ignoring `base` entirely. A relative `path` with no `..` component resolves
+/// through the kernel exactly as written, so `base` is never even called for
+/// it (`base` is a real syscall). Otherwise `base` is joined with `path`,
+/// popping `path`'s *leading* `.`/`..` components textually against `base`
+/// (a `..` deeper in `path` is left for `map_with`'s own scan, exactly as for
+/// any other absolute text). `base` itself is first rewritten to its
+/// *canonical* (host) name when it lies under `root`: from a cwd already
+/// inside the private tree, a `..` must land on the reported parent (e.g.
+/// `/private/tmp`), not the tree's own physical parent, since the two
+/// diverge right at the root. The joined, absolute text is then run back
+/// through `map_with`; if that itself finds no redirect but `base` was under
+/// `root`, the joined text must still be reported (never the original
+/// relative one, which the kernel would instead resolve inside the private
+/// tree).
+pub(crate) fn map_at_with(
+    root: &[u8],
+    path: &[u8],
+    out: &mut [u8],
+    base: impl FnOnce(&mut [u8]) -> Result<usize, c_int>,
+    resolve: &mut impl FnMut(&[u8], &mut [u8]) -> Result<usize, c_int>,
+) -> Result<Option<usize>, c_int> {
+    if path.starts_with(b"/") {
+        return map_with(root, path, out, resolve);
+    }
+    if !path.split(|&b| b == b'/').any(|c| c == b"..") {
+        return Ok(None);
+    }
+    let mut base_buf = [0u8; PATH_MAX];
+    let base_len = match base(&mut base_buf) {
+        Ok(n) if n < base_buf.len() => n,
+        _ => return Ok(None),
+    };
+    let under_root = unmap_in_place(root, &mut base_buf, base_len);
+    let mut len = under_root.unwrap_or(base_len);
+
+    let mut joined = [0u8; PATH_MAX];
+    joined[..len].copy_from_slice(&base_buf[..len]);
+    let mut rest = path;
+    loop {
+        rest = match rest {
+            b"." => b"",
+            b".." => {
+                pop_component(&mut len, &joined);
+                b""
+            }
+            _ if rest.starts_with(b"./") => &rest[2..],
+            _ if rest.starts_with(b"../") => {
+                pop_component(&mut len, &joined);
+                &rest[3..]
+            }
+            _ => break,
+        };
+        if rest.is_empty() {
+            break;
+        }
+    }
+    if !rest.is_empty() {
+        if &joined[..len] != b"/" {
+            if len >= joined.len() {
+                return Err(libc::ENAMETOOLONG);
+            }
+            joined[len] = b'/';
+            len += 1;
+        }
+        if len + rest.len() >= joined.len() {
+            return Err(libc::ENAMETOOLONG);
+        }
+        joined[len..len + rest.len()].copy_from_slice(rest);
+        len += rest.len();
+    }
+
+    match map_with(root, &joined[..len], out, resolve)? {
+        Some(n) => Ok(Some(n)),
+        None if under_root.is_some() => {
+            if len >= out.len() {
+                return Err(libc::ENAMETOOLONG);
+            }
+            out[..len].copy_from_slice(&joined[..len]);
+            out[len] = 0;
+            Ok(Some(len))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Remove the last component of `joined[..*len]` textually, never crossing
+/// the leading `/` itself.
+fn pop_component(len: &mut usize, joined: &[u8; PATH_MAX]) {
+    while *len > 1 && joined[*len - 1] != b'/' {
+        *len -= 1;
+    }
+    if *len > 1 {
+        *len -= 1;
+    }
 }
 
 /// Rewrite a physical World location back to its host name in place.
@@ -505,21 +671,30 @@ mod tests {
 
     const ROOT: &[u8] = b"/Users/me/.local/share/world/workspaces/tmp/127.77.0.1";
 
-    /// A resolver that stands in for the kernel: it follows `links`
-    /// (physical path -> target, matched by whole leading components;
-    /// relative targets resolve against the link's own parent, absolute
-    /// targets as-is) until none apply, then lexically normalizes. This is
-    /// oracle-consistent with the kernel exactly when no symlink is
-    /// involved, which is why the plain `mapped()` tests below (no links)
-    /// can use it in place of a live `getattrlist`.
+    /// A resolver that stands in for the kernel: it follows `links` (physical
+    /// path -> target, matched by whole leading components; relative targets
+    /// resolve against the link's own parent, absolute targets as-is) --
+    /// plus the two real symlinks every macOS host has at its root, `/var`
+    /// and `/tmp` -- until none apply, then fails with `ENOENT` for any
+    /// remaining path under `absent`, else lexically normalizes. This is
+    /// oracle-consistent with the kernel exactly when no *other* symlink is
+    /// involved, which is why the plain `mapped()` tests below (no links) can
+    /// use it in place of a live `getattrlist`. The default `/var`/`/tmp`
+    /// aliasing matters once `map_with` can ask about literal, non-root
+    /// -anchored text (the `Other`-escape case): unlike a `Temp` escape's
+    /// prefix, which is always below `root` and so never contains a literal
+    /// leading "/var" or "/tmp" to misread lexically.
     fn fake_resolve<'a>(
         links: &'a [(&'a str, &'a str)],
+        absent: &'a [&'a str],
     ) -> impl FnMut(&[u8], &mut [u8]) -> Result<usize, c_int> + 'a {
+        const DEFAULT: [(&str, &str); 2] = [("/var", "/private/var"), ("/tmp", "/private/tmp")];
         move |path: &[u8], out: &mut [u8]| {
             let mut current = path.split(|&b| b == 0).next().unwrap_or(path).to_vec();
             for _ in 0..32 {
                 let Some((link, target)) = links
                     .iter()
+                    .chain(DEFAULT.iter())
                     .find(|(link, _)| component_rest(&current, link.as_bytes()).is_some())
                 else {
                     break;
@@ -541,6 +716,12 @@ mod tests {
                 next.extend_from_slice(&rest);
                 current = next;
             }
+            if absent
+                .iter()
+                .any(|a| component_rest(&current, a.as_bytes()).is_some())
+            {
+                return Err(libc::ENOENT);
+            }
             let mut buf = [0u8; PATH_MAX];
             let len = normalize(&current, &mut buf).ok_or(libc::ENAMETOOLONG)?;
             if len >= out.len() {
@@ -552,14 +733,53 @@ mod tests {
     }
 
     fn mapped_with(path: &str, links: &[(&str, &str)]) -> Result<Option<String>, c_int> {
+        mapped_with_absent(path, links, &[])
+    }
+
+    /// Like `mapped_with`, but also reports `ENOENT` for anything under
+    /// `absent`.
+    fn mapped_with_absent(
+        path: &str,
+        links: &[(&str, &str)],
+        absent: &[&str],
+    ) -> Result<Option<String>, c_int> {
         let mut out = [0u8; PATH_MAX];
-        let mut resolve = fake_resolve(links);
+        let mut resolve = fake_resolve(links, absent);
         let result = map_with(ROOT, path.as_bytes(), &mut out, &mut resolve)?;
+        Ok(result.map(|n| String::from_utf8(out[..n].to_vec()).unwrap()))
+    }
+
+    /// Like `mapped_with`, but with a caller-supplied resolver (e.g. one that
+    /// must never be called, or that reports a specific real-world errno).
+    fn mapped_with_resolver(
+        path: &str,
+        resolve: &mut impl FnMut(&[u8], &mut [u8]) -> Result<usize, c_int>,
+    ) -> Result<Option<String>, c_int> {
+        let mut out = [0u8; PATH_MAX];
+        let result = map_with(ROOT, path.as_bytes(), &mut out, resolve)?;
         Ok(result.map(|n| String::from_utf8(out[..n].to_vec()).unwrap()))
     }
 
     fn mapped(path: &str) -> Option<String> {
         mapped_with(path, &[]).unwrap()
+    }
+
+    /// A `map_at_with` base closure that reports a fixed physical path.
+    fn fixed_base(s: String) -> impl FnOnce(&mut [u8]) -> Result<usize, c_int> {
+        move |out: &mut [u8]| {
+            out[..s.len()].copy_from_slice(s.as_bytes());
+            Ok(s.len())
+        }
+    }
+
+    fn mapped_at(
+        base: impl FnOnce(&mut [u8]) -> Result<usize, c_int>,
+        path: &str,
+    ) -> Result<Option<String>, c_int> {
+        let mut out = [0u8; PATH_MAX];
+        let mut resolve = fake_resolve(&[], &[]);
+        let result = map_at_with(ROOT, path.as_bytes(), &mut out, base, &mut resolve)?;
+        Ok(result.map(|n| String::from_utf8(out[..n].to_vec()).unwrap()))
     }
 
     #[test]
@@ -653,6 +873,116 @@ mod tests {
         let mut resolve = |_: &[u8], _: &mut [u8]| Err(libc::ENOENT);
         let result = map_with(ROOT, b"/tmp/a/../../etc", &mut out, &mut resolve);
         assert_eq!(result, Err(libc::ENOENT));
+    }
+
+    #[test]
+    fn escaping_dotdot_past_a_named_other_component_asks_the_kernel() {
+        let root = std::str::from_utf8(ROOT).unwrap();
+
+        // A definitely-absent leading component: since "tmp" still follows,
+        // the escape must ask the kernel, and its ENOENT must propagate
+        // rather than the path silently mapping into the workspace.
+        assert_eq!(
+            mapped_with_absent("/definitely-absent/../tmp/x", &[], &["/definitely-absent"]),
+            Err(libc::ENOENT)
+        );
+
+        // A symlinked leading component must be resolved by the kernel
+        // before the escaping ".." is applied, exactly like a Temp escape.
+        assert_eq!(
+            mapped_with_absent("/l/../tmp/x", &[("/l", "/private/var/folders")], &[]),
+            Ok(Some(format!("{root}/var/tmp/x")))
+        );
+
+        // Two ordinary (non-special) named components popped one at a time,
+        // no symlinks involved: same result as plain lexical resolution,
+        // reached via two escape-and-restart rounds.
+        assert_eq!(
+            mapped_with_absent("/a/b/../../tmp/x", &[], &[]),
+            Ok(Some(format!("{root}/tmp/x")))
+        );
+
+        // Popping a named component out of the aliased "/var" prefix still
+        // lands correctly on the var temp root.
+        assert_eq!(
+            mapped_with_absent("/var/x/../tmp/y", &[], &[]),
+            Ok(Some(format!("{root}/var/tmp/y")))
+        );
+
+        // No "tmp" component anywhere past the "..": stays lexical and never
+        // asks the kernel at all.
+        assert_eq!(
+            mapped_with_resolver("/Users/me/src/../include/x.h", &mut |_, _| {
+                panic!("resolver should not be called")
+            }),
+            Ok(None)
+        );
+
+        // A named component that is really a file, not a directory: the
+        // trailing "/" added to the resolve prefix makes the kernel (here,
+        // the fake standing in for it) fail with ENOTDIR, exactly as trying
+        // to `cd` into a file would.
+        let file_prefix = format!("{root}/tmp/f/");
+        assert_eq!(
+            mapped_with_resolver("/tmp/f/../../etc", &mut |p: &[u8], _: &mut [u8]| {
+                if p.starts_with(file_prefix.as_bytes()) {
+                    Err(libc::ENOTDIR)
+                } else {
+                    panic!("unexpected resolve call: {p:?}")
+                }
+            }),
+            Err(libc::ENOTDIR)
+        );
+    }
+
+    #[test]
+    fn map_at_with_joins_relative_dotdot_against_the_real_base() {
+        let root = std::str::from_utf8(ROOT).unwrap();
+
+        // No ".." at all: resolved through the kernel exactly as written,
+        // without ever calling `base` (a real syscall).
+        assert_eq!(
+            mapped_at(
+                |_: &mut [u8]| -> Result<usize, c_int> {
+                    panic!("base should not be called without ..")
+                },
+                "a/b",
+            ),
+            Ok(None)
+        );
+
+        // From an ordinary host cwd, enough ".." to reach a host temp root.
+        assert_eq!(
+            mapped_at(
+                fixed_base("/Users/alice/project".to_string()),
+                "../../../tmp/s.sock",
+            ),
+            Ok(Some(format!("{root}/tmp/s.sock")))
+        );
+        // Not enough ".." to reach anywhere redirected: left unmapped.
+        assert_eq!(
+            mapped_at(fixed_base("/Users/alice/project".to_string()), "../x"),
+            Ok(None)
+        );
+
+        // From a cwd already inside the private tree, ".." must land on the
+        // *reported* (host) parent, not the tree's own physical parent.
+        let base_a = format!("{root}/tmp/a");
+        assert_eq!(
+            mapped_at(fixed_base(base_a.clone()), "../../etc/hosts"),
+            Ok(Some("/private/etc/hosts".to_string()))
+        );
+        assert_eq!(
+            mapped_at(fixed_base(base_a), "../b"),
+            Ok(Some(format!("{root}/tmp/b")))
+        );
+
+        // A `base` failure (e.g. EBADF/ENOTDIR from a bad dirfd) just leaves
+        // the relative path for the kernel to report on itself.
+        assert_eq!(
+            mapped_at(|_: &mut [u8]| Err(libc::ENOENT), "../x"),
+            Ok(None)
+        );
     }
 
     #[test]
@@ -942,7 +1272,7 @@ mod tests {
             // it, with /var and /tmp treated as symlinks to their /private
             // forms -- must agree with an oracle built the same way.
             let mut mapped_buf = [0u8; PATH_MAX];
-            let mapped = map_with(ROOT, path.as_bytes(), &mut mapped_buf, &mut fake_resolve(&[])).unwrap();
+            let mapped = map_with(ROOT, path.as_bytes(), &mut mapped_buf, &mut fake_resolve(&[], &[])).unwrap();
             let effective: Vec<u8> = match mapped {
                 Some(n) => mapped_buf[..n].to_vec(),
                 None => path.as_bytes().to_vec(),

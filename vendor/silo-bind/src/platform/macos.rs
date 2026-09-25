@@ -207,14 +207,23 @@ unsafe fn spawn_common(
     label: &str,
     fallback: PosixSpawnFn,
 ) -> c_int {
+    let changes_cwd = unsafe { super::file_actions::changes_cwd(file_actions) };
     let mut exec_buf = [0u8; crate::tmp::PATH_MAX];
-    let path = match unsafe { crate::tmp::map_ptr(path, &mut exec_buf) } {
+    // When tracked file actions change cwd before exec, the kernel resolves a
+    // relative path against the *child's* new cwd, not this (cwd-aware)
+    // mapping's: map absolute-only here, so the relative-path guard below
+    // still sees the original relative text and rejects it, instead of
+    // validating one pathname and letting the kernel execute another.
+    let path = match unsafe {
+        if changes_cwd {
+            crate::tmp::map_ptr_abs(path, &mut exec_buf)
+        } else {
+            crate::tmp::map_ptr(path, &mut exec_buf)
+        }
+    } {
         Ok(path) => path,
         Err(error) => return error,
     };
-    let changes_cwd = unsafe { super::file_actions::changes_cwd(file_actions) };
-    // Tracked file actions change cwd before exec. Do not validate
-    // one relative pathname and then let the kernel execute another target.
     if changes_cwd
         && !path.is_null()
         && !unsafe { CStr::from_ptr(path) }.to_bytes().starts_with(b"/")

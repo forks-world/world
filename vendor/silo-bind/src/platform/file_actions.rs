@@ -8,6 +8,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Path arguments of spawn actions are resolved by the kernel in the child,
 /// so they are placed below the World temp root when the action is added.
+/// A relative one is left untouched (`map_ptr_abs`, not the cwd-aware
+/// `map_ptr`): it is resolved in the child against whatever cwd an earlier
+/// chdir action leaves it, which this (the adding) process's own cwd need
+/// not match.
 trait ActionArg: Sized {
     unsafe fn world(self, _buf: &mut [u8; crate::tmp::PATH_MAX]) -> Result<Self, c_int> {
         Ok(self)
@@ -15,7 +19,7 @@ trait ActionArg: Sized {
 }
 impl ActionArg for *const c_char {
     unsafe fn world(self, buf: &mut [u8; crate::tmp::PATH_MAX]) -> Result<Self, c_int> {
-        unsafe { crate::tmp::map_ptr(self, buf) }
+        unsafe { crate::tmp::map_ptr_abs(self, buf) }
     }
 }
 impl ActionArg for c_int {}

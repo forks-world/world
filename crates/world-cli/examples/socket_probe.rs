@@ -411,6 +411,108 @@ fn run() -> std::io::Result<()> {
             });
             print!("{report}");
         }
+        "temp-relative" => {
+            // Relative-path mapping (map_at) directly: a relative operand
+            // containing ".." can reach a host temp root just as an absolute
+            // one can, and, once the cwd is already inside a workspace's
+            // private tree, a further relative ".." must land on the
+            // *reported* (host) location, not wherever it physically resolves
+            // inside that tree. `n` is this test's unique name; `k` is the
+            // depth (in "/"-separated components) of this process's own cwd,
+            // computed by the caller so the right number of ".." reaches "/".
+            use std::ffi::CString;
+            let n = &args[2];
+            let k: usize = args[3].parse().unwrap();
+            let up = "../".repeat(k);
+            let cstr = |s: &str| CString::new(s).unwrap();
+
+            // The parent directories are created with relative mkdir calls
+            // (a bare, cwd-aware path); "tmp" itself may already exist.
+            for rel in [format!("{up}tmp"), format!("{up}tmp/{n}")] {
+                if unsafe { libc::mkdir(cstr(&rel).as_ptr(), 0o755) } != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(err);
+                    }
+                }
+            }
+
+            let f_rel = format!("{up}tmp/{n}/f");
+            let fd =
+                unsafe { libc::open(cstr(&f_rel).as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o644) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            unsafe {
+                libc::write(fd, b"f".as_ptr().cast(), 1);
+                libc::close(fd);
+            }
+
+            // The same relative text, resolved this time against a real
+            // directory fd rather than the AT_FDCWD sentinel.
+            let dirfd =
+                unsafe { libc::open(cstr(".").as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+            if dirfd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let f2_rel = format!("{up}tmp/{n}/f2");
+            let fd2 = unsafe {
+                libc::openat(
+                    dirfd,
+                    cstr(&f2_rel).as_ptr(),
+                    libc::O_CREAT | libc::O_WRONLY,
+                    0o644,
+                )
+            };
+            if fd2 < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            unsafe {
+                libc::write(fd2, b"f2".as_ptr().cast(), 2);
+                libc::close(fd2);
+                libc::close(dirfd);
+            }
+
+            let s_rel = format!("{up}tmp/{n}/s");
+            drop(std::os::unix::net::UnixListener::bind(&s_rel)?);
+
+            // A named (non-temp) component that does not exist at all,
+            // popped by "..", with "tmp" still following: must ask the
+            // kernel and report its ENOENT, not silently map into the
+            // workspace.
+            let absent = format!("/wt-absent-{n}/../tmp/{n}/f");
+            let absent_errno = unsafe {
+                let fd = libc::open(cstr(&absent).as_ptr(), libc::O_RDONLY);
+                if fd >= 0 {
+                    libc::close(fd);
+                    None
+                } else {
+                    std::io::Error::last_os_error().raw_os_error()
+                }
+            };
+
+            // Now with the cwd itself already inside the redirected root,
+            // enough ".." to leave it and reach a completely unrelated host
+            // path must land on the reported name, not the physical one.
+            if unsafe { libc::chdir(cstr(&format!("/tmp/{n}")).as_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let hosts_readable = unsafe {
+                let fd = libc::open(cstr("../../../etc/hosts").as_ptr(), libc::O_RDONLY);
+                if fd >= 0 {
+                    libc::close(fd);
+                    true
+                } else {
+                    false
+                }
+            };
+
+            let report = serde_json::json!({
+                "absent_errno": absent_errno,
+                "hosts_readable": hosts_readable,
+            });
+            print!("{report}");
+        }
         "cwd-sized" => {
             // Exercise getcwd with buffers sized against the (shorter) host
             // name, including the NULL-buffer allocating form.
