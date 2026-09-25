@@ -1330,9 +1330,13 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
     }
     // SAFETY: a non-negative result is a new descriptor we exclusively own.
     let pidfd = (pidfd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) });
-    // Let the holder continue only now that it is pinned.
-    // SAFETY: writes one byte from a static buffer to an owned pipe.
-    unsafe { libc::write(ack_write.as_raw_fd(), b"p".as_ptr().cast(), 1) };
+    // Let the holder continue only now that it is pinned. If that fails,
+    // closing the pipe makes the waiting holder exit before any setup.
+    if let Err(error) = send_byte(&ack_write, b'p') {
+        drop(ack_write);
+        reap_if_child(pidfd.as_ref());
+        return Err(error).context("start World namespace holder");
+    }
     let status = next().inspect_err(|_| reap_if_child(pidfd.as_ref()))?;
     if status != 0 {
         // A subreaper caller adopted the failed holder: reap it.
@@ -1413,6 +1417,22 @@ pub(crate) fn reap_stale_holder(holder: &Holder) {
     }
 }
 
+/// Send one handshake byte to the holder, retrying EINTR.
+fn send_byte(fd: &OwnedFd, byte: u8) -> IoResult<()> {
+    loop {
+        // SAFETY: writes one byte from a live local to an owned pipe.
+        match unsafe { libc::write(fd.as_raw_fd(), (&byte as *const u8).cast(), 1) } {
+            1 => return Ok(()),
+            _ => {
+                let error = Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
 /// A holder this process just started, pinned by pidfd when available.
 pub(crate) struct StartedHolder {
     pub holder: Holder,
@@ -1425,10 +1445,12 @@ pub(crate) struct StartedHolder {
 impl StartedHolder {
     /// Tell the holder its record has been persisted; it starts holding.
     /// Dropping without this (e.g. the process dies) makes it exit.
-    pub(crate) fn commit(mut self) {
-        if let Some(fd) = self.commit.take() {
-            // SAFETY: writes one byte from a static buffer to an owned pipe.
-            unsafe { libc::write(fd.as_raw_fd(), b"c".as_ptr().cast(), 1) };
+    /// On failure the holder has exited or will on EOF; its persisted
+    /// record is then stale and the next setup replaces it.
+    pub(crate) fn commit(mut self) -> IoResult<()> {
+        match self.commit.take() {
+            Some(fd) => send_byte(&fd, b'c'),
+            None => Ok(()),
         }
     }
 

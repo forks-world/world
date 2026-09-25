@@ -155,7 +155,9 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
             }
             return Err(err);
         }
-        started.commit();
+        started
+            .commit()
+            .context("World namespace holder exited before its record was committed")?;
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]
