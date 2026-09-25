@@ -64,11 +64,14 @@ mkdir -p ~/world-a ~/world-b
 - 私有目录路径（`HOME/.world/tmp/<地址>`）不得超过 512 字节；`create` 时超长会直接报错且不登记 Workspace。
 - Unix socket 路径上限 104 字节，重定向后路径会加上私有目录前缀（例如 `/Users/me/.world/tmp/127.77.0.1/tmp/`）。超长时 `bind/connect` 返回 `ENAMETOOLONG`。
 - 已存在于 Workspace 之外、指向 `/tmp` 的符号链接由内核解析，不经过重定向；`fcntl(F_GETPATH)`、`accept/recvfrom` 返回的对端地址、原始系统调用和脚本 shebang 中位于 `/tmp` 的解释器不在覆盖范围内。
+- 符号链接内容中若含需要内核解析才能判断是否进入 `/tmp` 的 `..`（如 `/x/../tmp/y`），按原文保存，之后由内核按宿主路径解析。
 - 宿主前缀中的 `..` 只要其后仍有 `tmp` 分量，就由内核解析实际位置后再判断；含 `..` 的相对路径，以及首个有效分量为 `tmp`、`private` 或 `var` 的相对路径（如在 `/` 下的 `tmp/x`），先按物理工作目录或 dirfd 补全再判断。无法取得工作目录或 dirfd 的物理路径（如目录已被删除）时，该调用直接以相应错误失败，不回退到未重定向的宿主路径。仍是限制的：相对符号链接目标、spawn file actions 中的路径、指向宿主临时目录且其后无 `tmp` 分量的符号链接、补全与实际调用之间其他线程 chdir 的竞争，以及工作目录或 dirfd 本身位于宿主临时目录内（仅可能来自 fd 传递或注入前打开的描述符，受管进程的 chdir/open 已被重定向）时的其他相对路径。
 - 私有目录不会随 Workspace 自动清理，也不像宿主 `/tmp` 那样在重启时清空；需要时停止任务后手动删除。
 - `~/.world`、`~/.world/tmp`、`<地址>`、`tmp`、`var`、`var/tmp` 必须是当前用户拥有的真实目录（非符号链接），前两级不可被组/其他用户写；否则拒绝执行且不修改任何权限。
 - `world exec` 的入口程序（绝对/相对路径或经 PATH 查找）同样先按该 Workspace 的临时目录重定向，再做 SIP/setuid/脚本校验并启动；argv[0] 保持用户写法。
 - 受管进程内 `posix_spawnp` 及 `env` 解释器按 PATH 查找时，相对 PATH 项先按进程实际（物理）工作目录补全再重定向；私有前缀不存在（ENOENT/ENOTDIR/EACCES）则跳过该项，其他错误直接返回，不回退宿主路径。
+
+旧版本按 `/tmp/world-a` 创建的 Workspace 无法再执行；运行 `world workspace create <ID> --workdir </tmp 之外的目录>` 可改指新目录，内部地址和私有临时目录保持不变（旧目录中的文件不会被移动）。
 
 `world workspace show A` 查看配置。Workspace 本地 ID 是开发用稳定标识，尚未对接 forkfs 全局 Workspace Resource ID 或组织授权。`create` 成功只表示元信息登记，不表示已配置地址或通过隔离验收。重启后需要重新 `setup`。停止所有关联任务后可以按 show 返回的地址手工执行 `sudo ifconfig lo0 -alias IP` 清理别名；这不会删除工作目录或注册表。
 

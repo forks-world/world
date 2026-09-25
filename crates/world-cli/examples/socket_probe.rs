@@ -660,6 +660,18 @@ fn run() -> std::io::Result<()> {
             });
             print!("{report}");
         }
+        "symlink-read" => {
+            // A symlink target the mapper cannot map lexically (its ".."
+            // needs the kernel to judge) must still be creatable and stored
+            // verbatim, even when it points nowhere real.
+            let target = &args[2];
+            let link = &args[3];
+            std::os::unix::fs::symlink(target, link)?;
+            let report = serde_json::json!({
+                "readlink": std::fs::read_link(link)?,
+            });
+            print!("{report}");
+        }
         _ => panic!("unknown probe"),
     }
     Ok(())

@@ -12,8 +12,8 @@ use std::os::raw::{c_char, c_int};
 use std::sync::OnceLock;
 
 pub(crate) use world_tmp_path::{
-    PATH_MAX, SUN_PATH_OFFSET, copy_cwd, copy_link, map, map_at, requeried_unix, unmap_in_place,
-    unmap_sockaddr, valid_root,
+    PATH_MAX, SUN_PATH_OFFSET, copy_cwd, copy_link, map, map_at, map_target, requeried_unix,
+    unmap_in_place, unmap_sockaddr, valid_root,
 };
 
 static ROOT: OnceLock<Option<Box<[u8]>>> = OnceLock::new();
@@ -93,6 +93,27 @@ pub unsafe fn map_ptr_abs(
     }
     let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
     Ok(match map(root, bytes, buf)? {
+        Some(_) => buf.as_ptr().cast(),
+        None => path,
+    })
+}
+
+/// `map_ptr_abs`, but for a symlink target rather than a path to resolve: the
+/// mapping is purely lexical (see `map_target`), so a target that would need
+/// the kernel to decide is left as the caller wrote it rather than failing
+/// the call for a legitimately dangling symlink.
+pub unsafe fn map_ptr_target(
+    path: *const c_char,
+    buf: &mut [u8; PATH_MAX],
+) -> Result<*const c_char, c_int> {
+    let Some(root) = root() else {
+        return Ok(path);
+    };
+    if path.is_null() {
+        return Ok(path);
+    }
+    let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+    Ok(match map_target(root, bytes, buf)? {
         Some(_) => buf.as_ptr().cast(),
         None => path,
     })

@@ -3,7 +3,8 @@
 //! Only libSystem entry points are covered: raw syscalls, pre-existing symlinks
 //! into host temp roots and `fcntl(F_GETPATH)` still observe physical paths.
 use crate::tmp::{
-    PATH_MAX, copy_cwd, copy_link, map_ptr, map_ptr_abs, map_ptr_at, root, unmap_cstr, unmap_unix,
+    PATH_MAX, copy_cwd, copy_link, map_ptr, map_ptr_at, map_ptr_target, root, unmap_cstr,
+    unmap_unix,
 };
 use libc::{
     c_char, c_int, c_long, c_ulong, c_void, dev_t, gid_t, mode_t, off_t, size_t, sockaddr,
@@ -12,9 +13,11 @@ use libc::{
 
 // Each path argument in the list is one of:
 //   `path @ fd`     -- dirfd-relative (an *at variant's own dirfd argument)
-//   `path @ verbatim` -- mapped only when absolute, exactly as a symlink's
-//                        own target must be (a relative one resolves later,
-//                        against the link's directory, not this call's cwd)
+//   `path @ target`   -- a symlink target: mapped purely lexically, and only
+//                        when absolute (a relative one resolves later,
+//                        against the link's directory, not this call's cwd);
+//                        never asks the kernel, so a dangling target is left
+//                        as written rather than failing the call
 //   `path`          -- plain, resolved against the cwd
 macro_rules! redirect {
     ($module:ident, $symbol:literal, ($($arg:ident: $ty:ty),*) -> $ret:ty, [$($spec:tt)+], $fail:expr) => {
@@ -33,9 +36,9 @@ macro_rules! redirect {
             interpose!(INTERPOSE, entry, real);
         }
     };
-    (@args $fail:expr; $path:ident @ verbatim, $($rest:tt)+) => {
+    (@args $fail:expr; $path:ident @ target, $($rest:tt)+) => {
         let mut buf = [0u8; PATH_MAX];
-        let $path = match unsafe { map_ptr_abs($path, &mut buf) } {
+        let $path = match unsafe { map_ptr_target($path, &mut buf) } {
             Ok(path) => path,
             Err(error) => {
                 unsafe { *crate::errno_ptr() = error };
@@ -44,9 +47,9 @@ macro_rules! redirect {
         };
         redirect!(@args $fail; $($rest)+);
     };
-    (@args $fail:expr; $path:ident @ verbatim) => {
+    (@args $fail:expr; $path:ident @ target) => {
         let mut buf = [0u8; PATH_MAX];
-        let $path = match unsafe { map_ptr_abs($path, &mut buf) } {
+        let $path = match unsafe { map_ptr_target($path, &mut buf) } {
             Ok(path) => path,
             Err(error) => {
                 unsafe { *crate::errno_ptr() = error };
@@ -149,8 +152,8 @@ redirect!(linkat, "linkat", (from_fd: c_int, from: Path, to_fd: c_int, to: Path,
 // the kernel resolves it there; readlink reports the host name again. A
 // relative target is left untouched either way: it resolves later, against
 // the link's own directory, never against this call's cwd or dirfd.
-redirect!(symlink, "symlink", (target: Path, path: Path) -> c_int, [target @ verbatim, path], -1);
-redirect!(symlinkat, "symlinkat", (target: Path, fd: c_int, path: Path) -> c_int, [target @ verbatim, path @ fd], -1);
+redirect!(symlink, "symlink", (target: Path, path: Path) -> c_int, [target @ target, path], -1);
+redirect!(symlinkat, "symlinkat", (target: Path, fd: c_int, path: Path) -> c_int, [target @ target, path @ fd], -1);
 redirect!(clonefile, "clonefile", (from: Path, to: Path, flags: u32) -> c_int, [from, to], -1);
 redirect!(clonefileat, "clonefileat", (from_fd: c_int, from: Path, to_fd: c_int, to: Path, flags: u32) -> c_int, [from @ from_fd, to @ to_fd], -1);
 redirect!(fclonefileat, "fclonefileat", (from_fd: c_int, to_fd: c_int, to: Path, flags: u32) -> c_int, [to @ to_fd], -1);

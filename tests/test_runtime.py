@@ -675,6 +675,21 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         self.assertEqual(report["missing"], errno.ENOENT)
 
     @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_symlink_target_needing_kernel_resolution_is_stored_verbatim(self):
+        # A target whose ".." handling could only be decided by asking the
+        # kernel (an absent leading component, popped before a "tmp" one)
+        # must not fail the symlink call: it is stored exactly as given and
+        # left to resolve, possibly dangling, at lookup time.
+        n = f"wt-{uuid.uuid4().hex[:8]}"
+        (self.world_tmp / "tmp" / n).mkdir()
+        target = f"/wt-absent-{n}/../tmp/{n}/x"
+        result = run(PROBE, "symlink-read", target, f"/tmp/{n}/dangling", env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["readlink"], target)
+        self.assertEqual(os.readlink(self.world_tmp / "tmp" / n / "dangling"), target)
+        self.assertFalse(pathlib.Path(f"/tmp/{n}").exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
     def test_relative_dotdot_reaches_and_escapes_a_redirected_temp_root(self):
         # A relative path containing ".." can reach a host temp root just as
         # an absolute one can (joined against the real, physical cwd), and,
@@ -880,6 +895,41 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         result = run(WORLD, "workspace", "show", "X", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("moved workspace registry", result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_workspace_repoints_a_legacy_tmp_workdir(self):
+        # A workdir recorded straight under /tmp, as the old quickstart used
+        # to create, can no longer be executed against (macOS exec rejects
+        # it): `create` must let it be re-pointed instead of staying stuck.
+        legacy = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, legacy, ignore_errors=True)
+        state = self.dir / "S"
+        state.mkdir()
+        state.joinpath("registry.json").write_text(json.dumps({
+            "X": {"id": "X", "ip": "127.77.0.9", "workdir": os.path.realpath(legacy)},
+        }))
+        # No recorded temp_root: filling one in needs a HOME outside /tmp,
+        # kept short like self.short (sun_path is 104 bytes).
+        home = pathlib.Path(os.path.realpath(pathlib.Path(self.short.name) / "home"))
+        home.mkdir()
+        env = dict(os.environ, HOME=str(home))
+        work = self.dir / "work"
+        work.mkdir()
+
+        result = run(WORLD, "workspace", "--state-dir", state, "create", "X", "--workdir", work, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("moved", result.stderr)
+
+        result = run(WORLD, "workspace", "--state-dir", state, "show", "X", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        shown = json.loads(result.stdout)
+        self.assertEqual(shown["workdir"], os.path.realpath(work))
+        self.assertEqual(shown["ip"], "127.77.0.9")
+
+        other = self.dir / "other"
+        other.mkdir()
+        result = run(WORLD, "workspace", "--state-dir", state, "create", "X", "--workdir", other, env=env)
+        self.assertEqual(result.returncode, 125)
 
     @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_slow_output_consumer_does_not_lose_tail(self):

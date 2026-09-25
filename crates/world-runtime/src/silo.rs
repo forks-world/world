@@ -474,14 +474,32 @@ fn create_in(
     let _lock = lock(state)?;
     let mut worlds = registry(state)?;
     if let Some(world) = worlds.get(id) {
+        let mut world = world.clone();
+        let mut dirty = false;
         if world.workdir != workdir {
-            bail!("workspace already belongs to another workdir");
+            // A workdir under /tmp or /var/tmp that a legacy build recorded
+            // can no longer be executed against (see `stale_workdir`); let
+            // it be re-pointed instead of leaving the workspace stuck. Any
+            // other mismatch still means the id is taken by a different
+            // workdir.
+            if !stale_workdir(&world.workdir) {
+                bail!("workspace already belongs to another workdir");
+            }
+            eprintln!(
+                "world: workspace {id} moved from {} to {}; files left in the old directory are not moved",
+                world.workdir.display(),
+                workdir.display()
+            );
+            world.workdir = workdir;
+            dirty = true;
         }
         // Never recompute a stored root from the current process's HOME:
         // only a legacy entry (predating this field) still has none.
-        let mut world = world.clone();
         if cfg!(target_os = "macos") && world.temp_root.is_none() {
             world.temp_root = Some(new_root(&home()?, world.ip)?);
+            dirty = true;
+        }
+        if dirty {
             worlds.insert(id.into(), world.clone());
             save(state, &worlds)?;
         }
@@ -598,13 +616,32 @@ fn get_in(state: &Path, id: &str, home: impl FnOnce() -> Result<PathBuf>) -> Res
 /// Host temp directories every process shares; `world exec` redirects them.
 const SHARED_TEMP: [&str; 2] = ["/private/tmp", "/private/var/tmp"];
 
+fn in_shared_temp(p: &Path) -> bool {
+    SHARED_TEMP.iter().any(|temp| p.starts_with(temp))
+}
+
 fn reject_shared_temp(path: &Path, what: &str) -> Result<()> {
-    if SHARED_TEMP.iter().any(|temp| path.starts_with(temp)) {
+    if in_shared_temp(path) {
         bail!(
             "{what} must not be under /tmp or /var/tmp: they are redirected inside the workspace"
         );
     }
     Ok(())
+}
+
+/// A recorded workdir `world exec` now refuses (legacy macOS /tmp layout).
+///
+/// Old builds of `world workspace create` accepted a workdir straight under
+/// `/tmp` or `/var/tmp` (before symlink resolution made that `/private/tmp`
+/// or `/private/var/tmp`, which `reject_shared_temp` already rejects for new
+/// entries). After a reboot macOS also clears `/tmp`, so the directory may no
+/// longer even exist -- `canonicalize` then fails and the raw-prefix checks
+/// below are what catch it.
+fn stale_workdir(stored: &Path) -> bool {
+    cfg!(target_os = "macos")
+        && (in_shared_temp(stored)
+            || ["/tmp", "/var/tmp"].iter().any(|t| stored.starts_with(t))
+            || stored.canonicalize().is_ok_and(|p| in_shared_temp(&p)))
 }
 
 /// Canonical `HOME` of the process running `world`, rejecting one below a
@@ -991,6 +1028,106 @@ mod registry_tests {
         assert_eq!(first.temp_root, Some(root_for(&home1, first.ip)));
     }
 
+    fn seed(state: &Path, world: &World) {
+        let mut worlds = BTreeMap::new();
+        worlds.insert(world.id.clone(), world.clone());
+        save(state, &worlds).unwrap();
+    }
+
+    /// A workdir recorded under `/private/tmp` (the canonical form of a
+    /// legacy `/tmp/world-a`-style quickstart entry) can never be executed
+    /// against on macOS; `create_in` must let it be re-pointed rather than
+    /// bailing "workspace already belongs to another workdir" forever. The
+    /// old directory need not even exist.
+    #[test]
+    fn create_in_repoints_a_stale_private_tmp_workdir() {
+        let state = tempfile::tempdir().unwrap();
+        let (_h, home) = home();
+        let ip = Ipv4Addr::new(127, 77, 0, 9);
+        let root = root_for(&home, ip);
+        seed(
+            state.path(),
+            &World {
+                id: "A".into(),
+                ip,
+                workdir: PathBuf::from("/private/tmp/wt-3f9c2a10-71e4-4b8a-9c2d-2f6a1b8e9c40"),
+                temp_root: Some(root.clone()),
+            },
+        );
+        let work = tempfile::tempdir().unwrap();
+        // The stored root must never be recomputed for a re-point.
+        let world = create_in(state.path(), "A", work.path(), unreachable_home).unwrap();
+        assert_eq!(world.ip, ip);
+        assert_eq!(world.temp_root, Some(root));
+        let expected_workdir = work.path().canonicalize().unwrap();
+        assert_eq!(world.workdir, expected_workdir);
+        assert_eq!(
+            registry(state.path()).unwrap()["A"].workdir,
+            expected_workdir
+        );
+    }
+
+    /// Same, but recorded with the raw (pre-symlink-resolution) `/tmp` form
+    /// some legacy entries still have on disk.
+    #[test]
+    fn create_in_repoints_a_stale_raw_tmp_workdir() {
+        let state = tempfile::tempdir().unwrap();
+        let (_h, home) = home();
+        let ip = Ipv4Addr::new(127, 77, 0, 9);
+        let root = root_for(&home, ip);
+        seed(
+            state.path(),
+            &World {
+                id: "A".into(),
+                ip,
+                workdir: PathBuf::from("/tmp/wt-9b7e5d2c-4a11-4f0d-8e3b-1c5a7f6d9e02"),
+                temp_root: Some(root.clone()),
+            },
+        );
+        let work = tempfile::tempdir().unwrap();
+        let world = create_in(state.path(), "A", work.path(), unreachable_home).unwrap();
+        assert_eq!(world.ip, ip);
+        assert_eq!(world.temp_root, Some(root));
+        let expected_workdir = work.path().canonicalize().unwrap();
+        assert_eq!(world.workdir, expected_workdir);
+        assert_eq!(
+            registry(state.path()).unwrap()["A"].workdir,
+            expected_workdir
+        );
+    }
+
+    /// A non-stale workdir mismatch (both real, ordinary directories) is
+    /// still rejected: only a workdir `world exec` can no longer use may be
+    /// re-pointed.
+    #[test]
+    fn create_in_still_rejects_swapping_a_real_workdir() {
+        let state = tempfile::tempdir().unwrap();
+        let (_h, home) = home();
+        let work1 = tempfile::tempdir().unwrap();
+        let work2 = tempfile::tempdir().unwrap();
+        create_in(state.path(), "A", work1.path(), fixed(home)).unwrap();
+        let err = create_in(state.path(), "A", work2.path(), unreachable_home).unwrap_err();
+        assert!(
+            err.to_string().contains("belongs to another workdir"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn exec_workdir_rejects_a_stale_entry_with_a_repoint_hint() {
+        let ip = Ipv4Addr::new(127, 77, 0, 9);
+        let world = World {
+            id: "stuck".into(),
+            ip,
+            workdir: PathBuf::from("/private/tmp/wt-does-not-exist"),
+            temp_root: Some(PathBuf::from("/Users/nobody/.world/tmp").join(ip.to_string())),
+        };
+        let err = exec_workdir(&world).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("re-point it with"), "{msg}");
+        assert!(msg.contains("stuck"), "{msg}");
+    }
+
     /// A `HOME` so deep that `root_for` produces a temp root longer than
     /// `world_tmp_path::MAX_ROOT_LEN`, without needing any of it to exist:
     /// `root_for` does no I/O.
@@ -1371,6 +1508,24 @@ async fn linux_exec(
     result
 }
 
+/// The workdir to execute in, refusing one `world exec` cannot run against:
+/// a live host temp directory it would redirect out from under itself, or a
+/// legacy entry recorded under one before that redirection existed.
+#[cfg(target_os = "macos")]
+fn exec_workdir(world: &World) -> Result<PathBuf> {
+    if stale_workdir(&world.workdir) {
+        bail!(
+            "workspace {}'s workdir {} is under /tmp or /var/tmp, which world exec redirects inside the workspace; re-point it with `world workspace create {} --workdir <dir outside /tmp>`",
+            world.id,
+            world.workdir.display(),
+            world.id
+        )
+    }
+    let dir = run::workdir(&world.workdir)?;
+    reject_shared_temp(&dir, "workdir")?;
+    Ok(dir)
+}
+
 #[cfg(target_os = "macos")]
 async fn macos_exec(
     world: World,
@@ -1384,8 +1539,7 @@ async fn macos_exec(
             world.id
         );
     }
-    let dir = run::workdir(&world.workdir)?;
-    reject_shared_temp(&dir, "workdir")?;
+    let dir = exec_workdir(&world)?;
     let temp = temp_root(&world)?;
     let executable = resolve_executable(&command[0], &dir, &temp)?;
     let library = std::env::current_exe()?
@@ -1627,6 +1781,38 @@ mod tests {
         assert_ne!(other.ip, ips[0]);
         let another = tempfile::tempdir().unwrap();
         assert!(create(state.path(), "A", another.path()).is_err());
+    }
+
+    /// `stale_workdir` only excuses a workdir mismatch on macOS: Linux never
+    /// redirects `/tmp`, so a real directory under it is an ordinary workdir
+    /// and swapping it for another must still be rejected.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_in_rejects_workdir_swap_from_a_real_tmp_dir() {
+        let state = tempfile::tempdir().unwrap();
+        let stored = tempfile::Builder::new()
+            .prefix("wt-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let stored_path = stored.path().canonicalize().unwrap();
+        let mut worlds = std::collections::BTreeMap::new();
+        worlds.insert(
+            "A".to_string(),
+            World {
+                id: "A".into(),
+                ip: Ipv4Addr::new(127, 77, 0, 9),
+                workdir: stored_path,
+                temp_root: None,
+            },
+        );
+        save(state.path(), &worlds).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let home = || -> Result<PathBuf> { panic!("home should not be needed on Linux") };
+        let err = create_in(state.path(), "A", other.path(), home).unwrap_err();
+        assert!(
+            err.to_string().contains("belongs to another workdir"),
+            "{err}"
+        );
     }
 
     #[cfg(target_os = "macos")]

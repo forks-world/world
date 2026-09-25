@@ -156,6 +156,17 @@ pub fn map(root: &[u8], path: &[u8], out: &mut [u8]) -> Result<Option<usize>, c_
     map_with(root, path, out, &mut resolve)
 }
 
+/// Map a symlink target: purely lexical. A target whose decision would need
+/// the kernel (a `..` escaping a temp root, or popping a name before `tmp`)
+/// is stored verbatim; it resolves at lookup time, possibly dangling.
+pub fn map_target(root: &[u8], target: &[u8], out: &mut [u8]) -> Result<Option<usize>, c_int> {
+    const UNRESOLVED: c_int = -1; // never a real errno
+    match map_with(root, target, out, &mut |_, _| Err(UNRESOLVED)) {
+        Err(UNRESOLVED) => Ok(None),
+        r => r,
+    }
+}
+
 /// Ask the kernel where a physical path (which may cross symlinks and may
 /// still contain unresolved `..` components) really resolves, following
 /// symlinks. `fd` is a directory to resolve `path` against, or `AT_FDCWD` to
@@ -893,6 +904,43 @@ mod tests {
         let mut resolve = |_: &[u8], _: &mut [u8]| Err(libc::ENOENT);
         let result = map_with(ROOT, b"/tmp/a/../../etc", &mut out, &mut resolve);
         assert_eq!(result, Err(libc::ENOENT));
+    }
+
+    fn target_mapped(target: &str) -> Result<Option<String>, c_int> {
+        let mut out = [0u8; PATH_MAX];
+        let result = map_target(ROOT, target.as_bytes(), &mut out)?;
+        Ok(result.map(|n| String::from_utf8(out[..n].to_vec()).unwrap()))
+    }
+
+    #[test]
+    fn map_target_leaves_targets_that_would_need_the_kernel() {
+        // Both need the kernel to decide whether the ".." escapes back out to
+        // a temp root; `map_target` never asks it, so the target is stored
+        // verbatim and resolves (possibly dangling) at lookup time.
+        assert_eq!(target_mapped("/does-not-exist/../tmp/x"), Ok(None));
+        assert_eq!(target_mapped("/tmp/a/../../etc/x"), Ok(None));
+    }
+
+    #[test]
+    fn map_target_maps_purely_lexical_temp_targets() {
+        let root = std::str::from_utf8(ROOT).unwrap();
+        assert_eq!(target_mapped("/tmp/x"), Ok(Some(format!("{root}/tmp/x"))));
+        assert_eq!(
+            target_mapped("/private/var/tmp/y"),
+            Ok(Some(format!("{root}/var/tmp/y")))
+        );
+        // A ".." that never leaves the temp root is copied verbatim, exactly
+        // as `map`/`map_with` would with no symlinks in play -- no resolver
+        // call needed.
+        assert_eq!(
+            target_mapped("/tmp/a/../b"),
+            Ok(Some(format!("{root}/tmp/a/../b")))
+        );
+    }
+
+    #[test]
+    fn map_target_leaves_relative_targets() {
+        assert_eq!(target_mapped("tmp/x"), Ok(None));
     }
 
     #[test]
