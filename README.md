@@ -28,21 +28,21 @@ forkfs RPC 服务是待实现的接入契约，World 不链接 forkfs 库，也�
 World 现在使用 Rust workspace。macOS 和 Linux 已实现两种本地运行模式：
 
 - `world network exec`：出站白名单。macOS 用 Seatbelt，禁止本地监听；Linux 为每次执行创建独立的 network namespace，只有 loopback，配合 Landlock 和 seccomp。
-- `world silo exec`：多个 World 使用相同端口，同一 World 的多次执行共享地址，应用无需修改源码或配置 World IP。macOS 集成固定版本的 silo，透明重写受支持原生程序的 localhost；Linux 让每个 World 持有一个内核 network namespace，不需要 root，也不注入动态库。
+- `world exec`：在 Workspace 内执行，多个 Workspace 使用相同端口，同一 Workspace 的多次执行共享地址，应用无需修改源码或配置 World IP。macOS 内部使用固定版本的 silo 透明重写受支持原生程序的 localhost，`/tmp`、`/var/tmp` 也按 Workspace 隔离，同名锁文件和 Unix socket 互不冲突；Linux 让每个 Workspace 持有一个内核 network namespace，不需要 root，也不注入动态库（`/tmp` 暂不隔离）。
 
 ```sh
 cargo build --workspace
-mkdir -p /tmp/world-a /tmp/world-b
-./target/debug/world silo create --world A --workdir /tmp/world-a
-./target/debug/world silo create --world B --workdir /tmp/world-b
-./target/debug/world silo setup --world A
-./target/debug/world silo setup --world B
-# macOS 的 setup 需要管理员授权，只添加本 World 的 loopback 别名；
-# Linux 的 setup 不需要特权，只启动持有 World namespace 的进程（teardown 停止它）。
-./target/debug/world silo exec --world A -- /opt/homebrew/bin/python3 -m http.server 8080 --bind 127.0.0.1
+mkdir -p ~/world-a ~/world-b
+./target/debug/world workspace create A --workdir ~/world-a
+./target/debug/world workspace create B --workdir ~/world-b
+./target/debug/world workspace setup A
+./target/debug/world workspace setup B
+# macOS 的 setup 需要管理员授权，只添加本 Workspace 的 loopback 别名；
+# Linux 的 setup 不需要特权，只启动持有 Workspace namespace 的进程（world workspace teardown 停止它）。
+./target/debug/world exec A -- /opt/homebrew/bin/python3 -m http.server 8080 --bind 127.0.0.1
 # 另一终端可在 B 中运行相同命令、使用相同端口。
 ```
 
-使用、验证和兼容边界见 [macOS 网络运行时](docs/macos-network-isolation.md) 和 [Linux 网络运行时](docs/linux-network-isolation.md)。macOS silo 是开发任务的 localhost 兼容层，不是对抗恶意代码的内核网络命名空间；Linux silo 是内核 namespace，但也不限制文件访问。两者都不能与出站白名单模式混为一谈。
+使用、验证和兼容边界见 [macOS 网络运行时](docs/macos-network-isolation.md) 和 [Linux 网络运行时](docs/linux-network-isolation.md)。macOS 的 Workspace localhost 模式是开发任务的 localhost 兼容层，不是对抗恶意代码的内核网络命名空间；Linux 是内核 namespace，但也不限制文件访问。两者都不能与出站白名单模式混为一谈。
 
 完整控制面、认证、计费、Skill/MCP 和 forkfs RPC 接入仍为拟议规格。forkfs 接入坚持 RPC，不链接其 C ABI。

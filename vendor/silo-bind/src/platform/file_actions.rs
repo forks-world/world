@@ -6,6 +6,26 @@
 use libc::{c_char, c_int, mode_t, posix_spawn_file_actions_t};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Path arguments of spawn actions are resolved by the kernel in the child,
+/// so they are placed below the World temp root when the action is added.
+/// A relative one is left untouched (`map_ptr_abs`, not the cwd-aware
+/// `map_ptr`): it is resolved in the child against whatever cwd an earlier
+/// chdir action leaves it, which this (the adding) process's own cwd need
+/// not match.
+trait ActionArg: Sized {
+    unsafe fn world(self, _buf: &mut [u8; crate::tmp::PATH_MAX]) -> Result<Self, c_int> {
+        Ok(self)
+    }
+}
+impl ActionArg for *const c_char {
+    unsafe fn world(self, buf: &mut [u8; crate::tmp::PATH_MAX]) -> Result<Self, c_int> {
+        unsafe { crate::tmp::map_ptr_abs(self, buf) }
+    }
+}
+impl ActionArg for c_int {}
+impl ActionArg for mode_t {}
+impl ActionArg for libc::mach_port_t {}
+
 static CWD_ACTIONS: [AtomicUsize; 4096] = [const { AtomicUsize::new(0) }; 4096];
 
 static MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -72,24 +92,6 @@ fn reserve(value: usize) -> Result<(usize, bool), c_int> {
     Err(libc::ENOMEM)
 }
 
-#[repr(C)]
-struct Interpose {
-    replacement: *const (),
-    original: *const (),
-}
-// Immutable function addresses consumed by dyld; optional originals may be null.
-unsafe impl Sync for Interpose {}
-macro_rules! interpose {
-    ($name:ident, $replacement:ident, $original:ident) => {
-        #[used]
-        #[unsafe(link_section = "__DATA,__interpose")]
-        static $name: Interpose = Interpose {
-            replacement: $replacement as *const (),
-            original: $original as *const (),
-        };
-    };
-}
-
 unsafe extern "C" {
     #[link_name = "posix_spawn_file_actions_init"]
     fn real_init(actions: *mut posix_spawn_file_actions_t) -> c_int;
@@ -133,6 +135,11 @@ macro_rules! cwd_action {
             actions: *mut posix_spawn_file_actions_t,
             $arg: $ty,
         ) -> c_int {
+            let mut buf = [0u8; crate::tmp::PATH_MAX];
+            let $arg = match unsafe { ActionArg::world($arg, &mut buf) } {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
             let _mutation = MutationGuard::enter();
             let (slot, fresh) = match reserve(unsafe { handle(actions) }) {
                 Ok(slot) => slot,
@@ -164,6 +171,14 @@ macro_rules! other_action {
             fn $original(actions: *mut posix_spawn_file_actions_t, $($arg: $ty),+) -> c_int;
         }
         unsafe extern "C" fn $wrapper(actions: *mut posix_spawn_file_actions_t, $($arg: $ty),+) -> c_int {
+            // Shadowed buffers stay alive until the real call returns.
+            $(
+                let mut buf = [0u8; crate::tmp::PATH_MAX];
+                let $arg = match unsafe { ActionArg::world($arg, &mut buf) } {
+                    Ok(value) => value,
+                    Err(error) => return error,
+                };
+            )+
             let _mutation = MutationGuard::enter();
             let slot = find(unsafe { handle(actions) });
             let result = unsafe { $original(actions, $($arg),+) };

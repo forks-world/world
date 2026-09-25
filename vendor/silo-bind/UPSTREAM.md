@@ -13,6 +13,16 @@ Final child exec targets must be native binaries; unresolved shebangs and
 replacement interpreters that resolve to SIP-protected paths fail with EACCES.
 World also rejects setuid/setgid targets and tracks cwd-changing spawn actions
 through their public APIs, including handle relocation and both API spellings.
+World additionally redirects the shared host temp directories (`/tmp`,
+`/var/tmp` and their `/private` forms) below a per-workspace `WORLD_TMP` root
+in libSystem path calls, spawn paths and AF_UNIX addresses (`src/tmp.rs`,
+`src/platform/paths.rs`), and requires children to keep the same root. The
+pure, allocation-free mapper itself (lexical redirection, the escape-safe
+kernel-assisted rewrite, and result unmapping) lives in the workspace crate
+`crates/world-tmp-path`, so it can be shared with world-runtime's entry-point
+resolution without pulling this crate's process-wide constructor and
+`#[no_mangle]` libc interposers into the supervisor; `src/tmp.rs` keeps only
+the `WORLD_TMP` state and the libSystem-facing glue around it.
 This remains a developer compatibility layer, not a hostile-code security
 boundary: raw syscalls and uninjected code can bypass interposition.
 

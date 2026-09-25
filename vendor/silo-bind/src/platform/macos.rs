@@ -37,6 +37,21 @@ static INTERPOSE_CONNECT: Interpose = Interpose {
     original: real_connect,
 };
 
+/// Place AF_UNIX names below the World temp root; None has set errno.
+unsafe fn unix_address(
+    addr: *const sockaddr,
+    len: socklen_t,
+    storage: &mut MaybeUninit<libc::sockaddr_un>,
+) -> Option<(*const sockaddr, socklen_t)> {
+    match unsafe { crate::tmp::map_unix(addr, len, storage) } {
+        Ok(mapped) => Some(mapped),
+        Err(error) => {
+            unsafe { *errno_ptr() = error };
+            None
+        }
+    }
+}
+
 const unsafe fn debug_read_port(addr: *const sockaddr, family: c_int, len: socklen_t) -> u16 {
     if family == AF_INET && (len as usize) >= std::mem::size_of::<sockaddr_in>() {
         unsafe { u16::from_be((*(addr as *const sockaddr_in)).sin_port) }
@@ -54,6 +69,10 @@ unsafe extern "C" fn silo_bind_entry(fd: c_int, addr: *const sockaddr, len: sock
     if !unsafe { crate::world::address_allowed(addr, len, true) } {
         return -1;
     }
+    let mut unix = MaybeUninit::uninit();
+    let Some((addr, len)) = (unsafe { unix_address(addr, len, &mut unix) }) else {
+        return -1;
+    };
     if !addr.is_null() && debug_enabled() {
         let family = unsafe { (*addr).sa_family } as c_int;
         let port = unsafe { debug_read_port(addr, family, len) };
@@ -108,6 +127,10 @@ unsafe extern "C" fn silo_connect_entry(fd: c_int, addr: *const sockaddr, len: s
     if !unsafe { crate::world::address_allowed(addr, len, false) } {
         return -1;
     }
+    let mut unix = MaybeUninit::uninit();
+    let Some((addr, len)) = (unsafe { unix_address(addr, len, &mut unix) }) else {
+        return -1;
+    };
     if !addr.is_null()
         && unsafe { (*addr).sa_family as i32 } == libc::AF_INET6
         && unsafe { is_v6only(fd) }
@@ -185,8 +208,22 @@ unsafe fn spawn_common(
     fallback: PosixSpawnFn,
 ) -> c_int {
     let changes_cwd = unsafe { super::file_actions::changes_cwd(file_actions) };
-    // Tracked file actions change cwd before exec. Do not validate
-    // one relative pathname and then let the kernel execute another target.
+    let mut exec_buf = [0u8; crate::tmp::PATH_MAX];
+    // When tracked file actions change cwd before exec, the kernel resolves a
+    // relative path against the *child's* new cwd, not this (cwd-aware)
+    // mapping's: map absolute-only here, so the relative-path guard below
+    // still sees the original relative text and rejects it, instead of
+    // validating one pathname and letting the kernel execute another.
+    let path = match unsafe {
+        if changes_cwd {
+            crate::tmp::map_ptr_abs(path, &mut exec_buf)
+        } else {
+            crate::tmp::map_ptr(path, &mut exec_buf)
+        }
+    } {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
     if changes_cwd
         && !path.is_null()
         && !unsafe { CStr::from_ptr(path) }.to_bytes().starts_with(b"/")
@@ -194,10 +231,10 @@ unsafe fn spawn_common(
         return libc::EACCES;
     }
     let candidate = if label == "posix_spawnp" {
-        let Some(candidate) = (unsafe { crate::world::path_candidate(path) }) else {
-            return libc::EACCES;
-        };
-        Some(candidate)
+        match unsafe { crate::world::path_candidate(path) } {
+            Ok(candidate) => Some(candidate),
+            Err(error) => return error,
+        }
     } else {
         None
     };
@@ -307,6 +344,14 @@ unsafe extern "C" fn silo_execve_entry(
     argv: *const *const libc::c_char,
     envp: *const *const libc::c_char,
 ) -> c_int {
+    let mut exec_buf = [0u8; crate::tmp::PATH_MAX];
+    let path = match unsafe { crate::tmp::map_ptr(path, &mut exec_buf) } {
+        Ok(path) => path,
+        Err(error) => {
+            unsafe { *errno_ptr() = error };
+            return -1;
+        }
+    };
     if !unsafe { crate::world::spawn_allowed(path, envp) } {
         return -1;
     }
@@ -372,6 +417,11 @@ unsafe extern "C" fn silo_sendto_entry(
     if !unsafe { crate::world::address_allowed(dest_addr, addrlen, false) } {
         return -1;
     }
+    let mut unix = MaybeUninit::uninit();
+    let Some((dest_addr, addrlen)) = (unsafe { unix_address(dest_addr, addrlen, &mut unix) })
+    else {
+        return -1;
+    };
     let mut storage = MaybeUninit::<SockaddrStorage>::uninit();
     let (dest_addr, addrlen) =
         unsafe { maybe_rewrite_addr(dest_addr, addrlen, true, &mut storage) };
@@ -439,6 +489,27 @@ unsafe extern "C" fn silo_sendmsg_entry(
     {
         return -1;
     }
+    let unix_msg;
+    let mut unix = MaybeUninit::uninit();
+    let msg = if msg.is_null() {
+        msg
+    } else {
+        let name = unsafe { (*msg).msg_name } as *const sockaddr;
+        let Some((addr, len)) = (unsafe { unix_address(name, (*msg).msg_namelen, &mut unix) })
+        else {
+            return -1;
+        };
+        if addr == name {
+            msg
+        } else {
+            unix_msg = libc::msghdr {
+                msg_name: addr as *mut libc::c_void,
+                msg_namelen: len,
+                ..unsafe { *msg }
+            };
+            &unix_msg
+        }
+    };
     let mut msg_buf: libc::msghdr = unsafe { std::mem::zeroed() };
     let mut storage = MaybeUninit::<SockaddrStorage>::uninit();
     let msg = unsafe { prepare_sendmsg(msg, &mut msg_buf, &mut storage) };

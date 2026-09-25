@@ -423,7 +423,7 @@ pub(crate) async fn wait(
     if let Some(path) = ack
         && std::fs::read(path).unwrap_or_default() != b"world-silo-v1"
     {
-        bail!("silo injection was not confirmed; this executable is unsupported");
+        bail!("localhost isolation was not confirmed; this executable is unsupported");
     }
     Ok(match status {
         None => 124,

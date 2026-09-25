@@ -1,6 +1,6 @@
 # Linux 网络运行时
 
-Linux 与 macOS 使用同一个 CLI（`world network exec`、`world silo ...`），但后端是内核隔离：非特权 user namespace + network namespace。不需要 root，也不注入动态库。实现在 `crates/world-runtime/src/linux.rs`。
+Linux 与 macOS 使用同一个 CLI（`world network exec`、`world workspace ...`、`world exec`），但后端是内核隔离：非特权 user namespace + network namespace。不需要 root，也不注入动态库。实现在 `crates/world-runtime/src/linux.rs`。
 
 ## 前提
 
@@ -32,33 +32,34 @@ Linux 与 macOS 使用同一个 CLI（`world network exec`、`world silo ...`）
 - **错误码**：连接宿主监听端口时，得到的是 namespace 内的 `ECONNREFUSED`，而不是 `EPERM`；Unix socket 返回 `EACCES`。
 - **进程信息**：所有支持的 Landlock ABI 都会阻止对沙箱外进程的 ptrace 及相关访问（`pidfd_getfd`、`process_vm_readv`、受保护的 `/proc/<pid>` 数据），因此任务无法借用宿主进程的 socket；但任务仍能列出宿主进程和它们的命令行。Linux 6.12 以前，同一 uid 的宿主进程也可能收到任务发出的信号。
 - **路径**：私有 `/dev` 会遮住宿主 `/dev` 下的路径，因此不支持位于 `/dev` 下的工作目录（例如 `/dev/shm/...`）；`TMPDIR` 指向 `/dev` 下时，私有临时目录改建在 `/tmp`。
-- **库调用者与 SIGCHLD**：在库中调用 `network exec` / `silo exec` 的进程不能忽略 `SIGCHLD`（`SIG_IGN` 或 `SA_NOCLDWAIT`，否则会直接报错），也不能在执行期间用 `waitpid(-1)` 回收未知子进程；否则任务的退出状态会丢失，`world` 会明确报错，而不会返回错误的状态。CLI 在启动时会重置 `SIGCHLD` 并解除对它的屏蔽。
+- **库调用者与 SIGCHLD**：在库中调用 `network exec` / `world exec` 的进程不能忽略 `SIGCHLD`（`SIG_IGN` 或 `SA_NOCLDWAIT`，否则会直接报错），也不能在执行期间用 `waitpid(-1)` 回收未知子进程；否则任务的退出状态会丢失，`world` 会明确报错，而不会返回错误的状态。CLI 在启动时会重置 `SIGCHLD` 并解除对它的屏蔽。
 - **进程回收**：Linux 的两种模式都在 PID namespace 中运行任务，脱离进程组的后代也会被回收；任务内看到的 PID 是 namespace 内的编号。
 - **标准输入**：Linux 的 `network exec` 只接受匿名管道的读端、`/dev/null` 或已关闭的标准输入（管道写端会成为通向宿主的通道，也会被拒绝）。其他文件、目录、命名 FIFO、终端和设备都会被拒绝，因为即使是只读描述符，也能对其 inode 执行 `fchmod`、`fchown`、`futimens`、`fsetxattr` 或终端 ioctl。需要输入文件时改用管道，例如 `cat FILE | world network exec ...`。`/dev/null` 会在沙箱内从只读的私有 `/dev` 重新打开，因此任务不持有宿主的设备节点。
 - **硬链接**：与 macOS 一样，写入边界基于路径。调用者事先放进工作目录、指向外部文件的硬链接会共享同一个 inode，任务可以通过它写入。任务自己无法创建这类别名：硬链接跨挂载会返回 `EXDEV`，经符号链接写入会落在只读视图上。forkfs Workspace 用 clonefile/reflink 创建独立 inode，不会产生这种别名；自行指定工作目录时，不要放入指向需保护文件的硬链接。
 - **读取**：与 macOS 一样，不限制读取宿主文件。
 
-## 同端口 localhost（silo）
+## 同端口 localhost（Workspace）
 
 ```sh
 mkdir -p /tmp/world-a /tmp/world-b
-./target/debug/world silo create --world A --workdir /tmp/world-a
-./target/debug/world silo create --world B --workdir /tmp/world-b
-./target/debug/world silo setup --world A
-./target/debug/world silo setup --world B
-./target/debug/world silo exec --world A -- python3 -m http.server 8080 --bind 127.0.0.1
-./target/debug/world silo exec --world B -- python3 -m http.server 8080 --bind 127.0.0.1
-./target/debug/world silo exec --world A -- curl --noproxy '*' http://localhost:8080/
+./target/debug/world workspace create A --workdir /tmp/world-a
+./target/debug/world workspace create B --workdir /tmp/world-b
+./target/debug/world workspace setup A
+./target/debug/world workspace setup B
+./target/debug/world exec A -- python3 -m http.server 8080 --bind 127.0.0.1
+./target/debug/world exec B -- python3 -m http.server 8080 --bind 127.0.0.1
+./target/debug/world exec A -- curl --noproxy '*' http://localhost:8080/
 ```
 
 - 在 Linux 上，`setup` 不需要 sudo：它启动一个脱离终端的 holder 进程（进程名 `world-holder`，单线程，由 init 回收；不依赖 `world` 可执行文件，嵌入 `world_runtime` 的程序也能使用），由它持有该 World 的 user namespace 和 network namespace。holder 的 PID、启动时间和 namespace inode 记录在状态目录的 `holders.json` 中；重复 `setup` 是幂等的。
 - `exec` 校验 holder 身份后，用 `setns` 加入这两个 namespace，再执行命令。同一个 World 的多次 `exec` 共享同一个内核网络栈。不同 World 的 localhost 完全独立，都可以绑定同一地址和端口，包括 `127.0.0.1`、`0.0.0.0`、`::1`、`::`、UDP，以及 1024 以下的端口。
 - 程序形态不限：脚本、系统程序、静态链接程序和 setuid 程序都可以运行。其中 setuid 位在 namespace 中不会提升权限。注册表里的 `ip` 字段在 Linux 上只是标识，不参与网络。
-- World 内只有 loopback：宿主访问不到 World 内的监听，World 内也没有外网，客户端必须同样通过 `world silo exec` 启动。继承的 `http_proxy` 等变量指向宿主代理时，World 内同样无法连接，访问 localhost 时应设置 `no_proxy` 或使用 `--noproxy`。与 macOS silo 一样，文件系统 Unix socket 不受限制。
+- World 内只有 loopback：宿主访问不到 World 内的监听，World 内也没有外网，客户端必须同样通过 `world exec` 启动。继承的 `http_proxy` 等变量指向宿主代理时，World 内同样无法连接，访问 localhost 时应设置 `no_proxy` 或使用 `--noproxy`。与 macOS 一样，文件系统 Unix socket 不受限制。
+- Linux 上 `/tmp` 暂不按 Workspace 隔离，不设置 `WORLD_TMP`/`TMPDIR`；这与 macOS 的临时目录重定向（见 [macOS 网络运行时](macos-network-isolation.md#临时目录)）不同，共享 `/tmp` 路径的多个 Workspace 之间仍可能冲突。因此 Workspace 工作目录可以位于 `/tmp`、`/var/tmp`（含 `/private` 形式）之下。
 - 在库中调用 `silo::setup` 的长期运行进程如果是 child subreaper，holder 会被它收养；Linux 5.4+ 上 teardown 会用 `waitid(P_PIDFD)` 精确回收，更早的内核上无法安全地按 PID 回收，需要调用者自行回收子进程。被外部杀死的 holder 会在下一次 `setup`/`teardown` 时，先用 pidfd 固定并核对启动时间，确认身份后再回收。如果 `pidfd_open` 被调用者自己的 seccomp 策略拒绝，`setup` 会失败，holder 在创建任何 namespace 之前就退出；这时同样需要调用者自行回收。
-- `world silo teardown --world A` 停止 holder：先用 pidfd 固定进程再校验身份，避免 PID 复用误杀；Linux 5.3 以前没有 pidfd，会在校验后立即按 PID 发送信号。已经在运行的 World 进程会继续持有旧的 namespace，但之后的 `exec` 无法再加入它。holder 被杀死或机器重启后，需要重新 `setup`；新 namespace 不会与仍在运行的旧进程共享。
+- `world workspace teardown A` 停止 holder：先用 pidfd 固定进程再校验身份，避免 PID 复用误杀；Linux 5.3 以前没有 pidfd，会在校验后立即按 PID 发送信号。已经在运行的 World 进程会继续持有旧的 namespace，但之后的 `exec` 无法再加入它。holder 被杀死或机器重启后，需要重新 `setup`；新 namespace 不会与仍在运行的旧进程共享。
 
-与 macOS 的 silo 不同，这里是内核 network namespace：原始系统调用、静态链接程序或绕过 libc 的程序，也无法访问其他 World 或宿主的 loopback。它仍然不是完整沙箱：不限制文件读写，同一 uid 的宿主进程可以加入 World 的 namespace，也不提供跨 World 文件保密、组织授权或远程租约。
+与 macOS 的动态库注入不同，这里是内核 network namespace：原始系统调用、静态链接程序或绕过 libc 的程序，也无法访问其他 World 或宿主的 loopback。它仍然不是完整沙箱：不限制文件读写，同一 uid 的宿主进程可以加入 World 的 namespace，也不提供跨 World 文件保密、组织授权或远程租约。
 
 ## 验证
 

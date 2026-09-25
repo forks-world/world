@@ -1,6 +1,11 @@
 #![allow(unsafe_code)]
 
 pub mod rewrite;
+// The pure mapper's own tests live in `world-tmp-path`, exercised there
+// unconditionally; this module is now only the macOS libSystem-facing glue
+// around `WORLD_TMP`, so it need not compile at all elsewhere.
+#[cfg(target_os = "macos")]
+pub(crate) mod tmp;
 #[cfg(target_os = "macos")]
 mod world;
 
@@ -114,7 +119,8 @@ static INIT_FN: unsafe extern "C" fn() = {
     unsafe extern "C" fn init() {
         let _ = get_silo_ip();
         let _ = debug_enabled();
-        crate::world::acknowledge();
+        let tmp_valid = crate::tmp::init();
+        crate::world::acknowledge(tmp_valid);
 
         if debug_enabled() {
             let pid = std::process::id();

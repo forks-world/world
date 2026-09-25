@@ -940,6 +940,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "world-tmp-path",
 ]
 
 [[package]]
@@ -949,6 +950,15 @@ dependencies = [
  "libc",
  "proptest",
  "tempfile",
+ "world-tmp-path",
+]
+
+[[package]]
+name = "world-tmp-path"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "proptest",
 ]
 
 [[package]]

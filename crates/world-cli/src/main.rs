@@ -20,11 +20,22 @@ enum Commands {
         #[command(subcommand)]
         command: Network,
     },
-    Silo {
+    /// Manage local workspaces with an isolated localhost.
+    Workspace {
         #[arg(long, global = true)]
         state_dir: Option<PathBuf>,
         #[command(subcommand)]
-        command: Silo,
+        command: Workspace,
+    },
+    /// Run a command inside a workspace's isolated localhost.
+    Exec {
+        workspace: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long,default_value="5m",value_parser=humantime::parse_duration)]
+        timeout: Duration,
+        #[arg(last = true, required = true)]
+        command: Vec<OsString>,
     },
 }
 #[derive(Subcommand)]
@@ -41,33 +52,23 @@ enum Network {
     },
 }
 #[derive(Subcommand)]
-enum Silo {
+enum Workspace {
     Create {
-        #[arg(long)]
-        world: String,
+        workspace: String,
         #[arg(long)]
         workdir: PathBuf,
     },
-    Inspect {
-        #[arg(long)]
-        world: String,
+    Show {
+        workspace: String,
     },
+    /// macOS: add the workspace loopback alias (requires sudo). Linux: start
+    /// the process holding the workspace network namespace (no privilege).
     Setup {
-        #[arg(long)]
-        world: String,
+        workspace: String,
     },
-    /// Linux: stop the World namespace holder started by setup.
+    /// Linux: stop the workspace namespace holder started by setup.
     Teardown {
-        #[arg(long)]
-        world: String,
-    },
-    Exec {
-        #[arg(long)]
-        world: String,
-        #[arg(long,default_value="5m",value_parser=humantime::parse_duration)]
-        timeout: Duration,
-        #[arg(last = true, required = true)]
-        command: Vec<OsString>,
+        workspace: String,
     },
 }
 
@@ -151,40 +152,42 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
             )
             .await
         }
-        Commands::Silo { state_dir, command } => {
+        Commands::Workspace { state_dir, command } => {
             let state = state_dir.map(Ok).unwrap_or_else(silo::default_state_dir)?;
             match command {
-                Silo::Create { world, workdir } => {
+                Workspace::Create { workspace, workdir } => {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&silo::create(&state, &world, &workdir)?)?
+                        serde_json::to_string_pretty(&silo::create(&state, &workspace, &workdir)?)?
                     );
                     Ok(0)
                 }
-                Silo::Inspect { world } => {
+                Workspace::Show { workspace } => {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&silo::inspect(&state, &world)?)?
+                        serde_json::to_string_pretty(&silo::get(&state, &workspace)?)?
                     );
                     Ok(0)
                 }
-                Silo::Setup { world } => {
-                    silo::setup(&state, &silo::inspect(&state, &world)?)?;
+                Workspace::Setup { workspace } => {
+                    silo::setup(&state, &silo::get(&state, &workspace)?)?;
                     Ok(0)
                 }
-                Silo::Teardown { world } => {
-                    silo::teardown(&state, &silo::inspect(&state, &world)?)?;
+                Workspace::Teardown { workspace } => {
+                    silo::teardown(&state, &silo::get(&state, &workspace)?)?;
                     Ok(0)
-                }
-                Silo::Exec {
-                    world,
-                    timeout,
-                    command,
-                } => {
-                    let world = silo::inspect(&state, &world)?;
-                    silo::exec(&state, world, command, timeout, cancel).await
                 }
             }
+        }
+        Commands::Exec {
+            workspace,
+            state_dir,
+            timeout,
+            command,
+        } => {
+            let state = state_dir.map(Ok).unwrap_or_else(silo::default_state_dir)?;
+            let world = silo::get(&state, &workspace)?;
+            silo::exec(&state, world, command, timeout, cancel).await
         }
     }
 }

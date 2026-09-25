@@ -7,19 +7,23 @@ WORLD_SILO_INTEGRATION=1 python3 -m unittest discover -s tests -v
 """
 import concurrent.futures
 import contextlib
+import errno
 import http.server
 import json
 import os
 import pathlib
 import select
+import shutil
 import ssl
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORLD = ROOT / "target/debug/world"
@@ -40,9 +44,9 @@ def run(*args, **kwargs):
 
 
 @contextlib.contextmanager
-def serving(args):
-    process = subprocess.Popen([str(x) for x in args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, text=True)
+def serving(args, **kwargs):
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    process = subprocess.Popen([str(x) for x in args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kwargs)
     try:
         if not select.select([process.stdout], [], [], 10)[0]:
             raise AssertionError("listener startup timed out")
@@ -68,6 +72,23 @@ class CLI(unittest.TestCase):
         self.dir = pathlib.Path(self.temp.name)
         self.policy = self.dir / "policy.json"
         self.policy.write_text(json.dumps({"network_id": "test", "allow": []}))
+        # Redirected socket names include the root: keep it short (sun_path is 104 bytes).
+        self.short = tempfile.TemporaryDirectory(prefix=".wt-", dir=pathlib.Path.home())
+        self.addCleanup(self.short.cleanup)
+        self.world_tmp = self.temp_root("w")
+
+    def temp_root(self, name):
+        root = pathlib.Path(self.short.name) / name
+        for sub in ["tmp", "var/tmp"]:
+            (root / sub).mkdir(parents=True)
+        return root
+
+    def shim_env(self, root, **extra):
+        ack = self.dir / "ack"
+        ack.touch()
+        return dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
+                    SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack),
+                    WORLD_TMP=str(root), **extra)
 
     def network(self, *command, timeout="5s", **kwargs):
         return run(WORLD, "network", "exec", "--policy", self.policy,
@@ -408,7 +429,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         ack = self.dir / "ack"
         ack.touch()
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack))
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp))
         with serving([PROBE, "serve", "127.0.0.1:0", "HOST"]) as (_, port):
             result = run(PROBE, "get", f"127.0.0.1:{port}", env=env)
             self.assertNotEqual(result.returncode, 0)
@@ -425,7 +446,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         script.write_text("#!/bin/sh\necho escaped\n")
         script.chmod(0o755)
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack),
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp),
                    PATH=str(self.dir))
         for mode in ["launch", "exec"]:
             result = run(PROBE, mode, script, env=env)
@@ -451,7 +472,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
             (self.dir / name).symlink_to(PROBE)
         script = self.dir / "script"
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), PATH=str(self.dir))
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp), PATH=str(self.dir))
         for shebang, interpreter, options in [("/bin/zsh", "zsh", []),
                 ("/usr/bin/env -S python3 -u -B", "python3", ["-u", "-B"])]:
             script.write_text(f"#!{shebang}\n")
@@ -479,7 +500,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         script.write_text("#!/usr/bin/env python3\n")
         script.chmod(0o755)
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), PATH=str(parent))
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp), PATH=str(parent))
         bad_dir, bad_link = self.dir / "bad-dir", self.dir / "bad-link"
         bad_dir.mkdir()
         bad_link.mkdir()
@@ -506,7 +527,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         script.write_text("#!/usr/bin/env python3\n")
         script.chmod(0o755)
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack))
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp))
         for path in ["", ":/nonexistent", "/nonexistent:", "/nonexistent::/nonexistent"]:
             for mode in ["launch-envpath", "exec-envpath"]:
                 result = run(PROBE, mode, path, script, env=env, cwd=self.dir)
@@ -514,12 +535,65 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
                 self.assertEqual(json.loads(result.stdout), ["./python3", str(script)])
 
     @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_envpath_search_without_a_cwd_still_redirects_absolute_entries(self):
+        # Once the caller's own working directory has been removed, our own
+        # (not interposed) getcwd fails: a relative PATH entry can then no
+        # longer be resolved and must be skipped, but an absolute one needs
+        # no cwd at all and must still be redirected below WORLD_TMP, never
+        # fall back to whatever the host's real /tmp holds at that name.
+        n = f"wt-{uuid.uuid4().hex[:8]}"
+        (self.world_tmp / "tmp" / n).mkdir()
+        self.addCleanup(shutil.rmtree, self.world_tmp / "tmp" / n, ignore_errors=True)
+        (self.world_tmp / "tmp" / n / "python3").symlink_to(PROBE)
+        script = pathlib.Path(self.short.name) / "script"
+        script.write_text("#!/usr/bin/env python3\n")
+        script.chmod(0o755)
+        # A decoy at the same PATH entry on the host: with a live cwd this
+        # would never be reached (the entry is absolute), so seeing it used
+        # instead of the private copy would prove the redirect was skipped.
+        host_decoy = pathlib.Path("/tmp") / n
+        host_decoy.mkdir()
+        self.addCleanup(shutil.rmtree, host_decoy, ignore_errors=True)
+        (host_decoy / "python3").symlink_to(PROBE)
+        gone = pathlib.Path(self.short.name) / "gone"
+        self.assertFalse(gone.exists())
+        for mode in ["launch-envpath-nocwd", "exec-envpath-nocwd"]:
+            result = run(PROBE, mode, gone, f"/tmp/{n}", script, env=self.shim_env(self.world_tmp))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            argv = json.loads(result.stdout)
+            self.assertEqual(argv[1], str(script))
+            self.assertTrue(argv[0].startswith(os.path.realpath(self.world_tmp)), argv)
+            self.assertFalse(argv[0].startswith(str(host_decoy)), argv)
+
+        # A relative PATH entry ("." meaning the now-gone cwd itself) has
+        # nothing to resolve against and is skipped, not handed to the mapper
+        # bare: the shebang interpreter is then never found, and, since the
+        # unresolved script itself is not a native binary, the spawn is
+        # refused (see socket_probe's PermissionDenied -> 77 mapping).
+        gone2 = pathlib.Path(self.short.name) / "gone2"
+        self.assertFalse(gone2.exists())
+        result = run(PROBE, "launch-envpath-nocwd", gone2, ".", script, env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 77, result.stderr)
+
+        # A plain (non-shebang) native executable reached only via PATH
+        # search, with no cwd at all: exercises `world::search_path`'s own
+        # absolute-entry branch directly, without going through the sip.rs
+        # interpreter lookup above.
+        (self.world_tmp / "tmp" / n / "probe").symlink_to(PROBE)
+        gone3 = pathlib.Path(self.short.name) / "gone3"
+        self.assertFalse(gone3.exists())
+        result = run(PROBE, "launch-envpath-nocwd", gone3, f"/tmp/{n}", "probe", "fd", "999",
+                     env=self.shim_env(self.world_tmp))
+        self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
     def test_child_injection_values_are_immutable(self):
         ack = self.dir / "ack"
         ack.touch()
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack))
-        for key, value in [("SILO_IP", "127.77.254.253"), ("DYLD_INSERT_LIBRARIES", "/usr/lib/libSystem.B.dylib")]:
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp))
+        for key, value in [("SILO_IP", "127.77.254.253"), ("DYLD_INSERT_LIBRARIES", "/usr/lib/libSystem.B.dylib"),
+                           ("WORLD_TMP", str(self.temp_root("other-tmp")))]:
             for mode in ["launch", "exec"]:
                 result = run(PROBE, "tamper-child", mode, key, value, env=env)
                 self.assertEqual(result.returncode, 77, result.stderr)
@@ -534,7 +608,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         script.write_text("#!/usr/bin/env -S python3 -u\n")
         script.chmod(0o755)
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), PATH=str(self.dir))
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp), PATH=str(self.dir))
         result = run(PROBE, "launch", "path-script", "caller-arg", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), [str(self.dir / "python3"), "-u", str(script), "caller-arg"])
@@ -549,7 +623,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         (cwd / "candidate").symlink_to("/bin/echo")
         (path / "candidate").symlink_to(PROBE)
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), PATH=str(path))
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp), PATH=str(path))
         for mode in ["raw-spawn", "raw-exec"]:
             result = run(PROBE, mode, "candidate", "fd", "999", env=env, cwd=cwd)
             self.assertEqual(result.returncode, 77, result.stderr)
@@ -571,7 +645,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         (current / "candidate").symlink_to(PROBE)
         (other / "candidate").symlink_to("/bin/echo")
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack))
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp))
         import ctypes
         modes = ["raw-spawn-chdir", "raw-spawn-fchdir"]
         if hasattr(ctypes.CDLL(None), "posix_spawn_file_actions_addchdir"):
@@ -591,7 +665,7 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         program = self.dir / "privileged"
         program.write_bytes(PROBE.read_bytes())
         env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(ROOT / "target/debug/libworld_silo_bind.dylib"),
-                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack))
+                   SILO_IP="127.77.254.254", WORLD_SILO_ACTIVE="1", WORLD_SILO_ACK=str(ack), WORLD_TMP=str(self.world_tmp))
         for mode in [0o4755, 0o2755]:
             program.chmod(mode)
             for launch in ["raw-spawn", "raw-exec"]:
@@ -600,6 +674,329 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         program.chmod(0o755)
         result = run(PROBE, "raw-spawn", program, "fd", "999", env=env)
         self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_shared_temp_paths_are_redirected(self):
+        name = f"wt-{uuid.uuid4().hex[:8]}"
+        result = run(PROBE, "temp-suite", name, env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        host = f"/private/tmp/{name}"
+        self.assertEqual(report["read"], "data")
+        self.assertEqual(report["readlink"], f"{host}/file")
+        self.assertEqual(report["canonical"], f"{host}/file")
+        self.assertEqual(report["cwd"], host)
+        self.assertEqual(report["socket"], f"{host}/s.sock")
+        self.assertTrue(report["mkstemp"].startswith(f"/tmp/{name}/mk."), report)
+        self.assertEqual((report["entries"], report["var"]), (6, "var"))
+        # "a/link/../x" is redirected only up to "a"; the kernel resolves the
+        # relative symlink and ".." from there, so it lands on "a/b/x", not
+        # a lexically-normalized (and nonexistent) "a/x".
+        self.assertEqual(report["symlink_parent"], "symlink-parent")
+        for leaked in [f"/tmp/{name}", f"/var/tmp/{name}"]:
+            self.assertFalse(os.path.lexists(leaked), leaked)
+        physical = self.world_tmp / "tmp" / name
+        self.assertEqual((physical / "file").read_text(), "data")
+        # Link targets are stored at the World location and resolved there.
+        self.assertEqual(os.readlink(physical / "link"), str(physical / "file"))
+        self.assertFalse((physical / "a" / "x").exists())
+        self.assertEqual((self.world_tmp / "var/tmp" / name / "file").read_text(), "var")
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_short_getsockname_buffer_is_respected(self):
+        name = f"wt-{uuid.uuid4().hex[:8]}"
+        path = f"/tmp/{name}/s.sock"
+        result = run(PROBE, "getsockname-short", path, "20", env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        host = f"/private/tmp/{name}/s.sock"
+        self.assertTrue(report["guard_intact"], report)
+        self.assertEqual(report["prefix"], host[:18])
+        self.assertEqual(report["len"], 2 + len(host) + 1)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_exactly_sized_sockaddr_un_is_mapped(self):
+        # bind/connect with a sockaddr_un buffer sized to exactly SUN_LEN(path)
+        # (no padding to the full 106-byte struct): map_unix must bound its
+        # read by the caller's socklen_t rather than the whole struct type.
+        name = f"wt-{uuid.uuid4().hex[:8]}"
+        (self.world_tmp / "tmp" / name).mkdir()
+        result = run(PROBE, "unix-sunlen", f"/tmp/{name}/s.sock", env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "ok")
+        physical = self.world_tmp / "tmp" / name / "s.sock"
+        self.assertTrue(stat.S_ISSOCK(os.lstat(physical).st_mode))
+        self.assertFalse(os.path.lexists(f"/tmp/{name}"))
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_dotdot_escapes_a_redirected_temp_root_through_a_symlink(self):
+        # A `..` chain long enough to leave the temp root, after a symlink
+        # inside it: the kernel resolves the symlink first, so the escape
+        # must land back in the *private* root, not walk the host's /tmp.
+        name = f"wt-{uuid.uuid4().hex[:8]}"
+        result = run(PROBE, "temp-escape", name, env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["via_link"], "escaped-ok")
+        self.assertTrue(report["hosts"], report)
+        self.assertEqual(report["missing"], errno.ENOENT)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_symlink_target_needing_kernel_resolution_is_stored_verbatim(self):
+        # A target whose ".." handling could only be decided by asking the
+        # kernel (an absent leading component, popped before a "tmp" one)
+        # must not fail the symlink call: it is stored exactly as given and
+        # left to resolve, possibly dangling, at lookup time.
+        n = f"wt-{uuid.uuid4().hex[:8]}"
+        (self.world_tmp / "tmp" / n).mkdir()
+        target = f"/wt-absent-{n}/../tmp/{n}/x"
+        result = run(PROBE, "symlink-read", target, f"/tmp/{n}/dangling", env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["readlink"], target)
+        self.assertEqual(os.readlink(self.world_tmp / "tmp" / n / "dangling"), target)
+        self.assertFalse(pathlib.Path(f"/tmp/{n}").exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_relative_dotdot_reaches_and_escapes_a_redirected_temp_root(self):
+        # A relative path containing ".." can reach a host temp root just as
+        # an absolute one can (joined against the real, physical cwd), and,
+        # once the cwd is already inside a workspace's private tree, a
+        # further relative ".." must land on the *reported* (host) location
+        # rather than wherever it physically resolves inside that tree.
+        n = f"wt-{uuid.uuid4().hex[:8]}"
+        cwd = pathlib.Path(self.short.name) / "c"
+        cwd.mkdir()
+        k = os.path.realpath(cwd).count("/")
+        result = run(PROBE, "temp-relative", n, str(k), env=self.shim_env(self.world_tmp), cwd=cwd)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["absent_errno"], errno.ENOENT)
+        self.assertTrue(report["hosts_readable"], report)
+        physical = self.world_tmp / "tmp" / n
+        self.assertEqual((physical / "f").read_text(), "f")
+        self.assertEqual((physical / "f2").read_text(), "f2")
+        self.assertTrue((physical / "s").is_socket())
+        self.assertFalse(os.path.lexists(f"/tmp/{n}"))
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_relative_path_from_root_reaches_the_redirected_temp_root(self):
+        # No ".." anywhere: a relative path still reaches a host temp root
+        # once its first real component is "tmp" or "var", straight off "/"
+        # (cwd and a dirfd) and off a dirfd on "/private".
+        n = f"wt-{uuid.uuid4().hex[:8]}"
+        result = run(PROBE, "temp-rootrel", n, env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.world_tmp / "tmp" / n / "f").read_text(), "f")
+        self.assertEqual((self.world_tmp / "tmp" / n / "f2").read_text(), "f2")
+        self.assertTrue((self.world_tmp / "var/tmp" / n).is_dir())
+        self.assertFalse(os.path.lexists(f"/tmp/{n}"))
+        self.assertFalse(os.path.lexists(f"/var/tmp/{n}"))
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_getcwd_reports_the_host_name_even_in_a_small_buffer(self):
+        name = f"wt-{uuid.uuid4().hex[:8]}"
+        result = run(PROBE, "cwd-sized", name, env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        host = f"/private/tmp/{name}"
+        self.assertEqual(report["fit"], host)
+        self.assertEqual(report["exact"], {"errno": errno.ERANGE})
+        self.assertEqual(report["null_fit"], host)
+        self.assertEqual(report["null_zero"], host)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_readlink_reports_the_host_name_even_when_truncated(self):
+        name = f"wt-{uuid.uuid4().hex[:8]}"
+        result = run(PROBE, "readlink-sized", name, env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        host_target = f"/private/tmp/{name}/target"
+        self.assertEqual(report["full"], host_target)
+        self.assertEqual(report["full_ret"], len(host_target))
+        self.assertEqual(report["short"], host_target[:10])
+        self.assertEqual(report["short_ret"], 10)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_same_temp_lock_and_socket_names_do_not_conflict(self):
+        path = f"/tmp/wt-{uuid.uuid4().hex[:8]}/service"
+        a, b = self.temp_root("a"), self.temp_root("b")
+        with serving([PROBE, "temp-hold", path], env=self.shim_env(a)):
+            with serving([PROBE, "temp-hold", path], env=self.shim_env(b)):
+                for root in [a, b]:
+                    self.assertTrue((root / path.removeprefix("/")).with_suffix(".sock").exists())
+            # The same World still shares its lock between processes.
+            result = run(PROBE, "temp-hold", path, env=self.shim_env(a))
+            self.assertEqual(result.returncode, 78, result.stderr)
+        self.assertFalse(os.path.lexists(os.path.dirname(path)))
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_executable_below_shared_temp_is_redirected(self):
+        name = f"wt-{uuid.uuid4().hex[:8]}"
+        (self.world_tmp / "tmp" / name).mkdir()
+        (self.world_tmp / "tmp" / name / "probe").symlink_to(PROBE)
+        for mode in ["launch", "exec", "raw-spawn", "raw-exec"]:
+            result = run(PROBE, mode, f"/tmp/{name}/probe", "fd", "999", env=self.shim_env(self.world_tmp))
+            self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_relative_path_entry_crossing_tmp_is_redirected(self):
+        # A PATH entry with no literal "/tmp" in it, but which lands there
+        # once resolved against the (physical) cwd via enough "..": the
+        # posix_spawnp PATH search must map it exactly as an absolute
+        # /tmp-rooted entry would be, not walk the host's real /tmp.
+        n = f"wt-{uuid.uuid4().hex[:8]}"
+        (self.world_tmp / "tmp" / n).mkdir()
+        (self.world_tmp / "tmp" / n / "probe").symlink_to(PROBE)
+        cwd = pathlib.Path(self.short.name) / "c"
+        cwd.mkdir()
+        depth = os.path.realpath(cwd).count("/")
+        path = "../" * depth + f"tmp/{n}"
+        result = run(PROBE, "launch", "probe", "fd", "999",
+                     env=self.shim_env(self.world_tmp, PATH=path), cwd=cwd)
+        self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_relative_path_entry_resolved_against_a_launched_cwd(self):
+        # Same redirection, but the relevant cwd is the launched child's own
+        # (set via chdir before the PATH-searched exec), not the harness's.
+        n = f"wt-{uuid.uuid4().hex[:8]}"
+        (self.world_tmp / "tmp" / n).mkdir()
+        (self.world_tmp / "tmp" / n / "probe").symlink_to(PROBE)
+        result = run(PROBE, "launch-in", f"/tmp/{n}", "probe", "fd", "999",
+                     env=self.shim_env(self.world_tmp, PATH="."))
+        self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_mapping_error_does_not_fall_back_to_host(self):
+        # A PATH entry that walks through a *host* /tmp directory (real, but
+        # with no private copy in this workspace) and back out to an
+        # otherwise-reachable binary: the escaping ".." must hit ENOENT
+        # against the missing private copy, never fall back to resolving
+        # the literal (host) text and finding the real file that way.
+        h = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, h, ignore_errors=True)
+        bindir = pathlib.Path(os.path.realpath(pathlib.Path(self.short.name) / "bin"))
+        bindir.mkdir()
+        (bindir / "probe").symlink_to(PROBE)
+        basename = os.path.basename(h)
+        # /tmp/<h> is really /private/tmp/<h> on the host; that many ".."
+        # reach "/", from where the literal text continues into bindir.
+        host_path = f"/private/tmp/{basename}"
+        depth = host_path.count("/")
+        path = f"/tmp/{basename}/" + "../" * depth + str(bindir).lstrip("/")
+        result = run(PROBE, "launch", "probe", "fd", "999",
+                     env=self.shim_env(self.world_tmp, PATH=path))
+        self.assertNotIn("descriptor-closed", result.stdout)
+        # path_candidate finds nothing (the escape maps to ENOENT, which is
+        # skipped rather than used) so posix_spawnp itself fails EACCES,
+        # which Rust's Command reports as PermissionDenied -> exit 77.
+        self.assertEqual(result.returncode, 77, result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_active_shim_requires_private_temp_root(self):
+        env = self.shim_env(self.world_tmp)
+        for value in [None, "", "/private/tmp/world", "relative/world/tmp"]:
+            if value is None:
+                env.pop("WORLD_TMP")
+            else:
+                env["WORLD_TMP"] = value
+            result = run(PROBE, "fd", "999", env=env)
+            self.assertEqual(result.returncode, 125, value)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_workspace_rejects_shared_temp_workdir(self):
+        for workdir in ["/tmp", "/private/var/tmp"]:
+            result = run(WORLD, "workspace", "--state-dir", self.dir / "state", "create", "X", "--workdir", workdir)
+            self.assertEqual(result.returncode, 125)
+            self.assertIn("must not be under /tmp or /var/tmp", result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_workspace_records_the_creating_home_and_reuses_it(self):
+        # sun_path is 104 bytes: keep both homes short, like self.short.
+        h1 = pathlib.Path(os.path.realpath(pathlib.Path(self.short.name) / "h1"))
+        h2 = pathlib.Path(os.path.realpath(pathlib.Path(self.short.name) / "h2"))
+        h1.mkdir()
+        h2.mkdir()
+        state = self.dir / "state"
+        work = self.dir / "work"
+        work.mkdir()
+        result = run(WORLD, "workspace", "--state-dir", state, "create", "X", "--workdir", work,
+                     env=dict(os.environ, HOME=str(h1)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        created = json.loads(result.stdout)
+        expected = f"{h1}/.world/tmp/{created['ip']}"
+        self.assertEqual(created["temp_root"], expected)
+
+        # A later `show` from a process with a different HOME must report
+        # the same, already-recorded temp root, not one under h2.
+        result = run(WORLD, "workspace", "--state-dir", state, "show", "X",
+                     env=dict(os.environ, HOME=str(h2)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["temp_root"], expected)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_workspace_migrates_the_legacy_default_registry_once(self):
+        # HOME must not be under /tmp, like h1/h2 above.
+        h = pathlib.Path(os.path.realpath(pathlib.Path(self.short.name) / "h"))
+        h.mkdir()
+        workdir = self.dir / "work"
+        workdir.mkdir()
+        old_registry = h / ".local/share/world/silo/registry.json"
+        old_registry.parent.mkdir(parents=True)
+        old_registry.write_text(json.dumps({
+            "X": {"id": "X", "ip": "127.77.0.9", "workdir": str(workdir)},
+        }))
+        env = dict(os.environ, HOME=str(h))
+
+        result = run(WORLD, "workspace", "show", "X", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        shown = json.loads(result.stdout)
+        self.assertEqual(shown["ip"], "127.77.0.9")
+        self.assertEqual(shown["temp_root"], f"{h}/.world/tmp/127.77.0.9")
+        self.assertIn("moved workspace registry", result.stderr)
+        new_registry = h / ".local/share/world/workspaces/registry.json"
+        self.assertTrue(new_registry.exists())
+        self.assertFalse(old_registry.exists())
+
+        # A second run finds the registry already migrated: no notice, no error.
+        result = run(WORLD, "workspace", "show", "X", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("moved workspace registry", result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_workspace_repoints_a_legacy_tmp_workdir(self):
+        # A workdir recorded straight under /tmp, as the old quickstart used
+        # to create, can no longer be executed against (macOS exec rejects
+        # it): `create` must let it be re-pointed instead of staying stuck.
+        legacy = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, legacy, ignore_errors=True)
+        state = self.dir / "S"
+        state.mkdir()
+        state.joinpath("registry.json").write_text(json.dumps({
+            "X": {"id": "X", "ip": "127.77.0.9", "workdir": os.path.realpath(legacy)},
+        }))
+        # No recorded temp_root: filling one in needs a HOME outside /tmp,
+        # kept short like self.short (sun_path is 104 bytes).
+        home = pathlib.Path(os.path.realpath(pathlib.Path(self.short.name) / "home"))
+        home.mkdir()
+        env = dict(os.environ, HOME=str(home))
+        work = self.dir / "work"
+        work.mkdir()
+
+        result = run(WORLD, "workspace", "--state-dir", state, "create", "X", "--workdir", work, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("moved", result.stderr)
+
+        result = run(WORLD, "workspace", "--state-dir", state, "show", "X", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        shown = json.loads(result.stdout)
+        self.assertEqual(shown["workdir"], os.path.realpath(work))
+        self.assertEqual(shown["ip"], "127.77.0.9")
+
+        other = self.dir / "other"
+        other.mkdir()
+        result = run(WORLD, "workspace", "--state-dir", state, "create", "X", "--workdir", other, env=env)
+        self.assertEqual(result.returncode, 125)
 
     @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_slow_output_consumer_does_not_lose_tail(self):
@@ -680,7 +1077,7 @@ class Silo(unittest.TestCase):
         for name in ["A", "B"]:
             work = cls.root / name
             work.mkdir()
-            result = run(WORLD, "silo", "--state-dir", cls.state, "create", "--world", name, "--workdir", work)
+            result = run(WORLD, "workspace", "--state-dir", cls.state, "create", name, "--workdir", work)
             if result.returncode:
                 raise AssertionError(result.stderr)
             info = json.loads(result.stdout)
@@ -691,11 +1088,12 @@ class Silo(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         for world in cls.worlds.values():
+            shutil.rmtree(pathlib.Path(world["temp_root"]), ignore_errors=True)
             subprocess.run(["sudo", "-n", "/sbin/ifconfig", "lo0", "-alias", world["ip"]], check=True, timeout=10)
         cls.temp.cleanup()
 
     def command(self, world, *args):
-        return [WORLD, "silo", "--state-dir", self.state, "exec", "--world", world, "--timeout", "30s", "--", PROBE, *args]
+        return [WORLD, "exec", world, "--state-dir", self.state, "--timeout", "30s", "--", PROBE, *args]
 
     def test_same_port_localhost_and_lifecycle(self):
         for host in ["127.0.0.1", "0.0.0.0", "[::1]", "[::]"]:
@@ -762,6 +1160,51 @@ class Silo(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout), [requested, "caller-argument"])
 
+    def test_main_executable_below_temp_uses_workspace_root(self):
+        n = f"wt-{uuid.uuid4().hex[:8]}"
+        root = pathlib.Path(self.worlds["A"]["temp_root"])
+        # An exec must have run at least once for the workspace root to exist.
+        result = run(*self.command("A", "fd", "999"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        private_dir = root / "tmp" / n
+        private_dir.mkdir(parents=True)
+        (private_dir / "probe").symlink_to(PROBE)
+        # The probe echoes argv as JSON only under an interpreter-like name.
+        (private_dir / "python3").symlink_to(PROBE)
+        self.addCleanup(shutil.rmtree, private_dir, ignore_errors=True)
+
+        # A decoy at the same name on the host, so a bug that left host paths
+        # unmapped would run /bin/echo instead of failing loudly.
+        host_dir = pathlib.Path("/tmp") / n
+        host_dir.mkdir()
+        (host_dir / "probe").symlink_to("/bin/echo")
+        self.addCleanup(shutil.rmtree, host_dir, ignore_errors=True)
+
+        for requested in [f"/tmp/{n}/probe", f"/private/tmp/{n}/probe"]:
+            command = self.command("A", "fd", "999")
+            command[-3] = requested
+            result = run(*command)
+            self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+        command = self.command("A", "fd", "999")
+        command[-3] = "probe"
+        result = run(*command, env=dict(os.environ, PATH=f"/tmp/{n}"))
+        self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+        requested = f"/tmp/{n}/python3"
+        command = self.command("A", "caller-argument")
+        command[-2] = requested
+        result = run(*command)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [requested, "caller-argument"])
+
+        # World B's own root has no such entry point below its temp root.
+        command = self.command("B", "fd", "999")
+        command[-3] = f"/tmp/{n}/probe"
+        result = run(*command)
+        self.assertNotEqual(result.returncode, 0)
+
     def test_main_privileged_mode_is_rejected(self):
         program = self.root / "privileged"
         program.write_bytes(PROBE.read_bytes())
@@ -773,6 +1216,30 @@ class Silo(unittest.TestCase):
             result = run(*command)
             self.assertEqual(result.returncode, 125, result.stderr)
             self.assertIn("privileged executable unsupported", result.stderr)
+
+    def test_temp_is_private_per_workspace(self):
+        path = f"/tmp/wt-{uuid.uuid4().hex[:8]}/service"
+        with serving(self.command("A", "temp-hold", path)):
+            with serving(self.command("B", "temp-hold", path)):
+                for name, world in self.worlds.items():
+                    root = pathlib.Path(world["temp_root"])
+                    self.assertTrue((root / path.removeprefix("/")).with_suffix(".sock").exists(), name)
+        self.assertFalse(os.path.lexists(os.path.dirname(path)))
+        result = run(*self.command("A", "temp-suite", f"wt-{uuid.uuid4().hex[:8]}"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tmpdir = json.loads(result.stdout)["tmpdir"]
+        self.assertEqual(tmpdir, self.worlds["A"]["temp_root"] + "/tmp/")
+
+    def test_exec_with_another_home_uses_the_recorded_temp_root(self):
+        # `world exec`'s own HOME must be irrelevant once a temp root is
+        # already recorded: it is never recomputed from the current HOME.
+        other_home = self.root / "otherhome"
+        other_home.mkdir(exist_ok=True)
+        result = run(*self.command("A", "temp-suite", f"wt-{uuid.uuid4().hex[:8]}"),
+                     env=dict(os.environ, HOME=str(other_home)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tmpdir = json.loads(result.stdout)["tmpdir"]
+        self.assertEqual(tmpdir, self.worlds["A"]["temp_root"] + "/tmp/")
 
     def test_udp_disconnect_uses_kernel_semantics(self):
         baseline = run(PROBE, "udp-disconnect", "127.0.0.1:12345")
@@ -803,7 +1270,7 @@ class Silo(unittest.TestCase):
 
 
 @unittest.skipUnless(LINUX, "Linux World namespaces")
-class LinuxSilo(unittest.TestCase):
+class LinuxWorkspace(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix="world-silo-test-")
@@ -812,8 +1279,8 @@ class LinuxSilo(unittest.TestCase):
         for name in ["A", "B"]:
             work = cls.root / name
             work.mkdir()
-            for action in [["create", "--world", name, "--workdir", work], ["setup", "--world", name]]:
-                result = run(WORLD, "silo", "--state-dir", cls.state, *action)
+            for action in [["create", name, "--workdir", work], ["setup", name]]:
+                result = run(WORLD, "workspace", "--state-dir", cls.state, *action)
                 if result.returncode:
                     cls.tearDownClass()
                     raise AssertionError(result.stderr)
@@ -821,11 +1288,11 @@ class LinuxSilo(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         for name in ["A", "B"]:
-            run(WORLD, "silo", "--state-dir", cls.state, "teardown", "--world", name)
+            run(WORLD, "workspace", "--state-dir", cls.state, "teardown", name)
         cls.temp.cleanup()
 
     def command(self, world, *args):
-        return [WORLD, "silo", "--state-dir", self.state, "exec", "--world", world, "--timeout", "30s", "--", PROBE, *args]
+        return [WORLD, "exec", world, "--state-dir", self.state, "--timeout", "30s", "--", PROBE, *args]
 
     def test_same_port_localhost_and_lifecycle(self):
         for host in ["127.0.0.1", "0.0.0.0", "[::1]", "[::]"]:
@@ -888,12 +1355,12 @@ class LinuxSilo(unittest.TestCase):
         state = self.root / "readonly-state"
         work = self.root / "D"
         work.mkdir()
-        silo = [WORLD, "silo", "--state-dir", state]
-        self.assertEqual(run(*silo, "create", "--world", "D", "--workdir", work).returncode, 0)
+        workspace = [WORLD, "workspace", "--state-dir", state]
+        self.assertEqual(run(*workspace, "create", "D", "--workdir", work).returncode, 0)
         state.chmod(0o555)
         self.addCleanup(state.chmod, 0o755)
         before = self.holders()
-        result = run(*silo, "setup", "--world", "D")
+        result = run(*workspace, "setup", "D")
         self.assertEqual(result.returncode, 125, result.stderr)
         time.sleep(0.3)
         self.assertEqual(self.holders() - before, set())
@@ -903,11 +1370,11 @@ class LinuxSilo(unittest.TestCase):
         # SIGCHLD: the intermediate child is auto-reaped (ECHILD on wait).
         work = self.root / "F"
         work.mkdir()
-        silo = [str(WORLD), "silo", "--state-dir", str(self.state)]
-        self.assertEqual(run(*silo, "create", "--world", "F", "--workdir", work).returncode, 0)
-        self.addCleanup(run, *silo, "teardown", "--world", "F")
+        workspace = [str(WORLD), "workspace", "--state-dir", str(self.state)]
+        self.assertEqual(run(*workspace, "create", "F", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *workspace, "teardown", "F")
         before = self.holders()
-        result = run("/bin/sh", "-c", 'trap "" CHLD; exec "$@"', "sh", *silo, "setup", "--world", "F")
+        result = run("/bin/sh", "-c", 'trap "" CHLD; exec "$@"', "sh", *workspace, "setup", "F")
         self.assertEqual(result.returncode, 0, result.stderr)
         pid = json.loads((self.state / "holders.json").read_text())["F"]["pid"]
         self.assertEqual(self.holders() - before, {pid})
@@ -929,11 +1396,11 @@ class LinuxSilo(unittest.TestCase):
     def test_stale_holder_is_replaced_and_forgotten(self):
         work = self.root / "E"
         work.mkdir()
-        silo = [WORLD, "silo", "--state-dir", self.state]
-        self.assertEqual(run(*silo, "create", "--world", "E", "--workdir", work).returncode, 0)
-        self.addCleanup(run, *silo, "teardown", "--world", "E")
+        workspace = [WORLD, "workspace", "--state-dir", self.state]
+        self.assertEqual(run(*workspace, "create", "E", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *workspace, "teardown", "E")
         for _ in range(2):
-            self.assertEqual(run(*silo, "setup", "--world", "E").returncode, 0)
+            self.assertEqual(run(*workspace, "setup", "E").returncode, 0)
             pid = json.loads((self.state / "holders.json").read_text())["E"]["pid"]
             os.kill(pid, 9)
             for _ in range(50):
@@ -941,17 +1408,17 @@ class LinuxSilo(unittest.TestCase):
                     break
                 time.sleep(0.1)
         # A dead holder is replaced by setup; teardown forgets a dead one.
-        self.assertEqual(run(*silo, "setup", "--world", "E").returncode, 0)
+        self.assertEqual(run(*workspace, "setup", "E").returncode, 0)
         self.assertEqual(run(*self.command("E", "fd", "999")).returncode, 0)
         pid = json.loads((self.state / "holders.json").read_text())["E"]["pid"]
         os.kill(pid, 9)
         time.sleep(0.3)
-        self.assertEqual(run(*silo, "teardown", "--world", "E").returncode, 0)
+        self.assertEqual(run(*workspace, "teardown", "E").returncode, 0)
         self.assertNotIn("E", json.loads((self.state / "holders.json").read_text()))
 
     def test_escaped_descendants_are_killed(self):
         work = self.root / "A"
-        command = [WORLD, "silo", "--state-dir", self.state, "exec", "--world", "A", "--", "/bin/sh", "-c",
+        command = [WORLD, "exec", "A", "--state-dir", self.state, "--", "/bin/sh", "-c",
                    'setsid /bin/sh -c "sleep 2; echo escaped > marker" </dev/null >/dev/null 2>&1 &']
         self.assertEqual(run(*command).returncode, 0)
         time.sleep(3)
@@ -960,20 +1427,20 @@ class LinuxSilo(unittest.TestCase):
     def test_setup_idempotent_and_teardown(self):
         work = self.root / "C"
         work.mkdir()
-        silo = [WORLD, "silo", "--state-dir", self.state]
-        self.assertEqual(run(*silo, "create", "--world", "C", "--workdir", work).returncode, 0)
-        self.addCleanup(run, *silo, "teardown", "--world", "C")
+        workspace = [WORLD, "workspace", "--state-dir", self.state]
+        self.assertEqual(run(*workspace, "create", "C", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *workspace, "teardown", "C")
         result = run(*self.command("C", "fd", "999"))
         self.assertEqual(result.returncode, 125)
-        self.assertIn("silo setup", result.stderr)
+        self.assertIn("workspace setup", result.stderr)
         for _ in range(2):
-            self.assertEqual(run(*silo, "setup", "--world", "C").returncode, 0)
+            self.assertEqual(run(*workspace, "setup", "C").returncode, 0)
         holders = json.loads((self.state / "holders.json").read_text())
         with serving(self.command("C", "serve", "127.0.0.1:0", "C")) as (_, port):
             result = run(*self.command("C", "get", f"127.0.0.1:{port}"))
             self.assertEqual((result.returncode, result.stdout), (0, "C"), result.stderr)
             self.assertEqual(json.loads((self.state / "holders.json").read_text()), holders)
-        self.assertEqual(run(*silo, "teardown", "--world", "C").returncode, 0)
+        self.assertEqual(run(*workspace, "teardown", "C").returncode, 0)
         with self.assertRaises(ProcessLookupError):
             for _ in range(50):
                 os.kill(holders["C"]["pid"], 0)
