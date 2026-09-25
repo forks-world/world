@@ -1168,7 +1168,8 @@ fn resolve_program(
         .iter()
         .find(|(key, _)| key == "PATH")
         .map(|(_, value)| value.clone())
-        .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
+        // glibc execvp's default (confstr _CS_PATH) when PATH is unset.
+        .unwrap_or_else(|| "/bin:/usr/bin".into());
     for dir in std::env::split_paths(&path) {
         let candidate = cwd.join(dir).join(program);
         let Ok(c) = CString::new(candidate.as_os_str().as_bytes()) else {
