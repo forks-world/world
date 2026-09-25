@@ -1198,6 +1198,70 @@ impl Holder {
     }
 }
 
+/// Forked child of start_holder; never returns. The double fork reparents
+/// the holder to init (or a subreaper), which reaps it after teardown, so a
+/// long-lived caller of setup never accumulates zombies.
+unsafe fn holder_process(
+    maps: &IdMaps,
+    report: RawFd,
+    ack: RawFd,
+    report_read: RawFd,
+    ack_write: RawFd,
+) -> ! {
+    unsafe {
+        if libc::setsid() < 0 {
+            libc::_exit(125);
+        }
+        let holder = libc::fork();
+        if holder != 0 {
+            libc::_exit(if holder > 0 { 0 } else { 125 });
+        }
+        libc::chdir(c"/".as_ptr());
+        // The report pipe becomes fd 0 and the acknowledgment pipe fd 1.
+        // The other ends are closed explicitly, so the wait below sees EOF
+        // if the caller goes away, even if the bulk cleanup fails.
+        if libc::dup2(report, 0) < 0 || libc::dup2(ack, 1) < 0 {
+            libc::_exit(125);
+        }
+        for fd in [report, ack, report_read, ack_write] {
+            libc::close(fd);
+        }
+        let send = |value: libc::pid_t| {
+            let size = std::mem::size_of_val(&value);
+            libc::write(0, (&value as *const libc::pid_t).cast(), size) == size as isize
+        };
+        // The holder never execs, so close-on-exec does not apply: drop
+        // every other inherited descriptor, so it never keeps the caller's
+        // sockets or files alive. A failure is reported only after the PID
+        // has been pinned, so the caller can always identify and reap us.
+        let cleanup = close_from(2);
+        // PID first, so the caller can pin (and, if we fail and it adopted
+        // us as a subreaper, reap) the holder; then the result.
+        if !send(libc::getpid()) {
+            libc::_exit(125);
+        }
+        let mut byte = 0u8;
+        loop {
+            match libc::read(1, (&mut byte as *mut u8).cast(), 1) {
+                1 => break,
+                n if n < 0 && *libc::__errno_location() == libc::EINTR => {}
+                // The caller gave up before pinning: never run unpinned.
+                _ => libc::_exit(125),
+            }
+        }
+        libc::close(1);
+        if let Err(error) = cleanup.and_then(|()| enter_new_namespaces(maps)) {
+            send(-error.raw_os_error().unwrap_or(libc::EIO));
+            libc::_exit(125);
+        }
+        libc::prctl(libc::PR_SET_NAME, c"world-holder".as_ptr());
+        if !send(0) {
+            libc::_exit(125);
+        }
+        hold()
+    }
+}
+
 /// Start a detached process that keeps new namespaces alive.
 pub(crate) fn start_holder() -> Result<StartedHolder> {
     let maps = IdMaps::current();
@@ -1217,75 +1281,23 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
         unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
     let (ack_read, ack_write) = (above_stdio(ack_read)?, above_stdio(ack_write)?);
     let ack = ack_read.as_raw_fd();
-    // The program is never executed: the holder stays in pre_exec forever,
-    // so any embedding executable works, not only the world CLI.
-    let mut cmd = std::process::Command::new("/proc/self/exe");
-    cmd.current_dir("/")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    // SAFETY: the closure only makes raw system calls on data prepared above.
-    unsafe {
-        cmd.pre_exec(move || {
-            check(libc::setsid())?;
-            // Double fork: the holder is reparented to init (or a subreaper),
-            // which reaps it after teardown, so a long-lived caller of setup
-            // never accumulates zombies.
-            let holder = check(libc::fork())?;
-            if holder != 0 {
-                libc::_exit(0);
-            }
-            // The holder never execs, so close-on-exec does not apply: drop
-            // every inherited descriptor first, keeping only the report
-            // pipe (as fd 0), so it never keeps the caller's sockets or
-            // files alive. That also closes spawn's status pipe, so setup
-            // errors are reported through the report pipe as -errno.
-            if libc::dup2(report, 0) < 0 || libc::dup2(ack, 1) < 0 {
-                libc::_exit(125);
-            }
-            let send = |value: libc::pid_t| {
-                let size = std::mem::size_of_val(&value);
-                libc::write(0, (&value as *const libc::pid_t).cast(), size) == size as isize
-            };
-            // Only the report (0) and acknowledgment (1) pipes remain, so
-            // the wait below sees EOF if the caller dies before pinning.
-            // Done before reporting the PID: once reported, the holder
-            // must stay alive until pinned, so no failure may come between.
-            if close_from(2).is_err() {
-                libc::_exit(125);
-            }
-            // PID first, so the caller can pin (and, if setup fails and it
-            // adopted us as a subreaper, reap) the holder; then the result.
-            if !send(libc::getpid()) {
-                libc::_exit(125);
-            }
-            let mut byte = 0u8;
-            loop {
-                match libc::read(1, (&mut byte as *mut u8).cast(), 1) {
-                    1 => break,
-                    n if n < 0 && *libc::__errno_location() == libc::EINTR => {}
-                    // The caller gave up before pinning: never run unpinned.
-                    _ => libc::_exit(125),
-                }
-            }
-            libc::close(1);
-            let setup = enter_new_namespaces(&maps);
-            if let Err(error) = setup {
-                send(-error.raw_os_error().unwrap_or(libc::EIO));
-                libc::_exit(125);
-            }
-            libc::prctl(libc::PR_SET_NAME, c"world-holder".as_ptr());
-            if !send(0) {
-                libc::_exit(125);
-            }
-            hold()
-        });
+    let (report_read, ack_write_fd) = (read.as_raw_fd(), ack_write.as_raw_fd());
+    // A raw double fork rather than Command: no exec and no exec-status
+    // pipe, so the holder can report its PID and wait to be pinned even
+    // when a later step fails, and any embedding executable works.
+    // SAFETY: after fork the child makes only raw system calls on data
+    // prepared above and never returns.
+    let intermediate = check(unsafe { libc::fork() })?;
+    if intermediate == 0 {
+        unsafe { holder_process(&maps, report, ack, report_read, ack_write_fd) }
     }
-    let mut child = cmd.spawn().context("start World namespace holder")?;
-    // Reap the intermediate. A caller that ignores SIGCHLD or reaps
-    // children itself may already have done so (ECHILD); spawn returning
-    // means the holder is running either way, so always read its PID.
-    let _ = child.wait();
+    // Reap the intermediate, which exits at once. A caller that ignores
+    // SIGCHLD or reaps children itself may already have done so (ECHILD).
+    let mut status = 0;
+    // SAFETY: status is a live int; the PID is our own unreaped child.
+    while unsafe { libc::waitpid(intermediate, &mut status, 0) } < 0
+        && Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+    {}
     drop((write, ack_read));
     let mut report = std::fs::File::from(read);
     // read_exact retries EINTR and short reads.
