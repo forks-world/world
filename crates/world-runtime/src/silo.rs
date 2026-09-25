@@ -470,7 +470,7 @@ fn create_in(
         bail!("invalid workspace ID");
     }
     let workdir = run::workdir(workdir)?;
-    reject_shared_temp(&workdir, "workdir")?;
+    check_workdir(&workdir)?;
     let _lock = lock(state)?;
     let mut worlds = registry(state)?;
     if let Some(world) = worlds.get(id) {
@@ -627,6 +627,16 @@ fn reject_shared_temp(path: &Path, what: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Only macOS redirects host temp dirs, so only there is a workdir under
+/// them unusable; Linux runs such a workdir normally.
+fn check_workdir(dir: &Path) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        reject_shared_temp(dir, "workdir")
+    } else {
+        Ok(())
+    }
 }
 
 /// A recorded workdir `world exec` now refuses (legacy macOS /tmp layout).
@@ -1522,7 +1532,7 @@ fn exec_workdir(world: &World) -> Result<PathBuf> {
         )
     }
     let dir = run::workdir(&world.workdir)?;
-    reject_shared_temp(&dir, "workdir")?;
+    check_workdir(&dir)?;
     Ok(dir)
 }
 
@@ -1813,6 +1823,40 @@ mod tests {
             err.to_string().contains("belongs to another workdir"),
             "{err}"
         );
+    }
+
+    /// Linux never redirects `/tmp`, so a workdir under it (including the
+    /// `/private` form macOS's symlink resolution would produce) is usable
+    /// as-is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_accepts_a_workdir_under_private_tmp() {
+        check_workdir(Path::new("/private/tmp/w")).unwrap();
+        check_workdir(Path::new("/private/var/tmp/w")).unwrap();
+    }
+
+    /// macOS redirects host temp dirs, so a workdir under either raw form
+    /// still must be rejected.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_rejects_a_workdir_under_private_tmp() {
+        let err = check_workdir(Path::new("/private/tmp/w")).unwrap_err();
+        assert!(err.to_string().contains("must not be under /tmp"), "{err}");
+    }
+
+    /// End to end: on Linux, creating a workspace with a workdir under
+    /// `/tmp` succeeds and never needs `home` (only macOS's temp-root
+    /// redirection depends on it).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_in_accepts_a_real_tmp_workdir_on_linux() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::Builder::new()
+            .prefix("wt-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let home = || -> Result<PathBuf> { panic!("home should not be needed on Linux") };
+        create_in(state.path(), "A", work.path(), home).unwrap();
     }
 
     #[cfg(target_os = "macos")]
