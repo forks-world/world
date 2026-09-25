@@ -78,6 +78,17 @@ fn run() -> std::io::Result<()> {
                 std::os::unix::net::UnixStream::connect(&args[2])?;
             }
         }
+        "pair" => {
+            let (mut a, mut b) = std::os::unix::net::UnixStream::pair()?;
+            a.write_all(b"pair")?;
+            let mut buf = [0; 4];
+            b.read_exact(&mut buf)?;
+            print!("{}", String::from_utf8_lossy(&buf));
+        }
+        "pair-dgram" => {
+            let (a, _b) = std::os::unix::net::UnixDatagram::pair()?;
+            a.send_to(b"escape", &args[2])?;
+        }
         "write" => {
             std::fs::write(&args[2], "escape")?;
         }

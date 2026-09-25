@@ -56,6 +56,11 @@ enum Silo {
         #[arg(long)]
         world: String,
     },
+    /// Linux: stop the World namespace holder started by setup.
+    Teardown {
+        #[arg(long)]
+        world: String,
+    },
     Exec {
         #[arg(long)]
         world: String,
@@ -66,8 +71,19 @@ enum Silo {
     },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // World must collect workload exit statuses; an ignored SIGCHLD
+    // inherited from the launcher (e.g. `trap '' CHLD`) would discard them.
+    #[cfg(unix)]
+    // SAFETY: resets one signal disposition before any thread exists.
+    unsafe {
+        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+        // A blocked mask survives exec too; Tokio's worker threads inherit it.
+        let mut set = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGCHLD);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+    }
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
@@ -76,6 +92,17 @@ async fn main() {
             std::process::exit(code);
         }
     };
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("world: start runtime: {err}");
+            std::process::exit(125);
+        }
+    };
+    std::process::exit(runtime.block_on(run(cli)));
+}
+
+async fn run(cli: Cli) -> i32 {
     let cancel = CancellationToken::new();
     let signal = cancel.clone();
     tokio::spawn(async move {
@@ -92,14 +119,13 @@ async fn main() {
         }
         signal.cancel();
     });
-    let code = match execute(cli, cancel).await {
+    match execute(cli, cancel).await {
         Ok(code) => code,
         Err(err) => {
             eprintln!("world: {err:#}");
             125
         }
-    };
-    std::process::exit(code);
+    }
 }
 
 async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
@@ -143,14 +169,21 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                     Ok(0)
                 }
                 Silo::Setup { world } => {
-                    silo::setup(&silo::inspect(&state, &world)?)?;
+                    silo::setup(&state, &silo::inspect(&state, &world)?)?;
+                    Ok(0)
+                }
+                Silo::Teardown { world } => {
+                    silo::teardown(&state, &silo::inspect(&state, &world)?)?;
                     Ok(0)
                 }
                 Silo::Exec {
                     world,
                     timeout,
                     command,
-                } => silo::exec(silo::inspect(&state, &world)?, command, timeout, cancel).await,
+                } => {
+                    let world = silo::inspect(&state, &world)?;
+                    silo::exec(&state, world, command, timeout, cancel).await
+                }
             }
         }
     }

@@ -1,4 +1,5 @@
-"""Real native-process checks. Silo tests require configured macOS loopback aliases.
+"""Real native-process checks. macOS silo tests require configured loopback
+aliases; Linux tests require unprivileged user namespaces.
 
 cargo build --workspace && cargo build --workspace --examples
 python3 -m unittest discover -s tests -v
@@ -23,15 +24,25 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORLD = ROOT / "target/debug/world"
 PROBE = ROOT / "target/debug/examples/socket_probe"
+MACOS = sys.platform == "darwin"
+LINUX = sys.platform.startswith("linux")
+SANDBOX = MACOS or LINUX
+# Seatbelt refuses denied operations (EPERM). A Linux network namespace has no
+# route to host listeners: TCP is refused, while seccomp refuses Unix sockets.
+DIAL_DENIED = 77 if MACOS else 78
 
 
 def run(*args, **kwargs):
+    # Independent of the runner's own stdin, which Linux network exec checks.
+    if "stdin" not in kwargs and "input" not in kwargs:
+        kwargs["stdin"] = subprocess.DEVNULL
     return subprocess.run([str(x) for x in args], capture_output=True, text=True, timeout=15, **kwargs)
 
 
 @contextlib.contextmanager
 def serving(args):
-    process = subprocess.Popen([str(x) for x in args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    process = subprocess.Popen([str(x) for x in args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True)
     try:
         if not select.select([process.stdout], [], [], 10)[0]:
             raise AssertionError("listener startup timed out")
@@ -65,7 +76,7 @@ class CLI(unittest.TestCase):
     def test_invalid_policy_and_platform(self):
         self.policy.write_text('{"network_id":"test","typo":true}')
         self.assertEqual(self.network("/bin/echo", "never").returncode, 125)
-        if sys.platform != "darwin":
+        if not SANDBOX:
             self.policy.write_text('{"network_id":"test"}')
             result = self.network("/bin/echo", "never")
             self.assertEqual(result.returncode, 125)
@@ -94,7 +105,248 @@ class CLI(unittest.TestCase):
             self.assertEqual(result.returncode, 77, result.stderr)
         self.assertEqual(self.network(PROBE, "serve", "127.0.0.1:0", "denied").returncode, 77)
 
-    @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
+    @unittest.skipUnless(LINUX, "network namespaces require Linux")
+    def test_namespace_denials_and_children(self):
+        for family, host in [(socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")]:
+            with self.subTest(host=host), socket.socket(family) as listener:
+                listener.bind((host, 0))
+                listener.listen()
+                address = f"[{host}]:{listener.getsockname()[1]}" if ":" in host else f"{host}:{listener.getsockname()[1]}"
+                self.assertEqual(run(PROBE, "dial", address).returncode, 0)
+                for prefix in [[], ["child"]]:
+                    result = self.network(PROBE, *prefix, "dial", address)
+                    self.assertEqual(result.returncode, DIAL_DENIED, result.stderr)
+        with serving([PROBE, "udp-serve", "127.0.0.1:0", "HOST"]) as (_, port):
+            self.assertEqual(run(PROBE, "udp-get", f"127.0.0.1:{port}").stdout, "HOST")
+            result = self.network(PROBE, "udp-get", f"127.0.0.1:{port}")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("HOST", result.stdout)
+        with tempfile.TemporaryDirectory(dir="/tmp") as d, socket.socket(socket.AF_UNIX) as listener:
+            path = str(pathlib.Path(d) / "s")
+            listener.bind(path)
+            listener.listen()
+            self.assertEqual(run(PROBE, "unix", path).returncode, 0)
+            for prefix in [[], ["child"]]:
+                result = self.network(PROBE, *prefix, "unix", path)
+                self.assertEqual(result.returncode, 77, result.stderr)
+        with tempfile.TemporaryDirectory(dir="/tmp") as d, socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as receiver:
+            path = str(pathlib.Path(d) / "d")
+            receiver.bind(path)
+            self.assertEqual(run(PROBE, "pair-dgram", path).returncode, 0)
+            self.assertEqual(receiver.recv(16), b"escape")
+            receiver.setblocking(False)
+            result = self.network(PROBE, "pair-dgram", path)
+            self.assertEqual(result.returncode, 77, result.stderr)
+            with self.assertRaises(BlockingIOError):
+                receiver.recv(16)
+        result = self.network(PROBE, "pair")
+        self.assertEqual((result.returncode, result.stdout), (0, "pair"), result.stderr)
+        with tempfile.TemporaryDirectory() as outside:
+            target = pathlib.Path(outside) / "target"
+            target.write_text("original")
+            result = self.network("/usr/bin/truncate", "-s", "0", target)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(target.read_text(), "original")
+            before = target.stat()
+            for command in [["chmod", "600", target], ["touch", "-d", "2000-01-01", target],
+                            ["ln", "-s", "x", pathlib.Path(outside) / "link"]]:
+                result = self.network(*command)
+                self.assertNotEqual(result.returncode, 0, command)
+            # No new alias of an outside file: hard links cross mounts (EXDEV)
+            # and writes through symlinks land on the read-only view.
+            result = self.network("/bin/sh", "-c", f"ln {target} hard; ln -s {target} soft; echo x > soft")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((self.dir / "hard").exists())
+            after = target.stat()
+            self.assertEqual((after.st_mode, after.st_mtime_ns), (before.st_mode, before.st_mtime_ns))
+            self.assertEqual(target.read_text(), "original")
+            self.assertFalse((pathlib.Path(outside) / "link").exists())
+        result = self.network("/bin/sh", "-c", 'echo in > inside && chmod 700 inside && touch -d 2000-01-01 inside && echo t > "$TMPDIR/t" && cat inside')
+        self.assertEqual((result.returncode, result.stdout), (0, "in\n"), result.stderr)
+        self.assertEqual((self.dir / "inside").stat().st_mode & 0o777, 0o700)
+        # Only loopback exists, private to this execution.
+        result = self.network("/bin/sh", "-c", "tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' '")
+        self.assertEqual((result.returncode, result.stdout), (0, "lo\n"), result.stderr)
+
+    @unittest.skipUnless(LINUX, "Landlock ptrace restriction requires Linux")
+    def test_cannot_steal_host_descriptors(self):
+        # The host process allows any tracer, as with Yama disabled; only
+        # Landlock's ptrace restriction (all ABIs) stands in the way.
+        target = subprocess.Popen([sys.executable, "-c", """
+import ctypes, socket, time
+ctypes.CDLL(None).prctl(0x59616d61, ctypes.c_ulong(2**64 - 1), 0, 0, 0)
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen()
+print(s.fileno(), flush=True); time.sleep(30)
+"""], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(target.wait)
+        self.addCleanup(target.kill)
+        fd = target.stdout.readline().strip()
+        (self.dir / "steal.py").write_text("""
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+pidfd = libc.syscall(434, int(sys.argv[1]), 0)
+got = libc.syscall(438, pidfd, int(sys.argv[2]), 0) if pidfd >= 0 else -1
+print("stolen" if got >= 0 else os.strerror(ctypes.get_errno()))
+""")
+        control = run(sys.executable, self.dir / "steal.py", target.pid, fd)
+        if pathlib.Path("/proc/sys/kernel/yama/ptrace_scope").read_text().strip() in ("0", "1"):
+            self.assertEqual(control.stdout.strip(), "stolen", control.stderr)
+        result = self.network("/usr/bin/python3", "steal.py", target.pid, fd)
+        # The PID namespace hides the host process (ESRCH); Landlock refuses
+        # the ptrace access check (EPERM) even when it is addressable.
+        self.assertIn(result.stdout.strip(), [os.strerror(1), os.strerror(3)], result.stderr)
+
+    @unittest.skipUnless(LINUX, "user namespaces require Linux")
+    def test_workload_has_no_capabilities_even_for_root(self):
+        script = "grep -E '^Cap(Inh|Prm|Eff|Bnd|Amb)' /proc/self/status | cut -f2 | sort -u; mount -o remount,rw / 2>/dev/null"
+        # `unshare -r` makes the caller UID 0, as when root runs world; the
+        # caller also raises its inheritable set, which exec must not keep.
+        raise_inheritable = """
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+header = (ctypes.c_uint32 * 2)(0x20080522, 0)
+data = (ctypes.c_uint32 * 6)()
+assert libc.syscall(125, header, data) == 0
+data[2] = data[1]  # inheritable = permitted (low word)
+assert libc.syscall(126, header, data) == 0, ctypes.get_errno()
+os.execv(sys.argv[1], sys.argv[1:])
+"""
+        for prefix in [[], ["unshare", "-r", sys.executable, "-c", raise_inheritable]]:
+            with self.subTest(prefix=prefix[:2]):
+                result = run(*prefix, WORLD, "network", "exec", "--policy", self.policy,
+                             "--workdir", self.dir, "--", "/bin/sh", "-c", script)
+                self.assertNotEqual(result.returncode, 0, "remount must fail")
+                self.assertEqual(result.stdout, "0000000000000000\n", result.stderr)
+
+    @unittest.skipUnless(LINUX, "Linux-specific isolation")
+    def test_keyrings_devices_and_dev_paths(self):
+        # KEYCTL_JOIN_SESSION_KEYRING: works on the host, refused by seccomp.
+        keyring = "import ctypes, os\nlibc = ctypes.CDLL(None, use_errno=True)\nr = libc.syscall(250, 1, None)\nprint('id' if r >= 0 else os.strerror(ctypes.get_errno()))"
+        self.assertIn("id", run(sys.executable, "-c", keyring).stdout)
+        result = self.network("/usr/bin/python3", "-c", keyring)
+        self.assertIn(os.strerror(1), result.stdout, result.stderr)
+        # Device nodes anywhere in the view, the workdir included, are inert.
+        options = "import os\nfor line in open('/proc/self/mountinfo'):\n    f = line.split()\n    if f[4] == os.getcwd(): print(f[5])"
+        result = self.network("/usr/bin/python3", "-c", options)
+        self.assertIn("nodev", result.stdout.strip().split(","), result.stderr)
+        # The private /dev would hide paths beneath the host /dev.
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as shm:
+            result = run(WORLD, "network", "exec", "--policy", self.policy, "--workdir", shm, "--", "/bin/true")
+            self.assertEqual(result.returncode, 125)
+            self.assertIn("workdir under /dev", result.stderr)
+            result = self.network("/bin/sh", "-c", 'case "$TMPDIR" in /dev/*) exit 1;; esac; test -d "$TMPDIR"',
+                                  env=dict(os.environ, TMPDIR=shm))
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(LINUX, "private /dev requires Linux")
+    def test_host_terminal_and_devices_are_unreachable(self):
+        import pty, termios
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        path = os.ttyname(slave)
+        code = f"""
+import os, termios
+fd = os.open({path!r}, os.O_RDONLY | os.O_NOCTTY)
+attrs = termios.tcgetattr(fd); attrs[3] &= ~termios.ECHO
+termios.tcsetattr(fd, termios.TCSANOW, attrs)
+"""
+        result = self.network("/usr/bin/python3", "-c", code)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(termios.tcgetattr(slave)[3] & termios.ECHO, "host terminal was changed")
+        script = "ls /dev | tr '\\n' ' '; test -e /dev/tty && echo tty; echo x > /dev/null && echo s > /dev/shm/s && cat /dev/shm/s; touch /dev/new 2>/dev/null || echo ro"
+        result = self.network("/bin/sh", "-c", script)
+        self.assertEqual(result.stdout, "fd full null random shm stderr stdin stdout urandom zero s\nro\n", result.stderr)
+
+    @unittest.skipUnless(LINUX, "IPC namespaces require Linux")
+    def test_host_sysv_ipc_is_unreachable(self):
+        created = run("ipcmk", "-M", "4096")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        shmid = created.stdout.split()[-1]
+        self.addCleanup(run, "ipcrm", "-m", shmid)
+        result = self.network("/bin/sh", "-c", f"ipcs -m | grep -c ' {shmid} '; ipcrm -m {shmid}")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), "0")
+        self.assertIn(f" {shmid} ", run("ipcs", "-m").stdout)
+
+    @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
+    def test_exit_status_with_ignored_sigchld(self):
+        # SIG_IGN survives exec; world must still collect the exit status.
+        command = [str(WORLD), "network", "exec", "--policy", str(self.policy), "--workdir", str(self.dir),
+                   "--", "/bin/sh", "-c", "exit 3"]
+        result = run("/bin/sh", "-c", 'trap "" CHLD; exec "$@"', "sh", *command)
+        self.assertEqual(result.returncode, 3, result.stderr)
+
+    @unittest.skipUnless(LINUX, "PID namespaces require Linux")
+    def test_escaped_descendants_are_killed(self):
+        self.assertEqual(self.network("/bin/sh", "-c", "kill -9 $$").returncode, 137)
+        script = 'setsid /bin/sh -c "sleep 2; echo escaped > marker" </dev/null >/dev/null 2>&1 & echo "$$"'
+        for timeout in ["5s", "300ms"]:
+            with self.subTest(timeout=timeout):
+                command = ["/bin/sh", "-c", script + ("" if timeout == "5s" else "; sleep 5")]
+                result = self.network(*command, timeout=timeout)
+                self.assertEqual(result.returncode, 0 if timeout == "5s" else 124, result.stderr)
+                if timeout == "5s":
+                    self.assertEqual(result.stdout, "2\n")  # PID 1 is the reaper
+                time.sleep(3)
+                self.assertFalse((self.dir / "marker").exists())
+
+    @unittest.skipUnless(LINUX, "Linux stdin policy")
+    def test_stdin_must_be_a_pipe_or_null(self):
+        # Any other inode could be modified through the inherited descriptor
+        # (fchmod, futimens, fsetxattr, terminal ioctls).
+        with tempfile.TemporaryDirectory() as outside:
+            target = pathlib.Path(outside) / "target"
+            target.write_text("content")
+            fifo = pathlib.Path(outside) / "fifo"
+            os.mkfifo(fifo)
+            fd = os.open(fifo, os.O_RDWR)
+            try:
+                with open(target) as file:
+                    for stdin in [file, fd]:
+                        result = self.network("/bin/cat", stdin=stdin)
+                        self.assertEqual(result.returncode, 125, result.stderr)
+                        self.assertIn("stdin must be a pipe or /dev/null", result.stderr)
+            finally:
+                os.close(fd)
+        # A pipe's write end would be a channel back to the host.
+        r, w = os.pipe()
+        try:
+            result = self.network("/bin/true", stdin=w)
+            self.assertEqual(result.returncode, 125, result.stderr)
+            self.assertIn("stdin must be a pipe or /dev/null", result.stderr)
+        finally:
+            os.close(r)
+            os.close(w)
+        result = self.network("/bin/cat", input="piped")
+        self.assertEqual((result.returncode, result.stdout), (0, "piped"), result.stderr)
+        check = "import os\nst = os.fstat(0)\nprint(os.major(st.st_rdev), os.minor(st.st_rdev), os.read(0, 1) == b'')"
+        result = self.network("/usr/bin/python3", "-c", check, stdin=subprocess.DEVNULL)
+        self.assertEqual((result.returncode, result.stdout), (0, "1 3 True\n"), result.stderr)
+        # The null device comes from the private read-only /dev.
+        result = run("unshare", "-r", WORLD, "network", "exec", "--policy", self.policy, "--workdir", self.dir,
+                     "--", "/usr/bin/python3", "-c", "import os; os.fchmod(0, 0o600)", stdin=subprocess.DEVNULL)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Read-only file system", result.stderr)
+
+    @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
+    def test_writable_file_stdin_is_refused(self):
+        with tempfile.TemporaryDirectory() as outside:
+            target = pathlib.Path(outside) / "target"
+            target.write_text("original")
+            with open(target, "r+") as stdin:
+                result = self.network("/bin/sh", "-c", "echo escape >&0", stdin=stdin)
+            self.assertEqual(result.returncode, 125, result.stderr)
+            self.assertIn("writable file stdin", result.stderr)
+            self.assertEqual(target.read_text(), "original")
+            with open(target) as stdin:
+                result = self.network("/bin/cat", stdin=stdin)
+            if MACOS:
+                self.assertEqual((result.returncode, result.stdout), (0, "original"), result.stderr)
+            else:
+                self.assertEqual(result.returncode, 125, result.stderr)
+
+    @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_exit_timeout_and_open_stdin(self):
         self.assertEqual(self.network("/bin/sh", "-c", "exit 42").returncode, 42)
         result = self.network("/bin/echo", "closed-stdin-ok", preexec_fn=lambda: os.close(0))
@@ -107,7 +359,7 @@ class CLI(unittest.TestCase):
             os.close(r)
             os.close(w)
 
-    @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
+    @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_fd_and_host_write_guards(self):
         first, second = socket.socketpair()
         with first as sock, second:
@@ -119,10 +371,13 @@ class CLI(unittest.TestCase):
             self.assertEqual(result.returncode, 125)
         with tempfile.TemporaryDirectory() as outside:
             result = self.network(PROBE, "write", str(pathlib.Path(outside) / "escape"))
-            self.assertEqual(result.returncode, 77, result.stderr)
-        self.assertNotEqual(self.network("/bin/launchctl", "list").returncode, 0)
+            # Linux refuses on the read-only mount (EROFS) before Landlock (EACCES).
+            self.assertIn(result.returncode, (77,) if MACOS else (77, 78), result.stderr)
+            self.assertFalse((pathlib.Path(outside) / "escape").exists())
+        if MACOS:
+            self.assertNotEqual(self.network("/bin/launchctl", "list").returncode, 0)
 
-    @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
+    @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_http_proxy_and_connect(self):
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
@@ -141,7 +396,7 @@ class CLI(unittest.TestCase):
                 for extra in [[], ["--proxytunnel"]]:
                     result = self.network("/usr/bin/curl", "-fsS", *extra, f"http://127.0.0.1:{port}")
                     self.assertEqual((result.returncode, result.stdout), (0, "allowed"), result.stderr)
-                self.assertEqual(self.network(PROBE, "dial", f"127.0.0.1:{port}").returncode, 77)
+                self.assertEqual(self.network(PROBE, "dial", f"127.0.0.1:{port}").returncode, DIAL_DENIED)
                 result = self.network("/usr/bin/curl", "-sS", "http://127.0.0.1:1")
                 self.assertIn("destination denied", result.stdout)
             finally:
@@ -346,7 +601,7 @@ class CLI(unittest.TestCase):
         result = run(PROBE, "raw-spawn", program, "fd", "999", env=env)
         self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
 
-    @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
+    @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_slow_output_consumer_does_not_lose_tail(self):
         for destination in ["stdout", "stderr"]:
             r, w = os.pipe()
@@ -362,7 +617,8 @@ class CLI(unittest.TestCase):
                 streams = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
                 streams[destination] = w
                 with subprocess.Popen([str(WORLD), "network", "exec", "--policy", str(self.policy),
-                        "--workdir", str(self.dir), "--timeout", "10s", "--", str(PROBE), "burst", destination], **streams) as process:
+                        "--workdir", str(self.dir), "--timeout", "10s", "--", str(PROBE), "burst", destination],
+                        stdin=subprocess.DEVNULL, **streams) as process:
                     os.close(w)
                     w = None
                     time.sleep(2)
@@ -380,7 +636,7 @@ class CLI(unittest.TestCase):
                 if w is not None:
                     os.close(w)
 
-    @unittest.skipUnless(sys.platform == "darwin", "Seatbelt requires macOS")
+    @unittest.skipUnless(SANDBOX, "requires macOS Seatbelt or Linux namespaces")
     def test_https_connect(self):
         config = self.dir / "openssl.cnf"
         config.write_text("[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=127.0.0.1\n[ext]\nsubjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:TRUE\n")
@@ -391,6 +647,8 @@ class CLI(unittest.TestCase):
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 self.send_response(200)
+                # Framed body: OpenSSL 3 curl rejects EOF without close_notify.
+                self.send_header("Content-Length", "6")
                 self.end_headers()
                 self.wfile.write(b"tls-ok")
             def log_message(self, *args):
@@ -542,6 +800,185 @@ class Silo(unittest.TestCase):
         result = run(*command)
         self.assertEqual(result.returncode, 125)
         self.assertNotIn("never", result.stdout)
+
+
+@unittest.skipUnless(LINUX, "Linux World namespaces")
+class LinuxSilo(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix="world-silo-test-")
+        cls.root = pathlib.Path(cls.temp.name)
+        cls.state = cls.root / "state"
+        for name in ["A", "B"]:
+            work = cls.root / name
+            work.mkdir()
+            for action in [["create", "--world", name, "--workdir", work], ["setup", "--world", name]]:
+                result = run(WORLD, "silo", "--state-dir", cls.state, *action)
+                if result.returncode:
+                    cls.tearDownClass()
+                    raise AssertionError(result.stderr)
+
+    @classmethod
+    def tearDownClass(cls):
+        for name in ["A", "B"]:
+            run(WORLD, "silo", "--state-dir", cls.state, "teardown", "--world", name)
+        cls.temp.cleanup()
+
+    def command(self, world, *args):
+        return [WORLD, "silo", "--state-dir", self.state, "exec", "--world", world, "--timeout", "30s", "--", PROBE, *args]
+
+    def test_same_port_localhost_and_lifecycle(self):
+        for host in ["127.0.0.1", "0.0.0.0", "[::1]", "[::]"]:
+            with self.subTest(host=host), serving(self.command("A", "serve", f"{host}:0", "A")) as (a, port):
+                with serving(self.command("B", "serve", f"{host}:{port}", "B")):
+                    localhost = "[::1]" if host.startswith("[") else "127.0.0.1"
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        futures = {name:pool.submit(run, *self.command(name, "get", f"{localhost}:{port}")) for name in ["A", "B"]}
+                        for name, future in futures.items():
+                            result = future.result()
+                            self.assertEqual((result.returncode, result.stdout), (0, name), result.stderr)
+                    result = run(*self.command("A", "child", "get", f"{localhost}:{port}"))
+                    self.assertEqual((result.returncode, result.stdout), (0, "A"), result.stderr)
+                    # Scripts and system binaries need no special handling.
+                    result = run(*self.command("B")[:-1], "/bin/sh", "-c", f'exec "$0" get {localhost}:{port}', PROBE)
+                    self.assertEqual((result.returncode, result.stdout), (0, "B"), result.stderr)
+                    self.assertNotIn(run(PROBE, "get", f"{localhost}:{port}").stdout, ["A", "B"])
+                    a.terminate()
+                    a.wait(timeout=5)
+                    result = run(*self.command("B", "get", f"{localhost}:{port}"))
+                    self.assertEqual((result.returncode, result.stdout), (0, "B"), result.stderr)
+
+    def test_udp(self):
+        with serving(self.command("A", "udp-serve", "127.0.0.1:0", "A")) as (_, port):
+            with serving(self.command("B", "udp-serve", f"127.0.0.1:{port}", "B")):
+                for name in ["A", "B"]:
+                    result = run(*self.command(name, "udp-get", f"127.0.0.1:{port}"))
+                    self.assertEqual((result.returncode, result.stdout), (0, name), result.stderr)
+
+    def test_no_host_fallback(self):
+        with serving([PROBE, "serve", "127.0.0.1:0", "HOST"]) as (_, port):
+            for name in ["A", "B"]:
+                result = run(*self.command(name, "get", f"127.0.0.1:{port}"))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("HOST", result.stdout)
+
+    def test_privileged_ports_and_descriptors(self):
+        with serving(self.command("A", "serve", "127.0.0.1:80", "A80")):
+            result = run(*self.command("A", "get", "127.0.0.1:80"))
+            self.assertEqual((result.returncode, result.stdout), (0, "A80"), result.stderr)
+        first, second = socket.socketpair()
+        with first as sock, second:
+            result = run(*self.command("A", "fd", sock.fileno()), pass_fds=(sock.fileno(),))
+            self.assertEqual((result.returncode, result.stdout), (0, "descriptor-closed"), result.stderr)
+
+    @staticmethod
+    def holders():
+        pids = set()
+        for entry in pathlib.Path("/proc").iterdir():
+            try:
+                if entry.name.isdigit() and (entry / "comm").read_text().strip() == "world-holder":
+                    pids.add(int(entry.name))
+            except OSError:
+                pass
+        return pids
+
+    def test_holder_is_single_threaded_and_never_orphaned(self):
+        pid = json.loads((self.state / "holders.json").read_text())["A"]["pid"]
+        self.assertEqual(len(os.listdir(f"/proc/{pid}/task")), 1)
+        state = self.root / "readonly-state"
+        work = self.root / "D"
+        work.mkdir()
+        silo = [WORLD, "silo", "--state-dir", state]
+        self.assertEqual(run(*silo, "create", "--world", "D", "--workdir", work).returncode, 0)
+        state.chmod(0o555)
+        self.addCleanup(state.chmod, 0o755)
+        before = self.holders()
+        result = run(*silo, "setup", "--world", "D")
+        self.assertEqual(result.returncode, 125, result.stderr)
+        time.sleep(0.3)
+        self.assertEqual(self.holders() - before, set())
+
+    def test_setup_with_ignored_sigchld(self):
+        # SIG_IGN survives exec, as for an embedding process that ignores
+        # SIGCHLD: the intermediate child is auto-reaped (ECHILD on wait).
+        work = self.root / "F"
+        work.mkdir()
+        silo = [str(WORLD), "silo", "--state-dir", str(self.state)]
+        self.assertEqual(run(*silo, "create", "--world", "F", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *silo, "teardown", "--world", "F")
+        before = self.holders()
+        result = run("/bin/sh", "-c", 'trap "" CHLD; exec "$@"', "sh", *silo, "setup", "--world", "F")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pid = json.loads((self.state / "holders.json").read_text())["F"]["pid"]
+        self.assertEqual(self.holders() - before, {pid})
+        self.assertEqual(run(*self.command("F", "fd", "999")).returncode, 0)
+
+    def test_socket_stdin_is_refused(self):
+        first, second = socket.socketpair()
+        with first as sock, second:
+            result = run(*self.command("A", "fd", "999"), stdin=sock.fileno())
+        self.assertEqual(result.returncode, 125)
+        self.assertIn("socket stdin", result.stderr)
+
+    def test_exit_status_with_ignored_sigchld(self):
+        command = [str(x) for x in self.command("A", "fd", "999")]
+        command[-3:] = ["/bin/sh", "-c", "exit 3"]
+        result = run("/bin/sh", "-c", 'trap "" CHLD; exec "$@"', "sh", *command)
+        self.assertEqual(result.returncode, 3, result.stderr)
+
+    def test_stale_holder_is_replaced_and_forgotten(self):
+        work = self.root / "E"
+        work.mkdir()
+        silo = [WORLD, "silo", "--state-dir", self.state]
+        self.assertEqual(run(*silo, "create", "--world", "E", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *silo, "teardown", "--world", "E")
+        for _ in range(2):
+            self.assertEqual(run(*silo, "setup", "--world", "E").returncode, 0)
+            pid = json.loads((self.state / "holders.json").read_text())["E"]["pid"]
+            os.kill(pid, 9)
+            for _ in range(50):
+                if not os.path.exists(f"/proc/{pid}"):
+                    break
+                time.sleep(0.1)
+        # A dead holder is replaced by setup; teardown forgets a dead one.
+        self.assertEqual(run(*silo, "setup", "--world", "E").returncode, 0)
+        self.assertEqual(run(*self.command("E", "fd", "999")).returncode, 0)
+        pid = json.loads((self.state / "holders.json").read_text())["E"]["pid"]
+        os.kill(pid, 9)
+        time.sleep(0.3)
+        self.assertEqual(run(*silo, "teardown", "--world", "E").returncode, 0)
+        self.assertNotIn("E", json.loads((self.state / "holders.json").read_text()))
+
+    def test_escaped_descendants_are_killed(self):
+        work = self.root / "A"
+        command = [WORLD, "silo", "--state-dir", self.state, "exec", "--world", "A", "--", "/bin/sh", "-c",
+                   'setsid /bin/sh -c "sleep 2; echo escaped > marker" </dev/null >/dev/null 2>&1 &']
+        self.assertEqual(run(*command).returncode, 0)
+        time.sleep(3)
+        self.assertFalse((work / "marker").exists())
+
+    def test_setup_idempotent_and_teardown(self):
+        work = self.root / "C"
+        work.mkdir()
+        silo = [WORLD, "silo", "--state-dir", self.state]
+        self.assertEqual(run(*silo, "create", "--world", "C", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *silo, "teardown", "--world", "C")
+        result = run(*self.command("C", "fd", "999"))
+        self.assertEqual(result.returncode, 125)
+        self.assertIn("silo setup", result.stderr)
+        for _ in range(2):
+            self.assertEqual(run(*silo, "setup", "--world", "C").returncode, 0)
+        holders = json.loads((self.state / "holders.json").read_text())
+        with serving(self.command("C", "serve", "127.0.0.1:0", "C")) as (_, port):
+            result = run(*self.command("C", "get", f"127.0.0.1:{port}"))
+            self.assertEqual((result.returncode, result.stdout), (0, "C"), result.stderr)
+            self.assertEqual(json.loads((self.state / "holders.json").read_text()), holders)
+        self.assertEqual(run(*silo, "teardown", "--world", "C").returncode, 0)
+        with self.assertRaises(ProcessLookupError):
+            for _ in range(50):
+                os.kill(holders["C"]["pid"], 0)
+                time.sleep(0.1)
+        self.assertEqual(run(*self.command("C", "fd", "999")).returncode, 125)
 
 
 if __name__ == "__main__":

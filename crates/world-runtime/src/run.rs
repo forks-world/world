@@ -9,7 +9,8 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    process::Command,
+    process::{Child, Command},
+    task::JoinHandle,
     time::{Instant, sleep_until, timeout},
 };
 use tokio_util::sync::CancellationToken;
@@ -46,10 +47,30 @@ pub fn workdir(path: &Path) -> Result<PathBuf> {
 pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<i32> {
     options.policy.validate()?;
     validate_command(&options.command, options.timeout)?;
-    if !cfg!(target_os = "macos") {
-        bail!("network isolation backend requires macOS; refusing unsandboxed execution");
+    check_sigchld()?;
+    #[cfg(target_os = "macos")]
+    {
+        seatbelt(options, cancel).await
     }
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::run(options, cancel).await
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = cancel;
+        bail!("network isolation backend requires macOS or Linux; refusing unsandboxed execution");
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn seatbelt(options: RunOptions, cancel: CancellationToken) -> Result<i32> {
     let deadline = Instant::now() + options.timeout;
+    // A closed stdin becomes /dev/null, which Seatbelt keeps read-only.
+    let stdin = match pin_stdin()? {
+        Some(fd) => Stdio::from(fd),
+        None => Stdio::null(),
+    };
     let dir = workdir(&options.workdir)?;
     let temp = tempfile::Builder::new()
         .prefix("world-network-")
@@ -96,11 +117,109 @@ pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<i32> 
             cmd.env(key, proxy.url());
         }
     }
-    let result = supervise(cmd, deadline, cancel, &mut proxy, None).await;
+    let result = supervise(cmd, Some(stdin), deadline, cancel, &mut proxy, None).await;
     if let Some(proxy) = &mut proxy {
         proxy.close().await;
     }
     result
+}
+
+/// Linux network exec accepts stdin only as the read end of an anonymous
+/// pipe, the null device (replaced inside the sandbox) or closed. Any other
+/// file, FIFO, terminal or device is an inode the workload could modify
+/// through the inherited descriptor (fchmod, fchown, futimens, fsetxattr,
+/// ioctl). The descriptor is duplicated before it is checked and that
+/// exact duplicate becomes the child's stdin, so another thread replacing
+/// fd 0 afterwards cannot bypass the check. `None` means stdin is closed.
+#[cfg(target_os = "linux")]
+pub(crate) fn pin_linux_stdin() -> Result<Option<std::os::fd::OwnedFd>> {
+    use std::os::fd::AsRawFd;
+    const PIPEFS_MAGIC: u32 = 0x5049_5045;
+    let Some(pinned) = pin_stdin()? else {
+        return Ok(None);
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat initializes the provided stat structure only on success.
+    if unsafe { libc::fstat(pinned.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let stat = unsafe { stat.assume_init() };
+    let accepted = match stat.st_mode & libc::S_IFMT {
+        libc::S_IFIFO => {
+            let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            // SAFETY: fstatfs initializes the structure only on success.
+            if unsafe { libc::fstatfs(pinned.as_raw_fd(), fs.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // f_type's integer type differs between C libraries.
+            let pipe = unsafe { fs.assume_init() }.f_type as u32 == PIPEFS_MAGIC;
+            // Only a read end: a write end would be a channel to the host.
+            // SAFETY: F_GETFL takes no pointer argument.
+            let flags = unsafe { libc::fcntl(pinned.as_raw_fd(), libc::F_GETFL) };
+            pipe && flags >= 0 && flags & libc::O_ACCMODE == libc::O_RDONLY
+        }
+        libc::S_IFCHR => is_null_device(stat.st_rdev),
+        _ => false,
+    };
+    if !accepted {
+        bail!(
+            "stdin must be a pipe or /dev/null for Linux network exec; \
+             e.g. `cat FILE | world network exec ...`"
+        );
+    }
+    Ok(Some(pinned))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn is_null_device(rdev: libc::dev_t) -> bool {
+    libc::major(rdev) == 1 && libc::minor(rdev) == 3
+}
+
+/// Duplicate stdin once and check the duplicate; the caller installs that
+/// exact descriptor as the child's stdin, so another thread replacing fd 0
+/// afterwards cannot bypass the checks. Sockets are refused, and so is a
+/// writable file or block device: an inherited descriptor keeps its
+/// access mode inside the sandbox. `None` means stdin is closed.
+#[cfg(unix)]
+pub(crate) fn pin_stdin() -> Result<Option<std::os::fd::OwnedFd>> {
+    pin_stdin_with(true)
+}
+
+/// pin_stdin, optionally allowing writable files (silo is no write sandbox).
+#[cfg(unix)]
+pub(crate) fn pin_stdin_with(refuse_writable: bool) -> Result<Option<std::os::fd::OwnedFd>> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor we exclusively own.
+    let fd = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EBADF) {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    // SAFETY: as above.
+    let pinned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat initializes the provided stat structure only on success.
+    if unsafe { libc::fstat(pinned.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let kind = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
+    if kind == libc::S_IFSOCK {
+        bail!("socket stdin is not allowed; use a pipe");
+    }
+    if refuse_writable && (kind == libc::S_IFREG || kind == libc::S_IFBLK) {
+        // SAFETY: F_GETFL takes no pointer argument.
+        let flags = unsafe { libc::fcntl(pinned.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if flags & libc::O_ACCMODE != libc::O_RDONLY {
+            bail!("writable file stdin is not allowed; open it read-only or use a pipe");
+        }
+    }
+    Ok(Some(pinned))
 }
 
 #[cfg(unix)]
@@ -117,28 +236,84 @@ fn stdin_is_socket() -> Result<bool> {
     Ok(unsafe { stat.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFSOCK)
 }
 
-pub(crate) async fn supervise(
-    mut cmd: Command,
-    deadline: Instant,
-    cancel: CancellationToken,
-    proxy: &mut Option<Proxy>,
-    ack: Option<&Path>,
-) -> Result<i32> {
+/// A process that ignores SIGCHLD (SIG_IGN or SA_NOCLDWAIT) has its
+/// children reaped automatically, so the workload's exit status could not
+/// be collected; a blocked SIGCHLD can delay noticing the exit. The CLI
+/// resets and unblocks it; library callers must do neither.
+pub(crate) fn check_sigchld() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+        // SAFETY: reads the current disposition into a live struct.
+        if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), action.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let action = unsafe { action.assume_init() };
+        if action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+            bail!("SIGCHLD is ignored in this process; the workload's exit status would be lost");
+        }
+        // A blocked SIGCHLD (inherited by the runtime's threads) can keep
+        // the child-exit notification from arriving until the deadline.
+        let mut mask = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        // SAFETY: reads this thread's mask into a live struct.
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), mask.as_mut_ptr()) };
+        if unsafe { libc::sigismember(mask.as_ptr(), libc::SIGCHLD) } == 1 {
+            bail!("SIGCHLD is blocked in this thread; the workload's exit status could be missed");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn check_stdin() -> Result<()> {
     #[cfg(unix)]
     if stdin_is_socket()? {
         bail!("socket stdin is not allowed; use a pipe");
     }
-    if cancel.is_cancelled() || Instant::now() >= deadline {
-        return Ok(124);
-    }
-    cmd.stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
+    Ok(())
+}
+
+type Forward = JoinHandle<std::io::Result<u64>>;
+
+/// A started workload whose process group is killed when dropped.
+pub(crate) struct Workload {
+    child: Child,
+    guard: ProcessGroup,
+    out: Forward,
+    err: Forward,
+}
+
+pub(crate) fn spawn(mut cmd: Command) -> Result<Workload> {
+    // stdin is the caller's choice (inherited in supervise).
+    cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.as_std_mut().process_group(0);
-    let mut child = cmd.spawn().context("start workload")?;
+    // No caller signal handler may run in the forked child before its
+    // setup has reset them: block every signal in this thread across the
+    // fork (std unblocks in the child just before the pre_exec steps, whose
+    // first action on Linux resets caught handlers) and restore afterwards.
+    #[cfg(unix)]
+    let previous = {
+        // SAFETY: sigset operations on live local sets, this thread only.
+        unsafe {
+            let mut all = std::mem::zeroed::<libc::sigset_t>();
+            let mut previous = std::mem::zeroed::<libc::sigset_t>();
+            libc::sigfillset(&mut all);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &all, &mut previous);
+            previous
+        }
+    };
+    let spawned = cmd.spawn();
+    #[cfg(unix)]
+    // SAFETY: restores this thread's own previous mask.
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+    }
+    let mut child = spawned.context("start workload")?;
     let pid = child.id().context("child PID unavailable")?;
+    // Armed first: any later error kills the whole group, including the
+    // PID-namespace init and workload behind the spawned wrapper.
     let guard = ProcessGroup(pid);
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
@@ -146,6 +321,51 @@ pub(crate) async fn supervise(
         tokio::spawn(async move { tokio::io::copy(&mut stdout, &mut tokio::io::stdout()).await });
     let err =
         tokio::spawn(async move { tokio::io::copy(&mut stderr, &mut tokio::io::stderr()).await });
+    Ok(Workload {
+        child,
+        guard,
+        out,
+        err,
+    })
+}
+
+/// `stdin`: a descriptor already pinned and checked by the caller, or
+/// `None` to check fd 0 and let the child inherit it.
+pub(crate) async fn supervise(
+    mut cmd: Command,
+    stdin: Option<Stdio>,
+    deadline: Instant,
+    cancel: CancellationToken,
+    proxy: &mut Option<Proxy>,
+    ack: Option<&Path>,
+) -> Result<i32> {
+    let stdin = match stdin {
+        Some(stdin) => stdin,
+        None => {
+            check_stdin()?;
+            Stdio::inherit()
+        }
+    };
+    if cancel.is_cancelled() || Instant::now() >= deadline {
+        return Ok(124);
+    }
+    cmd.stdin(stdin);
+    wait(spawn(cmd)?, deadline, cancel, proxy, ack).await
+}
+
+pub(crate) async fn wait(
+    workload: Workload,
+    deadline: Instant,
+    cancel: CancellationToken,
+    proxy: &mut Option<Proxy>,
+    ack: Option<&Path>,
+) -> Result<i32> {
+    let Workload {
+        mut child,
+        guard,
+        out,
+        err,
+    } = workload;
     let injection_failure = async {
         if let Some(path) = ack {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -159,7 +379,16 @@ pub(crate) async fn supervise(
         _=injection_failure=>None,
         _=cancel.cancelled()=>None,
         _=sleep_until(deadline)=>None,
-        result=child.wait()=>Some(result?),
+        result=child.wait()=>Some(result.map_err(|error| {
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                anyhow::anyhow!(
+                    "the workload was reaped elsewhere in this process \
+                     (a SIGCHLD handler calling waitpid(-1)?); its exit status is unavailable"
+                )
+            } else {
+                error.into()
+            }
+        })?),
     };
     if let Some(proxy) = proxy {
         proxy.close().await;
@@ -211,7 +440,7 @@ pub(crate) async fn supervise(
     })
 }
 
-struct ProcessGroup(u32);
+pub(crate) struct ProcessGroup(u32);
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         #[cfg(unix)]
@@ -222,6 +451,7 @@ impl Drop for ProcessGroup {
     }
 }
 
+#[cfg(target_os = "macos")]
 const CLOSE_DESCRIPTORS: &str = r#"
 for file in /dev/fd/*; do
  fd=${file##*/}
@@ -231,6 +461,7 @@ done
 exec "$@"
 "#;
 
+#[cfg(target_os = "macos")]
 fn seatbelt_profile(workdir: &Path, temp: &Path, port: Option<u16>) -> Result<String> {
     let quote = |p: &Path| -> Result<String> {
         Ok(serde_json::to_string(
@@ -261,4 +492,25 @@ fn seatbelt_profile(workdir: &Path, temp: &Path, port: Option<u16>) -> Result<St
         ));
     }
     Ok(profile)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[test]
+    fn blocked_sigchld_is_rejected() {
+        // The mask is per thread, so this does not affect other tests.
+        std::thread::spawn(|| {
+            assert!(super::check_sigchld().is_ok());
+            // SAFETY: sigset operations on a live local set; this thread only.
+            unsafe {
+                let mut set = std::mem::zeroed::<libc::sigset_t>();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGCHLD);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+            }
+            assert!(super::check_sigchld().is_err());
+        })
+        .join()
+        .unwrap();
+    }
 }
