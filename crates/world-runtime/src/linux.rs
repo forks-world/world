@@ -1077,10 +1077,12 @@ impl RawChild {
                 // SAFETY: info is a live siginfo_t; the pidfd is open.
                 if unsafe { libc::waitid(P_PIDFD, id, &mut info, flags) } < 0 {
                     let error = Error::last_os_error();
-                    if error.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
+                    match error.raw_os_error() {
+                        Some(libc::EINTR) => continue,
+                        // Linux 5.3 has pidfd_open but not P_PIDFD (5.4).
+                        Some(libc::EINVAL) => break,
+                        _ => return Err(error),
                     }
-                    return Err(error);
                 }
                 // SAFETY: si_pid is valid after a successful waitid.
                 if unsafe { info.si_pid() } != 0 {
@@ -1090,7 +1092,7 @@ impl RawChild {
                 ready.clear_ready();
             }
         }
-        // Without a pidfd, a thread waits for the exit but leaves the zombie
+        // Without P_PIDFD, a thread waits for the exit but leaves the zombie
         // (WNOWAIT): if this future is cancelled, the detached thread cannot
         // reap the child, so its PID stays ours until this side reaps it.
         let pid = self.pid;
