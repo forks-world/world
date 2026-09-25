@@ -513,6 +513,80 @@ fn run() -> std::io::Result<()> {
             });
             print!("{report}");
         }
+        "temp-rootrel" => {
+            // No ".." anywhere: the redirected root is reached purely by a
+            // relative path's *first* component being "tmp" (or, via a
+            // dirfd/cwd on "/private", "var"), straight off "/" and off a
+            // dirfd opened on "/" and on "/private".
+            use std::ffi::CString;
+            let n = &args[2];
+            let cstr = |s: &str| CString::new(s).unwrap();
+
+            if unsafe { libc::chdir(cstr("/").as_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let dir_rel = format!("tmp/{n}");
+            if unsafe { libc::mkdir(cstr(&dir_rel).as_ptr(), 0o755) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let f_rel = format!("tmp/{n}/f");
+            let fd = unsafe {
+                libc::open(
+                    cstr(&f_rel).as_ptr(),
+                    libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+                    0o644,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            unsafe {
+                libc::write(fd, b"f".as_ptr().cast(), 1);
+                libc::close(fd);
+            }
+
+            let dirfd =
+                unsafe { libc::open(cstr("/").as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+            if dirfd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let f2_rel = format!("tmp/{n}/f2");
+            let fd2 = unsafe {
+                libc::openat(
+                    dirfd,
+                    cstr(&f2_rel).as_ptr(),
+                    libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+                    0o644,
+                )
+            };
+            if fd2 < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            unsafe {
+                libc::write(fd2, b"f2".as_ptr().cast(), 2);
+                libc::close(fd2);
+                libc::close(dirfd);
+            }
+
+            let pfd = unsafe {
+                libc::open(
+                    cstr("/private").as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                )
+            };
+            if pfd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let var_tmp_rel = format!("var/tmp/{n}");
+            if unsafe { libc::mkdirat(pfd, cstr(&var_tmp_rel).as_ptr(), 0o755) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            unsafe {
+                libc::close(pfd);
+            }
+
+            print!("{}", serde_json::json!({}));
+        }
         "cwd-sized" => {
             // Exercise getcwd with buffers sized against the (shorter) host
             // name, including the NULL-buffer allocating form.

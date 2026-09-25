@@ -437,11 +437,21 @@ pub(crate) fn map_with(
     Err(libc::ELOOP)
 }
 
+/// The first non-empty, non-`.` component of a relative path, or `""` when
+/// `path` has none (e.g. `"."`, `""`).
+fn first_real_component(p: &[u8]) -> &[u8] {
+    p.split(|&b| b == b'/')
+        .find(|c| !c.is_empty() && *c != b".")
+        .unwrap_or(b"")
+}
+
 /// Write the World location for a `dirfd`-relative `path` into `out`, exactly
 /// as `map` does for an absolute one. Below a directory `fd` (or the cwd, for
 /// `AT_FDCWD`), a relative path with a `..` component can reach a host temp
 /// root, or, from a cwd already inside a workspace's private tree, escape it
-/// physically without escaping it logically (see `map_at_with`).
+/// physically without escaping it logically; so can a relative path with no
+/// `..` at all, once its first real component is `tmp`, `private` or `var`
+/// (see `map_at_with`).
 pub fn map_at(
     root: &[u8],
     dirfd: c_int,
@@ -458,9 +468,11 @@ pub fn map_at(
 /// `real_base`) and to finish mapping the joined absolute text.
 ///
 /// An absolute `path` is handled exactly as `map_with` already does,
-/// ignoring `base` entirely. A relative `path` with no `..` component resolves
-/// through the kernel exactly as written, so `base` is never even called for
-/// it (`base` is a real syscall). Otherwise `base` is joined with `path`,
+/// ignoring `base` entirely. A relative `path` with no `..` component whose
+/// first real component is not `tmp`, `private` or `var` resolves through the
+/// kernel exactly as written, so `base` is never even called for it (`base`
+/// is a real syscall) -- it could not possibly land under a host temp root.
+/// Otherwise `base` is joined with `path`,
 /// popping `path`'s *leading* `.`/`..` components textually against `base`
 /// (a `..` deeper in `path` is left for `map_with`'s own scan, exactly as for
 /// any other absolute text). `base` itself is first rewritten to its
@@ -482,7 +494,8 @@ pub(crate) fn map_at_with(
     if path.starts_with(b"/") {
         return map_with(root, path, out, resolve);
     }
-    if !path.split(|&b| b == b'/').any(|c| c == b"..") {
+    let has_dotdot = path.split(|&b| b == b'/').any(|c| c == b"..");
+    if !has_dotdot && !matches!(first_real_component(path), b"tmp" | b"private" | b"var") {
         return Ok(None);
     }
     let mut base_buf = [0u8; PATH_MAX];
@@ -939,8 +952,9 @@ mod tests {
     fn map_at_with_joins_relative_dotdot_against_the_real_base() {
         let root = std::str::from_utf8(ROOT).unwrap();
 
-        // No ".." at all: resolved through the kernel exactly as written,
-        // without ever calling `base` (a real syscall).
+        // No ".." at all, and the first real component isn't tmp/private/var:
+        // resolved through the kernel exactly as written, without ever
+        // calling `base` (a real syscall).
         assert_eq!(
             mapped_at(
                 |_: &mut [u8]| -> Result<usize, c_int> {
@@ -982,6 +996,61 @@ mod tests {
         assert_eq!(
             mapped_at(|_: &mut [u8]| Err(libc::ENOENT), "../x"),
             Ok(None)
+        );
+    }
+
+    #[test]
+    fn map_at_with_joins_no_dotdot_paths_from_root_bases() {
+        let root = std::str::from_utf8(ROOT).unwrap();
+
+        // From "/" (or its "/private" aliases), a relative path with no ".."
+        // still reaches a host temp root once joined with the base, exactly
+        // as the kernel would resolve it component by component.
+        for (base, path, expected) in [
+            ("/", "tmp/x", "/tmp/x"),
+            ("/private", "tmp/x", "/tmp/x"),
+            ("/private/var", "tmp/x", "/var/tmp/x"),
+            ("/", "var/tmp/x", "/var/tmp/x"),
+            ("/", "private/var/tmp/x", "/var/tmp/x"),
+            ("/", "./tmp/x", "/tmp/x"),
+            ("/", ".//tmp/x", "/tmp/x"),
+        ] {
+            assert_eq!(
+                mapped_at(fixed_base(base.to_string()), path),
+                Ok(Some(format!("{root}{expected}"))),
+                "{base} + {path}"
+            );
+        }
+
+        // An ordinary host cwd: "tmp/x" joined onto it is just a host path
+        // with no temp root anywhere in its resolved prefix, so it is left
+        // unmapped exactly as the kernel would leave it.
+        assert_eq!(
+            mapped_at(fixed_base("/Users/me".to_string()), "tmp/x"),
+            Ok(None)
+        );
+
+        // No ".." and a first real component that is never tmp/private/var:
+        // `base` (a real syscall) is never even called.
+        for path in ["src/main.rs", "a/b", "."] {
+            assert_eq!(
+                mapped_at(
+                    |_: &mut [u8]| -> Result<usize, c_int> {
+                        panic!("base should not be called for {path}")
+                    },
+                    path,
+                ),
+                Ok(None),
+                "{path}"
+            );
+        }
+
+        // A base already under the redirected root: the joined text lands
+        // back inside it, and `map_with` reports that directly.
+        let base_under_root = format!("{root}/tmp/a");
+        assert_eq!(
+            mapped_at(fixed_base(base_under_root), "tmp/x"),
+            Ok(Some(format!("{root}/tmp/a/tmp/x")))
         );
     }
 

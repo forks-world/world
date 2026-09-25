@@ -697,6 +697,20 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
         self.assertFalse(os.path.lexists(f"/tmp/{n}"))
 
     @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
+    def test_relative_path_from_root_reaches_the_redirected_temp_root(self):
+        # No ".." anywhere: a relative path still reaches a host temp root
+        # once its first real component is "tmp" or "var", straight off "/"
+        # (cwd and a dirfd) and off a dirfd on "/private".
+        n = f"wt-{uuid.uuid4().hex[:8]}"
+        result = run(PROBE, "temp-rootrel", n, env=self.shim_env(self.world_tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.world_tmp / "tmp" / n / "f").read_text(), "f")
+        self.assertEqual((self.world_tmp / "tmp" / n / "f2").read_text(), "f2")
+        self.assertTrue((self.world_tmp / "var/tmp" / n).is_dir())
+        self.assertFalse(os.path.lexists(f"/tmp/{n}"))
+        self.assertFalse(os.path.lexists(f"/var/tmp/{n}"))
+
+    @unittest.skipUnless(sys.platform == "darwin", "native shim requires macOS")
     def test_getcwd_reports_the_host_name_even_in_a_small_buffer(self):
         name = f"wt-{uuid.uuid4().hex[:8]}"
         result = run(PROBE, "cwd-sized", name, env=self.shim_env(self.world_tmp))
