@@ -1,15 +1,20 @@
 use crate::{policy::Policy, proxy::Proxy};
 use anyhow::{Context, Result, bail};
+#[cfg(all(unix, not(target_os = "linux")))]
+use std::os::unix::process::CommandExt;
 #[cfg(unix)]
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
+#[cfg(not(target_os = "linux"))]
+use std::process::Stdio;
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
-    process::Stdio,
     time::Duration,
 };
+// Linux forks workloads itself (linux::spawn); other platforms use Command.
+#[cfg(not(target_os = "linux"))]
+use tokio::process::{Child, Command};
 use tokio::{
-    process::{Child, Command},
     task::JoinHandle,
     time::{Instant, sleep_until, timeout},
 };
@@ -222,7 +227,7 @@ pub(crate) fn pin_stdin_with(refuse_writable: bool) -> Result<Option<std::os::fd
     Ok(Some(pinned))
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn stdin_is_socket() -> Result<bool> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: fstat initializes the provided stat structure only on success.
@@ -264,6 +269,7 @@ pub(crate) fn check_sigchld() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn check_stdin() -> Result<()> {
     #[cfg(unix)]
     if stdin_is_socket()? {
@@ -274,14 +280,75 @@ pub(crate) fn check_stdin() -> Result<()> {
 
 type Forward = JoinHandle<std::io::Result<u64>>;
 
+/// The workload process: a Tokio child, or on Linux a raw-forked one.
+pub(crate) enum Process {
+    #[cfg(not(target_os = "linux"))]
+    Tokio(Child),
+    #[cfg(target_os = "linux")]
+    Raw(crate::linux::RawChild),
+}
+
+impl Process {
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self {
+            #[cfg(not(target_os = "linux"))]
+            Process::Tokio(child) => child.wait().await,
+            #[cfg(target_os = "linux")]
+            Process::Raw(child) => child.wait().await,
+        }
+    }
+    async fn kill(&mut self) {
+        match self {
+            #[cfg(not(target_os = "linux"))]
+            Process::Tokio(child) => {
+                let _ = child.kill().await;
+            }
+            #[cfg(target_os = "linux")]
+            Process::Raw(child) => {
+                child.kill();
+                let _ = child.wait().await;
+            }
+        }
+    }
+}
+
 /// A started workload whose process group is killed when dropped.
 pub(crate) struct Workload {
-    child: Child,
+    child: Process,
     guard: ProcessGroup,
     out: Forward,
     err: Forward,
 }
 
+fn forward<R>(mut from: R, stderr: bool) -> Forward
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        if stderr {
+            tokio::io::copy(&mut from, &mut tokio::io::stderr()).await
+        } else {
+            tokio::io::copy(&mut from, &mut tokio::io::stdout()).await
+        }
+    })
+}
+
+/// Supervise a raw-forked Linux workload like a spawned Command.
+#[cfg(target_os = "linux")]
+pub(crate) fn raw_workload(mut child: crate::linux::RawChild) -> Workload {
+    // Armed first: the workload leads its own process group.
+    let guard = ProcessGroup(child.pid as u32);
+    let out = forward(child.stdout.take().expect("stdout pipe"), false);
+    let err = forward(child.stderr.take().expect("stderr pipe"), true);
+    Workload {
+        child: Process::Raw(child),
+        guard,
+        out,
+        err,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn spawn(mut cmd: Command) -> Result<Workload> {
     // stdin is the caller's choice (inherited in supervise).
     cmd.stdout(Stdio::piped())
@@ -315,14 +382,10 @@ pub(crate) fn spawn(mut cmd: Command) -> Result<Workload> {
     // Armed first: any later error kills the whole group, including the
     // PID-namespace init and workload behind the spawned wrapper.
     let guard = ProcessGroup(pid);
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let out =
-        tokio::spawn(async move { tokio::io::copy(&mut stdout, &mut tokio::io::stdout()).await });
-    let err =
-        tokio::spawn(async move { tokio::io::copy(&mut stderr, &mut tokio::io::stderr()).await });
+    let out = forward(child.stdout.take().unwrap(), false);
+    let err = forward(child.stderr.take().unwrap(), true);
     Ok(Workload {
-        child,
+        child: Process::Tokio(child),
         guard,
         out,
         err,
@@ -331,6 +394,7 @@ pub(crate) fn spawn(mut cmd: Command) -> Result<Workload> {
 
 /// `stdin`: a descriptor already pinned and checked by the caller, or
 /// `None` to check fd 0 and let the child inherit it.
+#[cfg(not(target_os = "linux"))]
 pub(crate) async fn supervise(
     mut cmd: Command,
     stdin: Option<Stdio>,
@@ -395,7 +459,7 @@ pub(crate) async fn wait(
     }
     drop(guard);
     if status.is_none() {
-        let _ = child.kill().await;
+        child.kill().await;
         let _ = child.wait().await;
     }
     for mut task in [out, err] {

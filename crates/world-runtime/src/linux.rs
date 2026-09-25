@@ -20,14 +20,11 @@ use std::{
     io::{Error, Result as IoResult},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-        unix::{ffi::OsStrExt, fs::MetadataExt, process::CommandExt},
+        unix::{ffi::OsStrExt, fs::MetadataExt},
     },
     path::Path,
 };
-use tokio::{
-    process::Command,
-    time::{Instant, sleep_until},
-};
+use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 
 fn check(result: libc::c_int) -> IoResult<libc::c_int> {
@@ -48,6 +45,24 @@ pub(crate) fn above_stdio(fd: OwnedFd) -> IoResult<OwnedFd> {
     // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor we exclusively own.
     let moved = check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) })?;
     Ok(unsafe { OwnedFd::from_raw_fd(moved) })
+}
+
+/// pidfd_open, moved above stdio when possible: with a closed stdio slot
+/// the kernel returns 0-2, where a concurrent caller could pin it as its
+/// stdin or dup2 over it. If moving fails, the low descriptor still works.
+fn open_pidfd(pid: libc::pid_t) -> IoResult<OwnedFd> {
+    // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
+    let fd = check(unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) } as RawFd)?;
+    // SAFETY: the kernel returned a new descriptor we exclusively own.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    if fd.as_raw_fd() > 2 {
+        return Ok(fd);
+    }
+    // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor we exclusively own.
+    match unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) } {
+        moved if moved >= 0 => Ok(unsafe { OwnedFd::from_raw_fd(moved) }),
+        _ => Ok(fd),
+    }
 }
 
 /// Maps the caller's own uid/gid into a new user namespace.
@@ -1019,6 +1034,340 @@ mod seccomp {
     }
 }
 
+/// What to run and how to prepare the forked child before exec.
+pub(crate) struct Spawn {
+    pub program: std::ffi::OsString,
+    pub args: Vec<std::ffi::OsString>,
+    pub cwd: std::path::PathBuf,
+    /// The complete environment of the workload.
+    pub env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    /// A pinned, checked stdin; `None` means the null device.
+    pub stdin: Option<OwnedFd>,
+    /// Runs in the child after stdio and cwd are set up, with every signal
+    /// still blocked; it must only make raw system calls.
+    pub setup: Box<dyn FnMut() -> IoResult<()> + Send>,
+}
+
+/// A raw-forked workload: waited for through a pidfd (or a blocking
+/// waitpid thread before Linux 5.3), with its output as async pipes.
+pub(crate) struct RawChild {
+    pub pid: libc::pid_t,
+    pidfd: Option<tokio::io::unix::AsyncFd<OwnedFd>>,
+    reaped: bool,
+    pub stdout: Option<tokio::net::unix::pipe::Receiver>,
+    pub stderr: Option<tokio::net::unix::pipe::Receiver>,
+}
+
+fn wait_status(info: &libc::siginfo_t) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    // SAFETY: si_status is valid for the CLD_* codes waitid reports.
+    let status = unsafe { info.si_status() };
+    std::process::ExitStatus::from_raw(match info.si_code {
+        libc::CLD_EXITED => (status & 0xff) << 8,
+        libc::CLD_DUMPED => status | 0x80,
+        _ => status,
+    })
+}
+
+/// Block until the child has exited, leaving it unreaped (a zombie).
+fn wait_exited(pid: libc::pid_t) -> IoResult<()> {
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    let flags = libc::WEXITED | libc::WNOWAIT;
+    // SAFETY: info is a live siginfo_t; pid is our unreaped child.
+    while unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) } < 0 {
+        let error = Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+impl RawChild {
+    pub(crate) async fn wait(&mut self) -> IoResult<std::process::ExitStatus> {
+        const P_PIDFD: libc::idtype_t = 3;
+        if let Some(fd) = &self.pidfd {
+            loop {
+                let mut ready = fd.readable().await?;
+                let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+                let id = fd.get_ref().as_raw_fd() as libc::id_t;
+                let flags = libc::WEXITED | libc::WNOHANG;
+                // SAFETY: info is a live siginfo_t; the pidfd is open.
+                if unsafe { libc::waitid(P_PIDFD, id, &mut info, flags) } < 0 {
+                    let error = Error::last_os_error();
+                    match error.raw_os_error() {
+                        Some(libc::EINTR) => continue,
+                        // Linux 5.3 has pidfd_open but not P_PIDFD (5.4).
+                        Some(libc::EINVAL) => break,
+                        _ => return Err(error),
+                    }
+                }
+                // SAFETY: si_pid is valid after a successful waitid.
+                if unsafe { info.si_pid() } != 0 {
+                    self.reaped = true;
+                    return Ok(wait_status(&info));
+                }
+                ready.clear_ready();
+            }
+        }
+        // Without P_PIDFD, a thread waits for the exit but leaves the zombie
+        // (WNOWAIT): if this future is cancelled, the detached thread cannot
+        // reap the child, so its PID stays ours until this side reaps it.
+        let pid = self.pid;
+        tokio::task::spawn_blocking(move || wait_exited(pid))
+            .await
+            .map_err(Error::other)??;
+        let status = self.reap()?;
+        use std::os::unix::process::ExitStatusExt;
+        Ok(std::process::ExitStatus::from_raw(status))
+    }
+
+    /// Reap the child (blocking until it exits) and return its raw status.
+    fn reap(&mut self) -> IoResult<i32> {
+        let mut status = 0;
+        // SAFETY: status is a live int; pid is our unreaped child.
+        while unsafe { libc::waitpid(self.pid, &mut status, 0) } < 0 {
+            let error = Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        self.reaped = true;
+        Ok(status)
+    }
+
+    pub(crate) fn kill(&self) {
+        // SAFETY: plain-integer signalling of our own unreaped child.
+        unsafe {
+            match &self.pidfd {
+                Some(fd) => {
+                    let null = std::ptr::null::<libc::siginfo_t>();
+                    let fd = fd.get_ref().as_raw_fd();
+                    libc::syscall(libc::SYS_pidfd_send_signal, fd, libc::SIGKILL, null, 0u32);
+                }
+                None => {
+                    libc::kill(self.pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RawChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            // The whole group, not just the leader: its PID namespace init
+            // and descendants outlive it otherwise. The unreaped leader keeps
+            // the group ID from being reused.
+            // SAFETY: plain-integer signalling of our child's process group.
+            unsafe { libc::kill(-self.pid, libc::SIGKILL) };
+            self.kill();
+            let _ = self.reap();
+        }
+    }
+}
+
+fn cstring(value: &std::ffi::OsStr) -> Result<CString> {
+    CString::new(value.as_bytes()).context("argument or environment contains NUL")
+}
+
+/// The paths execvp would try, prepared before fork: a name with a slash
+/// is used as given (relative to the child's cwd), otherwise each PATH
+/// entry in order (relative entries resolve against the cwd).
+fn program_candidates(
+    program: &std::ffi::OsStr,
+    cwd: &Path,
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<Vec<CString>> {
+    if program.is_empty() {
+        return Err(Error::from_raw_os_error(libc::ENOENT)).context("start workload");
+    }
+    if program.as_bytes().contains(&b'/') {
+        return Ok(vec![cstring(program)?]);
+    }
+    let path = env
+        .iter()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| value.clone())
+        // glibc execvp's default (confstr _CS_PATH) when PATH is unset.
+        .unwrap_or_else(|| "/bin:/usr/bin".into());
+    std::env::split_paths(&path)
+        .map(|dir| cstring(cwd.join(dir).join(program).as_os_str()))
+        .collect()
+}
+
+/// Whether execvp moves on to the next PATH entry after this exec error.
+fn try_next_candidate(errno: i32) -> bool {
+    matches!(errno, libc::EACCES | libc::ENOENT | libc::ENOTDIR)
+        || matches!(errno, libc::ESTALE | libc::ENODEV | libc::ETIMEDOUT)
+}
+
+fn pipe_pair() -> Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 writes two new descriptors into fds on success.
+    check(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) })?;
+    // SAFETY: both descriptors are new and exclusively owned here.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    Ok((above_stdio(read)?, above_stdio(write)?))
+}
+
+fn receiver(fd: OwnedFd) -> Result<tokio::net::unix::pipe::Receiver> {
+    // SAFETY: fcntl on an owned descriptor with integer arguments.
+    unsafe {
+        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    Ok(tokio::net::unix::pipe::Receiver::from_owned_fd(fd)?)
+}
+
+/// Fork and exec the workload without std's Command: every signal stays
+/// blocked in the child until its inherited handlers are reset and its
+/// setup is done, so no caller handler can ever run in it (std clears the
+/// mask before its pre_exec hooks, leaving a window).
+pub(crate) fn spawn(mut spec: Spawn) -> Result<RawChild> {
+    let candidates = program_candidates(&spec.program, &spec.cwd, &spec.env)?;
+    let cwd = cstring(spec.cwd.as_os_str())?;
+    let argv: Vec<CString> = std::iter::once(&spec.program)
+        .chain(&spec.args)
+        .map(|arg| cstring(arg))
+        .collect::<Result<_>>()?;
+    // execvp's fallback for a script without a shebang line (ENOEXEC).
+    let sh_argvs: Vec<Vec<CString>> = candidates
+        .iter()
+        .map(|program| {
+            [c"/bin/sh".to_owned(), program.clone()]
+                .into_iter()
+                .chain(argv[1..].iter().cloned())
+                .collect()
+        })
+        .collect();
+    let env: Vec<CString> = spec
+        .env
+        .iter()
+        .map(|(key, value)| {
+            let mut entry = key.as_bytes().to_vec();
+            entry.push(b'=');
+            entry.extend_from_slice(value.as_bytes());
+            CString::new(entry).context("environment contains NUL")
+        })
+        .collect::<Result<_>>()?;
+    let pointers = |list: &[CString]| {
+        let mut out: Vec<*const libc::c_char> = list.iter().map(|c| c.as_ptr()).collect();
+        out.push(std::ptr::null());
+        out
+    };
+    let (argv_ptr, env_ptr) = (pointers(&argv), pointers(&env));
+    let sh_ptrs: Vec<_> = sh_argvs.iter().map(|list| pointers(list)).collect();
+    let stdin = match spec.stdin.take() {
+        Some(fd) => above_stdio(fd)?,
+        None => above_stdio(std::fs::File::open("/dev/null")?.into())?,
+    };
+    let (out_read, out_write) = pipe_pair()?;
+    let (err_read, err_write) = pipe_pair()?;
+    let (status_read, status_write) = pipe_pair()?;
+    let fds = [
+        stdin.as_raw_fd(),
+        out_write.as_raw_fd(),
+        err_write.as_raw_fd(),
+        status_write.as_raw_fd(),
+    ];
+    // SAFETY: sigset operations on live local sets, this thread only.
+    let mut all = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    let mut previous = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    unsafe {
+        libc::sigfillset(&mut all);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &all, &mut previous);
+    }
+    // SAFETY: the child only makes raw system calls on data prepared above
+    // (the setup closure included) and never returns.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        unsafe {
+            let report = |error: i32| -> ! {
+                let bytes = error.to_ne_bytes();
+                libc::write(fds[3], bytes.as_ptr().cast(), bytes.len());
+                libc::_exit(127)
+            };
+            let errno = || *libc::__errno_location();
+            // Signals are blocked: reset inherited handlers before anything.
+            reset_caught_handlers();
+            if libc::setpgid(0, 0) < 0
+                || libc::dup2(fds[0], 0) < 0
+                || libc::dup2(fds[1], 1) < 0
+                || libc::dup2(fds[2], 2) < 0
+                || libc::chdir(cwd.as_ptr()) < 0
+            {
+                report(errno());
+            }
+            if let Err(error) = (spec.setup)() {
+                report(error.raw_os_error().unwrap_or(libc::EIO));
+            }
+            // Rust ignores SIGPIPE; the workload gets the default, as with
+            // std's Command. Then unblock and exec.
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            let mut empty = std::mem::zeroed::<libc::sigset_t>();
+            libc::sigemptyset(&mut empty);
+            libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+            // execvp's search: skip entries that fail for path reasons,
+            // report EACCES if any entry had it, else the last error.
+            let mut denied = false;
+            let mut last = libc::ENOENT;
+            for (program, sh_ptr) in candidates.iter().zip(&sh_ptrs) {
+                libc::execve(program.as_ptr(), argv_ptr.as_ptr(), env_ptr.as_ptr());
+                last = errno();
+                if last == libc::ENOEXEC {
+                    libc::execve(c"/bin/sh".as_ptr(), sh_ptr.as_ptr(), env_ptr.as_ptr());
+                    last = errno();
+                }
+                denied |= last == libc::EACCES;
+                if !try_next_candidate(last) {
+                    break;
+                }
+            }
+            let error = if denied && try_next_candidate(last) {
+                libc::EACCES
+            } else {
+                last
+            };
+            report(error)
+        }
+    }
+    // SAFETY: restores this thread's own previous mask.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) };
+    let pid = check(pid).context("start workload")?;
+    // Own the child before anything else can fail: dropping it kills and
+    // reaps, so no early return leaves the workload unsupervised.
+    let mut child = RawChild {
+        pid,
+        pidfd: None,
+        reaped: false,
+        stdout: None,
+        stderr: None,
+    };
+    drop((stdin, out_write, err_write, status_write));
+    if let Ok(fd) = open_pidfd(pid) {
+        child.pidfd = Some(tokio::io::unix::AsyncFd::new(fd)?);
+    }
+    // Closed on exec (CLOEXEC; setup wrappers close theirs): EOF means the
+    // workload is running, four bytes are the errno of a failed setup/exec.
+    let mut bytes = [0u8; 4];
+    let mut status = std::fs::File::from(status_read);
+    let read = loop {
+        match std::io::Read::read(&mut status, &mut bytes) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => break result.context("start workload")?,
+        }
+    };
+    if read != 0 {
+        // Dropping the child reaps it.
+        let errno = i32::from_ne_bytes(bytes);
+        return Err(Error::from_raw_os_error(errno)).context("start workload");
+    }
+    child.stdout = Some(receiver(out_read)?);
+    child.stderr = Some(receiver(err_read)?);
+    Ok(child)
+}
+
 /// `world network exec`: private network namespace plus egress proxy.
 pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Result<i32> {
     let deadline = Instant::now() + options.timeout;
@@ -1073,17 +1422,18 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
             Some((above_stdio(parent)?, above_stdio(child)?))
         }
     };
-    let mut cmd = Command::new(&options.command[0]);
-    cmd.args(&options.command[1..])
-        .current_dir(&dir)
-        .env_clear()
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
-        .env("HOME", &temp_path)
-        .env("TMPDIR", &temp_path)
-        .env("PWD", &dir)
-        .env("LANG", "C.UTF-8")
-        .env("NO_PROXY", "")
-        .env("no_proxy", "");
+    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = vec![
+        (
+            "PATH".into(),
+            "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".into(),
+        ),
+        ("HOME".into(), temp_path.clone().into()),
+        ("TMPDIR".into(), temp_path.clone().into()),
+        ("PWD".into(), dir.clone().into()),
+        ("LANG".into(), "C.UTF-8".into()),
+        ("NO_PROXY".into(), "".into()),
+        ("no_proxy".into(), "".into()),
+    ];
     if let Some(prepared) = &prepared {
         for key in [
             "http_proxy",
@@ -1093,17 +1443,16 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
             "ALL_PROXY",
             "all_proxy",
         ] {
-            cmd.env(key, prepared.url(port));
+            env.push((key.into(), prepared.url(port).into()));
         }
     }
     let maps = IdMaps::current();
     let view = WritableView::new(&dir, &[&temp_path])?;
     let ruleset_fd = ruleset.as_raw_fd();
     let child_channel = channel.as_ref().map(|(_, child)| child.as_raw_fd());
-    // SAFETY: the closure only makes raw system calls on data prepared above.
-    unsafe {
-        cmd.as_std_mut().pre_exec(move || {
-            reset_caught_handlers();
+    let setup = move || -> IoResult<()> {
+        // SAFETY: raw system calls on data prepared above (see Spawn).
+        unsafe {
             enter_new_namespaces(&maps)?;
             // Private System V IPC and POSIX message queues.
             check(libc::unshare(libc::CLONE_NEWIPC))?;
@@ -1118,18 +1467,21 @@ pub(crate) async fn run(options: RunOptions, cancel: CancellationToken) -> Resul
             drop_capabilities()?;
             seccomp::install(&filter)?;
             enter_pid_namespace()
-        });
-    }
+        }
+    };
     if cancel.is_cancelled() || Instant::now() >= deadline {
         return Ok(124);
     }
     // The validated descriptor itself, never whatever fd 0 is now. A
     // closed stdin becomes the null device, reopened inside the sandbox.
-    cmd.stdin(match stdin {
-        Some(fd) => std::process::Stdio::from(fd),
-        None => std::process::Stdio::null(),
-    });
-    let workload = run::spawn(cmd)?;
+    let workload = run::raw_workload(spawn(Spawn {
+        program: options.command[0].clone(),
+        args: options.command[1..].to_vec(),
+        cwd: dir.clone(),
+        env,
+        stdin,
+        setup: Box::new(setup),
+    })?);
     drop(ruleset);
     let mut proxy = match (prepared, channel) {
         (Some(prepared), Some((parent, child))) => {
@@ -1360,19 +1712,14 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
     let pid = next()?;
     // Pin the holder before it continues: it is blocked waiting for the
     // acknowledgment below, so it is alive and its PID cannot be reused.
-    // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
-    if pidfd < 0 {
-        let error = Error::last_os_error();
+    let pidfd = match open_pidfd(pid) {
+        Ok(fd) => Some(fd),
         // Only a kernel without pidfds (before 5.3) may go on unpinned, as
         // teardown then does too. On any other failure, return without the
         // acknowledgment: the holder sees EOF and exits before setup.
-        if error.raw_os_error() != Some(libc::ENOSYS) {
-            return Err(error).context("pin World namespace holder");
-        }
-    }
-    // SAFETY: a non-negative result is a new descriptor we exclusively own.
-    let pidfd = (pidfd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) });
+        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => None,
+        Err(error) => return Err(error).context("pin World namespace holder"),
+    };
     // Let the holder continue only now that it is pinned. If that fails,
     // closing the pipe makes the waiting holder exit before any setup.
     if let Err(error) = send_byte(&ack_write, b'p') {
@@ -1438,13 +1785,9 @@ fn reap_if_child(pidfd: Option<&OwnedFd>) {
 /// the identity before waitid(P_PIDFD) reaps it without blocking. A
 /// reused PID fails the start-time check and nothing is reaped.
 pub(crate) fn reap_stale_holder(holder: &Holder) {
-    // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, holder.pid as libc::pid_t, 0u32) };
-    if fd < 0 {
+    let Ok(pidfd) = open_pidfd(holder.pid as libc::pid_t) else {
         return;
-    }
-    // SAFETY: the kernel returned a new descriptor we exclusively own.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+    };
     if start_time(holder.pid).ok() != Some(holder.start_time) {
         return;
     }
@@ -1525,23 +1868,21 @@ impl StartedHolder {
 pub(crate) fn stop_holder(holder: &Holder) -> Result<()> {
     // Pin the process first, then verify it: the signal cannot reach a
     // process that reused the PID after verification.
-    // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, holder.pid as libc::pid_t, 0u32) };
-    if pidfd < 0 {
-        let error = Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ENOSYS) {
+    let pidfd = match open_pidfd(holder.pid as libc::pid_t) {
+        Ok(fd) => fd,
+        Err(error) if error.raw_os_error() != Some(libc::ENOSYS) => {
             return Err(error).context("open holder pidfd");
         }
-        // Before Linux 5.3: verify, then signal by PID. Only a PID reused
-        // between these two calls could be hit.
-        let _namespaces = holder.open()?;
-        // SAFETY: kill takes plain integers.
-        check(unsafe { libc::kill(holder.pid as libc::pid_t, libc::SIGKILL) })?;
-        reap_if_child(None);
-        return Ok(());
-    }
-    // SAFETY: the kernel returned a new descriptor we exclusively own.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
+        Err(_) => {
+            // Before Linux 5.3: verify, then signal by PID. Only a PID
+            // reused between these two calls could be hit.
+            let _namespaces = holder.open()?;
+            // SAFETY: kill takes plain integers.
+            check(unsafe { libc::kill(holder.pid as libc::pid_t, libc::SIGKILL) })?;
+            reap_if_child(None);
+            return Ok(());
+        }
+    };
     let _namespaces = holder.open()?;
     // SAFETY: pidfd is open; no siginfo is passed.
     let result = unsafe {
@@ -1610,6 +1951,108 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         panic!("uncommitted holder is still running");
+    }
+
+    /// Without a pidfd, a cancelled wait must not let its detached thread
+    /// reap the child: the PID stays ours until the owner collects it.
+    #[test]
+    fn cancelled_fallback_wait_leaves_the_child_to_its_owner() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut child = super::spawn(super::Spawn {
+                program: "sleep".into(),
+                args: vec!["0.3".into()],
+                cwd: "/".into(),
+                env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+                stdin: None,
+                setup: Box::new(|| Ok(())),
+            })
+            .unwrap();
+            child.pidfd = None;
+            let short = std::time::Duration::from_millis(50);
+            assert!(tokio::time::timeout(short, child.wait()).await.is_err());
+            // The detached waiter sees the exit but leaves a zombie.
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            assert!(!child.reaped);
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", child.pid)).unwrap();
+            let state = stat.rsplit_once(')').unwrap().1.trim_start();
+            assert!(state.starts_with('Z'));
+            assert!(child.wait().await.unwrap().success());
+            assert!(child.reaped);
+        });
+    }
+
+    /// Dropping a child that was never handed to a supervisor (a failed
+    /// spawn step) kills its descendants too, not only the leader.
+    #[test]
+    fn dropped_child_takes_its_process_group() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let descendant = runtime.block_on(async {
+            use tokio::io::AsyncBufReadExt;
+            let mut child = super::spawn(super::Spawn {
+                program: "sh".into(),
+                args: vec!["-c".into(), "sleep 30 & echo $!; wait".into()],
+                cwd: "/".into(),
+                env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+                stdin: None,
+                setup: Box::new(|| Ok(())),
+            })
+            .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let mut line = String::new();
+            let mut reader = tokio::io::BufReader::new(stdout);
+            reader.read_line(&mut line).await.unwrap();
+            drop(child);
+            line.trim().parse::<i32>().unwrap()
+        });
+        for _ in 0..50 {
+            let stat = std::fs::read_to_string(format!("/proc/{descendant}/stat"));
+            let state = stat.as_deref().unwrap_or("").rsplit_once(')');
+            if state.is_none_or(|(_, rest)| rest.trim_start().starts_with('Z')) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("descendant {descendant} survived its dropped leader");
+    }
+
+    /// Like execvp: an entry whose exec fails for path reasons (here a
+    /// missing shebang interpreter) falls through to the next PATH entry,
+    /// and EACCES is reported when no entry could run.
+    #[test]
+    fn path_search_continues_like_execvp() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let (first, second) = (temp.path().join("a"), temp.path().join("b"));
+        for (dir, script, mode) in [
+            (&first, "#!/nonexistent/interpreter\n", 0o755),
+            (&second, "#!/bin/sh\nexit 7\n", 0o755),
+        ] {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::write(dir.join("tool"), script).unwrap();
+            let permissions = std::fs::Permissions::from_mode(mode);
+            std::fs::set_permissions(dir.join("tool"), permissions).unwrap();
+        }
+        let spec = |path: &std::path::Path| super::Spawn {
+            program: "tool".into(),
+            args: vec![],
+            cwd: "/".into(),
+            env: vec![("PATH".into(), path.as_os_str().to_owned())],
+            stdin: None,
+            setup: Box::new(|| Ok(())),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let both = std::env::join_paths([&first, &second]).unwrap();
+            let mut child = super::spawn(spec(both.as_ref())).unwrap();
+            assert_eq!(child.wait().await.unwrap().code(), Some(7));
+            let script = second.join("tool");
+            let permissions = std::fs::Permissions::from_mode(0o644);
+            std::fs::set_permissions(&script, permissions).unwrap();
+            let error = super::spawn(spec(&second)).err().unwrap();
+            let errno = error.root_cause().downcast_ref::<std::io::Error>();
+            assert_eq!(errno.and_then(|e| e.raw_os_error()), Some(libc::EACCES));
+        });
     }
 
     #[test]
