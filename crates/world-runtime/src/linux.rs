@@ -1279,10 +1279,19 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
     let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
     let (read, write) = (above_stdio(read)?, above_stdio(write)?);
     let report = write.as_raw_fd();
-    // Parent -> holder: "pinned". The holder waits for it after reporting
-    // its PID, so it is alive (its PID not reusable) while it is pinned.
-    // SAFETY: pipe2 writes two new descriptors into fds on success.
-    check(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) })?;
+    // Parent -> holder: "pinned", then "committed". The holder waits for
+    // them, so it is alive (its PID not reusable) while it is pinned. A
+    // socket, so the parent can send with MSG_NOSIGNAL: a dead holder must
+    // yield EPIPE, not a SIGPIPE that kills the caller.
+    // SAFETY: socketpair writes two new descriptors into fds on success.
+    check(unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    })?;
     // SAFETY: both descriptors are new and exclusively owned here.
     let (ack_read, ack_write) =
         unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
@@ -1417,11 +1426,13 @@ pub(crate) fn reap_stale_holder(holder: &Holder) {
     }
 }
 
-/// Send one handshake byte to the holder, retrying EINTR.
+/// Send one handshake byte to the holder, retrying EINTR. MSG_NOSIGNAL:
+/// if the holder died this returns EPIPE instead of raising SIGPIPE.
 fn send_byte(fd: &OwnedFd, byte: u8) -> IoResult<()> {
     loop {
-        // SAFETY: writes one byte from a live local to an owned pipe.
-        match unsafe { libc::write(fd.as_raw_fd(), (&byte as *const u8).cast(), 1) } {
+        let data = (&byte as *const u8).cast();
+        // SAFETY: sends one byte from a live local on an owned socket.
+        match unsafe { libc::send(fd.as_raw_fd(), data, 1, libc::MSG_NOSIGNAL) } {
             1 => return Ok(()),
             _ => {
                 let error = Error::last_os_error();
