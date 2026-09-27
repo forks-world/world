@@ -109,13 +109,13 @@ impl NsConnector {
             iov_base: (&mut status as *mut u8).cast(),
             iov_len: 1,
         };
-        let mut control = [0u8; 64];
+        let mut control = [0u64; 8]; // u64: cmsghdr alignment
         // SAFETY: msghdr points at live local buffers for the call.
         let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
         message.msg_iov = &mut iov;
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen = control.len();
+        message.msg_controllen = std::mem::size_of_val(&control);
         let received = loop {
             // SAFETY: as above; the kernel fills the buffers.
             let n =
@@ -208,7 +208,7 @@ unsafe fn connector(user: RawFd, net: RawFd, parent_end: RawFd, channel: RawFd) 
                 iov_base: (&mut status as *mut u8).cast(),
                 iov_len: 1,
             };
-            let mut control = [0u8; 64];
+            let mut control = [0u64; 8]; // u64: cmsghdr alignment
             let mut message = std::mem::zeroed::<libc::msghdr>();
             message.msg_iov = &mut iov;
             message.msg_iovlen = 1;
@@ -341,22 +341,27 @@ async fn relay(
     Ok(())
 }
 
-/// Forward the workspace's listeners (read from its holder's view of
-/// /proc/net) from `ip` on the host until dropped. Rescans every second.
-pub(crate) async fn forward(id: String, holder: u32, ip: Ipv4Addr, connector: NsConnector) {
+/// Forward the workspace's listeners from `ip` on the host until dropped.
+/// Rescans every second, through the connector: it lives in the
+/// workspace's network namespace exactly as long as this exec, so neither
+/// a torn-down holder nor a reused PID changes what is seen.
+pub(crate) async fn forward(id: String, ip: Ipv4Addr, connector: NsConnector) {
+    let pid = connector.pid;
     let connector = Arc::new(connector);
-    let mut active: HashMap<u16, tokio::task::JoinHandle<()>> = HashMap::new();
-    let read = |name: &str| {
-        std::fs::read_to_string(format!("/proc/{holder}/net/{name}")).unwrap_or_default()
-    };
+    let mut active: HashMap<u16, (SocketAddr, tokio::task::JoinHandle<()>)> = HashMap::new();
+    let read =
+        |name: &str| std::fs::read_to_string(format!("/proc/{pid}/net/{name}")).unwrap_or_default();
     // Announce only ports that open while this exec runs (its own server,
     // typically), not every listener of the workspace on every exec.
     let mut announced: std::collections::HashSet<u16> =
         listeners(&read("tcp"), &read("tcp6")).into_keys().collect();
+    let mut reported = std::collections::HashSet::new();
     loop {
         let wanted = listeners(&read("tcp"), &read("tcp6"));
-        active.retain(|port, task| {
-            let keep = wanted.contains_key(port) && !task.is_finished();
+        // Also restart a relay whose target changed (e.g. the IPv4 listener
+        // closed and an IPv6 one on the same port remains).
+        active.retain(|port, (target, task)| {
+            let keep = wanted.get(port) == Some(target) && !task.is_finished();
             if !keep {
                 task.abort();
             }
@@ -366,8 +371,21 @@ pub(crate) async fn forward(id: String, holder: u32, ip: Ipv4Addr, connector: Ns
             if active.contains_key(&port) {
                 continue;
             }
-            let Ok(listener) = bind_shared(ip, port) else {
-                continue;
+            let listener = match bind_shared(ip, port) {
+                Ok(listener) => listener,
+                Err(err) => {
+                    if reported.insert(port) {
+                        let hint = if err.raw_os_error() == Some(libc::EACCES) {
+                            " (ports below net.ipv4.ip_unprivileged_port_start need privilege on the host: use a higher port, or lower it with sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0)"
+                        } else {
+                            ""
+                        };
+                        eprintln!(
+                            "world: workspace {id}: port {port} cannot be reached from the host at {ip}:{port}: {err}{hint}"
+                        );
+                    }
+                    continue;
+                }
             };
             if announced.insert(port) {
                 eprintln!(
@@ -375,14 +393,12 @@ pub(crate) async fn forward(id: String, holder: u32, ip: Ipv4Addr, connector: Ns
                 );
             }
             let connector = connector.clone();
-            active.insert(
-                port,
-                tokio::spawn(async move {
-                    while let Ok((inbound, _)) = listener.accept().await {
-                        tokio::spawn(relay(inbound, connector.clone(), target));
-                    }
-                }),
-            );
+            let task = tokio::spawn(async move {
+                while let Ok((inbound, _)) = listener.accept().await {
+                    tokio::spawn(relay(inbound, connector.clone(), target));
+                }
+            });
+            active.insert(port, (target, task));
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -392,8 +408,8 @@ pub(crate) async fn forward(id: String, holder: u32, ip: Ipv4Addr, connector: Ns
 pub(crate) struct Forwarding(tokio::task::JoinHandle<()>);
 
 impl Forwarding {
-    pub(crate) fn start(id: String, holder: u32, ip: Ipv4Addr, connector: NsConnector) -> Self {
-        Self(tokio::spawn(forward(id, holder, ip, connector)))
+    pub(crate) fn start(id: String, ip: Ipv4Addr, connector: NsConnector) -> Self {
+        Self(tokio::spawn(forward(id, ip, connector)))
     }
 }
 

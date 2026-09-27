@@ -1545,6 +1545,35 @@ except OSError:
         result = run(PROBE, "get", f"{ips['A']}:{port}")
         self.assertNotEqual(result.returncode, 0)
 
+    def test_forwarding_outlives_a_torn_down_holder(self):
+        # A running workload keeps the old namespace after teardown; its
+        # listeners stay reachable while its exec runs.
+        work = self.root / "Q"
+        work.mkdir()
+        workspace = [WORLD, "workspace", "--state-dir", self.state]
+        self.assertEqual(run(*workspace, "create", "Q", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *workspace, "teardown", "Q")
+        self.assertEqual(run(*workspace, "setup", "Q").returncode, 0)
+        ip = json.loads(run(*workspace, "show", "Q").stdout)["ip"]
+        with serving(self.command("Q", "serve", "127.0.0.1:0", "Q")) as (_, port):
+            time.sleep(1.5)
+            self.assertEqual(run(PROBE, "get", f"{ip}:{port}").stdout, "Q")
+            self.assertEqual(run(*workspace, "teardown", "Q").returncode, 0)
+            time.sleep(2.5)
+            result = run(PROBE, "get", f"{ip}:{port}")
+            self.assertEqual((result.returncode, result.stdout), (0, "Q"), result.stderr)
+
+    def test_unforwardable_privileged_port_is_reported(self):
+        start = int(pathlib.Path("/proc/sys/net/ipv4/ip_unprivileged_port_start").read_text())
+        if start <= 80 or os.geteuid() == 0:
+            self.skipTest("the host lets this user bind port 80")
+        command = self.command("A")[:-1] + [
+            "/bin/sh", "-c", '"$0" serve 127.0.0.1:80 A >/dev/null & sleep 2.5', PROBE]
+        result = run(*command)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("port 80 cannot be reached from the host", result.stderr)
+        self.assertIn("ip_unprivileged_port_start", result.stderr)
+
     def test_workspace_rejects_tmp_workdir(self):
         for workdir in ["/tmp", "/var/tmp"]:
             result = run(WORLD, "workspace", "--state-dir", self.state, "create", "T", "--workdir", workdir)

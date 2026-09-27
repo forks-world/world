@@ -1876,7 +1876,6 @@ async fn linux_exec(
     let forwarding = match crate::forward::NsConnector::start(user_fd, net_fd) {
         Ok(connector) => Some(crate::forward::Forwarding::start(
             world.id.clone(),
-            holder.pid,
             world.ip,
             connector,
         )),
