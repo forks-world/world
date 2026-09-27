@@ -1627,6 +1627,13 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let temp = crate::linux::PrivateTemp::new(&root)?;
+        let egress = crate::linux::Egress::new(&root)?;
+        if egress.is_none() && std::env::var_os("WORLD_PASTA").is_none() {
+            eprintln!(
+                "world: pasta not found (install the passt package); workspace {} has no outbound network",
+                world.id
+            );
+        }
         let _lock = lock(state)?;
         let mut holders = read_map::<crate::linux::Holder>(state, "holders.json")?;
         if let Some(holder) = holders.get(&world.id) {
@@ -1638,27 +1645,48 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
                         "world: restarting workspace {} to give it a private /tmp; processes already running keep the old namespace",
                         world.id
                     );
-                } else if holder.temp_is(&root) {
-                    return Ok(());
-                } else {
+                } else if !holder.temp_is(&root) {
                     // Its temp root was deleted, or the workspace moved to
                     // a new one (see `owned_temp_root`).
                     eprintln!(
                         "world: restarting workspace {} because its temp directory changed; processes already running keep the old namespace",
                         world.id
                     );
+                } else if holder.egress
+                    && std::env::var_os("WORLD_PASTA").is_some_and(|v| v.is_empty())
+                {
+                    // Outbound network explicitly disabled.
+                    eprintln!(
+                        "world: restarting workspace {} without outbound network (WORLD_PASTA is empty); processes already running keep the old namespace",
+                        world.id
+                    );
+                } else if egress.is_some() && (!holder.egress || !holder.pasta_running()?) {
+                    // Started without pasta (not installed then, or before
+                    // workspaces had network), or pasta has died.
+                    eprintln!(
+                        "world: restarting workspace {} to connect its outbound network; processes already running keep the old namespace",
+                        world.id
+                    );
+                } else {
+                    return Ok(());
                 }
                 crate::linux::stop_holder(holder)?;
             } else {
                 crate::linux::reap_stale_holder(holder);
             }
         }
-        let started = crate::linux::start_holder(&temp)?;
+        let started = crate::linux::start_holder(&temp, egress.as_ref())?;
+        if egress.is_some() && !started.holder.egress {
+            eprintln!(
+                "world: pasta could not connect workspace {} (no usable host network?); it has loopback only until setup runs again",
+                world.id
+            );
+        }
         holders.insert(world.id.clone(), started.holder);
         if let Err(err) = persist(state, "holders.json", &holders) {
             // An unrecorded holder could never be torn down or reused.
+            let pid = started.holder.pid;
             if let Err(kill) = started.kill() {
-                let pid = started.holder.pid;
                 return Err(err.context(format!("could not stop unrecorded holder {pid}: {kill}")));
             }
             return Err(err);
@@ -1792,6 +1820,21 @@ async fn linux_exec(
     let mnt = crate::linux::above_stdio(namespaces.mnt.context("workspace mount namespace")?)?;
     let (user_fd, mnt_fd, net_fd) = (user.as_raw_fd(), mnt.as_raw_fd(), net.as_raw_fd());
     let cwd = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    // The workspace's resolv.conf (see `linux::heal_resolv`).
+    let resolv = if holder.egress {
+        let path = root.join("resolv.conf");
+        std::fs::metadata(&path).ok().map(|meta| {
+            use std::os::unix::fs::MetadataExt;
+            let path = std::ffi::CString::new(path.into_os_string().into_encoded_bytes());
+            (path, (meta.dev(), meta.ino()))
+        })
+    } else {
+        None
+    };
+    let resolv = match resolv {
+        Some((path, own)) => Some((path?, own)),
+        None => None,
+    };
     // /tmp is the workspace's own; a TMPDIR elsewhere would be shared.
     let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
         .filter(|(key, _)| key != "WORLD_ID" && key != "TMPDIR")
@@ -1805,6 +1848,9 @@ async fn linux_exec(
             // Joining the mount namespace moved us to its root.
             if libc::chdir(cwd.as_ptr()) < 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            if let Some((path, own)) = &resolv {
+                crate::linux::heal_resolv(path, *own);
             }
             crate::linux::close_extra_descriptors()?;
             crate::linux::enter_pid_namespace()?;
@@ -2037,6 +2083,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn setup_works_from_an_embedding_executable() {
+        let _serial = crate::linux::HOLDER_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let state = tempfile::tempdir().unwrap();
         let (work, home) = (workdir(), workdir());
         let world = create_at(state.path(), "embedded", work.path(), home.path()).unwrap();
@@ -2061,6 +2110,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn teardown_reaps_holder_adopted_by_subreaper() {
+        let _serial = crate::linux::HOLDER_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // SAFETY: prctl with integer arguments on this test process.
         unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
         let state = tempfile::tempdir().unwrap();
@@ -2070,6 +2122,9 @@ mod tests {
         let pid = holder(state.path(), "adopted").unwrap().pid;
         let parent = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
         assert!(parent.contains(&format!("PPid:\t{}\n", std::process::id())));
+        // With pasta, the holder's monitor is adopted too once it dies.
+        let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"));
+        let monitor = children.unwrap_or_default();
         teardown(state.path(), &world).unwrap();
         // SAFETY: as above.
         unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0) };
@@ -2077,6 +2132,12 @@ mod tests {
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "holder left as a zombie"
         );
+        for child in monitor.split_whitespace() {
+            assert!(
+                !std::path::Path::new(&format!("/proc/{child}")).exists(),
+                "pasta monitor {child} left as a zombie"
+            );
+        }
     }
 
     /// A holder killed externally stays a zombie of a subreaper caller;
@@ -2084,6 +2145,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn setup_reaps_externally_killed_holder_of_subreaper() {
+        let _serial = crate::linux::HOLDER_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // SAFETY: prctl with integer arguments on this test process.
         unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
         let state = tempfile::tempdir().unwrap();
@@ -2091,6 +2155,8 @@ mod tests {
         let world = create_at(state.path(), "killed", work.path(), home.path()).unwrap();
         setup(state.path(), &world).unwrap();
         let old = holder(state.path(), "killed").unwrap().pid;
+        let children = std::fs::read_to_string(format!("/proc/{old}/task/{old}/children"));
+        let monitor = children.unwrap_or_default();
         // SAFETY: kill with integer arguments.
         unsafe { libc::kill(old as libc::pid_t, libc::SIGKILL) };
         std::thread::sleep(Duration::from_millis(100));
@@ -2102,6 +2168,12 @@ mod tests {
             !std::path::Path::new(&format!("/proc/{old}")).exists(),
             "killed holder left as a zombie"
         );
+        for child in monitor.split_whitespace() {
+            assert!(
+                !std::path::Path::new(&format!("/proc/{child}")).exists(),
+                "killed holder's pasta monitor {child} left as a zombie"
+            );
+        }
     }
 
     #[test]
@@ -2337,6 +2409,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn setup_restarts_a_holder_whose_temp_root_changed() {
+        let _serial = crate::linux::HOLDER_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (state, work, home) = (tempfile::tempdir().unwrap(), workdir(), workdir());
         let world = create_at(state.path(), "T", work.path(), home.path()).unwrap();
         setup(state.path(), &world).unwrap();

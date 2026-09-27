@@ -1372,6 +1372,144 @@ exit $status
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((root / "tmp/wt-back").read_text(), "back\n")
 
+    PASTA = shutil.which("pasta") is not None
+
+    def in_workspace(self, world, script, *args, **kwargs):
+        return run(*self.command(world)[:-1], sys.executable, "-c", script, *args, **kwargs)
+
+    @unittest.skipUnless(PASTA, "pasta (passt) is not installed")
+    def test_outbound_network_and_dns(self):
+        try:
+            socket.create_connection(("1.1.1.1", 443), timeout=3).close()
+        except OSError:
+            self.skipTest("the host itself has no direct outbound network")
+        script = """
+import socket, struct
+socket.create_connection(("1.1.1.1", 443), timeout=5).close()
+servers = [l.split()[1] for l in open("/etc/resolv.conf") if l.startswith("nameserver")]
+query = struct.pack(">HHHHHH", 7, 0x0100, 1, 0, 0, 0) + b"\\x07example\\x03com\\x00" + struct.pack(">HH", 1, 1)
+dns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+dns.settimeout(5)
+dns.sendto(query, (servers[0], 53))
+answers = struct.unpack(">H", dns.recv(512)[6:8])[0]
+print(servers, answers > 0)
+"""
+        result = self.in_workspace("A", script)
+        self.assertEqual((result.returncode, result.stdout), (0, "['169.254.1.1'] True\n"), result.stderr)
+
+    @unittest.skipUnless(PASTA, "pasta (passt) is not installed")
+    def test_pasta_gets_the_null_device_on_stdio(self):
+        # A WORLD_PASTA wrapper that insists on /dev/null stdio, as a
+        # wrapper reading stdin would otherwise block on the lifecycle pipe.
+        wrapper = self.root / "strict-pasta"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            "for fd in 0 1 2; do\n"
+            '  [ "$(readlink /proc/$$/fd/$fd)" = /dev/null ] || exit 1\n'
+            "done\n"
+            f'exec {shutil.which("pasta")} "$@"\n')
+        wrapper.chmod(0o755)
+        work = self.root / "P"
+        work.mkdir()
+        workspace = [WORLD, "workspace", "--state-dir", self.state]
+        self.assertEqual(run(*workspace, "create", "P", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *workspace, "teardown", "P")
+        result = run(*workspace, "setup", "P", env=dict(os.environ, WORLD_PASTA=str(wrapper)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("loopback only", result.stderr)
+
+    @unittest.skipUnless(PASTA, "pasta (passt) is not installed")
+    def test_host_loopback_is_unreachable_through_the_gateway(self):
+        script = """
+import socket, struct, sys
+for line in open("/proc/net/route").read().splitlines()[1:]:
+    fields = line.split()
+    if fields[1] == "00000000":
+        gateway = socket.inet_ntoa(struct.pack("<I", int(fields[2], 16)))
+try:
+    socket.create_connection((gateway, int(sys.argv[1])), timeout=3).close()
+    print("connected")
+except OSError:
+    print("refused")
+"""
+        with serving([PROBE, "serve", "127.0.0.1:0", "HOST"]) as (_, port):
+            result = self.in_workspace("A", script, str(port))
+        self.assertEqual((result.returncode, result.stdout), (0, "refused\n"), result.stderr)
+
+    @unittest.skipUnless(PASTA, "pasta (passt) is not installed")
+    def test_network_follows_the_holder(self):
+        work = self.root / "N"
+        work.mkdir()
+        workspace = [WORLD, "workspace", "--state-dir", self.state]
+        self.assertEqual(run(*workspace, "create", "N", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *workspace, "teardown", "N")
+        # Without pasta: loopback only; setup with pasta then connects it.
+        result = run(*workspace, "setup", "N", env=dict(os.environ, WORLD_PASTA=""))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        routes = "print(sum(1 for l in open('/proc/net/route').read().splitlines()[1:]))"
+        self.assertEqual(self.in_workspace("N", routes).stdout, "0\n")
+        result = run(*workspace, "setup", "N")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("outbound network", result.stderr)
+        self.assertNotEqual(self.in_workspace("N", routes).stdout, "0\n")
+
+        def family():
+            holder = json.loads((self.state / "holders.json").read_text())["N"]["pid"]
+            monitor = pathlib.Path(f"/proc/{holder}/task/{holder}/children").read_text().split()
+            pasta = pathlib.Path(f"/proc/{monitor[0]}/task/{monitor[0]}/children").read_text().split()
+            return holder, int(monitor[0]), int(pasta[0])
+
+        # A pasta that never connects (like an offline host, here one that
+        # hangs until the holder gives up) leaves the workspace usable with
+        # loopback only; setup connects it later.
+        self.assertEqual(run(*workspace, "teardown", "N").returncode, 0)
+        hanging = self.root / "hanging-pasta"
+        hanging.write_text("#!/bin/sh\nexec sleep 60\n")
+        hanging.chmod(0o755)
+        result = run(*workspace, "setup", "N", env=dict(os.environ, WORLD_PASTA=str(hanging)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("loopback only", result.stderr)
+        self.assertEqual(self.in_workspace("N", routes).stdout, "0\n")
+        # The abandoned monitor is reaped, not left as a zombie.
+        holder = json.loads((self.state / "holders.json").read_text())["N"]["pid"]
+        for _ in range(50):
+            if not pathlib.Path(f"/proc/{holder}/task/{holder}/children").read_text().split():
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("the holder kept a child after dropping pasta")
+        result = run(*workspace, "setup", "N")
+        self.assertIn("outbound network", result.stderr)
+        self.assertNotEqual(self.in_workspace("N", routes).stdout, "0\n")
+
+        # An explicit opt-out takes the network away again, and back.
+        result = run(*workspace, "setup", "N", env=dict(os.environ, WORLD_PASTA=""))
+        self.assertIn("without outbound network", result.stderr)
+        self.assertEqual(self.in_workspace("N", routes).stdout, "0\n")
+        relative = os.path.relpath(shutil.which("pasta"))
+        result = run(*workspace, "setup", "N", env=dict(os.environ, WORLD_PASTA=relative))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(self.in_workspace("N", routes).stdout, "0\n")
+
+        # pasta dying is repaired by setup.
+        holder, monitor, pasta = family()
+        os.kill(pasta, 9)
+        time.sleep(0.8)
+        result = run(*workspace, "setup", "N")
+        self.assertIn("outbound network", result.stderr)
+        self.assertNotEqual(family()[0], holder)
+        # teardown ends the holder, the monitor and pasta.
+        holder, monitor, pasta = family()
+        self.assertEqual(run(*workspace, "teardown", "N").returncode, 0)
+        for pid in (holder, monitor, pasta):
+            for _ in range(50):
+                stat = pathlib.Path(f"/proc/{pid}/stat")
+                if not stat.exists() or stat.read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail(f"{pid} still running after teardown")
+
     def test_workspace_rejects_tmp_workdir(self):
         for workdir in ["/tmp", "/var/tmp"]:
             result = run(WORLD, "workspace", "--state-dir", self.state, "create", "T", "--workdir", workdir)

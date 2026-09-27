@@ -489,6 +489,364 @@ unsafe fn enter_private_temp(temp: &PrivateTemp) -> IoResult<()> {
     Ok(())
 }
 
+/// Where DNS queries are sent inside a workspace: pasta forwards them to
+/// the host's resolver, which may itself be a host loopback address (e.g.
+/// systemd-resolved's 127.0.0.53) the workspace could not reach.
+const DNS_FORWARD: &str = "169.254.1.1";
+
+/// Outbound network for a workspace: pasta (from the passt project) runs
+/// in the host network namespace and connects the holder's network
+/// namespace to the host's network through a tap device, without root.
+/// Host loopback stays unreachable: no gateway mapping (`--no-map-gw`) and
+/// no port forwarding in either direction.
+pub(crate) struct Egress {
+    program: CString,
+    _args: Vec<CString>,
+    /// `/proc/<holder>/ns/{user,net}`, filled in by the holder (its PID is
+    /// only known after the fork) without allocating.
+    paths: Box<[std::cell::Cell<[u8; 48]>; 2]>,
+    argv: Vec<*const libc::c_char>,
+    /// The workspace's resolv.conf, bound over /etc/resolv.conf.
+    resolv: CString,
+}
+
+impl Egress {
+    /// `None` when pasta is not installed (or `WORLD_PASTA` is set empty):
+    /// the workspace then has loopback only.
+    pub(crate) fn new(root: &Path) -> Result<Option<Self>> {
+        let Some(program) = find_pasta()? else {
+            return Ok(None);
+        };
+        Self::with_program(root, program).map(Some)
+    }
+
+    fn with_program(root: &Path, program: std::path::PathBuf) -> Result<Self> {
+        let resolv = root.join("resolv.conf");
+        write_resolv(&resolv)?;
+        let c = |s: &str| CString::new(s).expect("static argument");
+        let args: Vec<CString> = [
+            "pasta",
+            "--foreground",
+            "--quiet",
+            "--config-net",
+            "--no-map-gw",
+            "-t",
+            "none",
+            "-u",
+            "none",
+            "-T",
+            "none",
+            "-U",
+            "none",
+            "--dns-forward",
+            DNS_FORWARD,
+            // The holder's death (PR_SET_PDEATHSIG) ends pasta; watching the
+            // namespace path is not possible for /proc paths.
+            "--no-netns-quit",
+            "--userns",
+            "--netns",
+        ]
+        .into_iter()
+        .map(c)
+        .collect();
+        let paths = Box::new([
+            std::cell::Cell::new([0u8; 48]),
+            std::cell::Cell::new([0u8; 48]),
+        ]);
+        let (fixed, flags) = args.split_at(args.len() - 2);
+        let mut argv: Vec<*const libc::c_char> = fixed.iter().map(|a| a.as_ptr()).collect();
+        argv.extend([
+            flags[0].as_ptr(),
+            paths[0].as_ptr().cast(),
+            flags[1].as_ptr(),
+            paths[1].as_ptr().cast(),
+            std::ptr::null(),
+        ]);
+        Ok(Self {
+            program: CString::new(program.into_os_string().into_encoded_bytes())?,
+            _args: args,
+            paths,
+            argv,
+            resolv: CString::new(resolv.into_os_string().into_encoded_bytes())?,
+        })
+    }
+}
+
+/// pasta from `WORLD_PASTA` (empty disables it), else PATH or the usual
+/// system directories.
+fn find_pasta() -> Result<Option<std::path::PathBuf>> {
+    let executable = |p: &Path| {
+        p.is_file()
+            && CString::new(p.as_os_str().as_bytes())
+                // SAFETY: a NUL-terminated path and an integer mode.
+                .is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0)
+    };
+    if let Some(chosen) = std::env::var_os("WORLD_PASTA") {
+        if chosen.is_empty() {
+            return Ok(None);
+        }
+        let chosen = std::path::PathBuf::from(chosen);
+        ensure!(
+            executable(&chosen),
+            "WORLD_PASTA {} is not an executable",
+            chosen.display()
+        );
+        // The holder execs it from /, not from this directory.
+        return Ok(Some(std::path::absolute(&chosen)?));
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    Ok(std::env::split_paths(&path)
+        .chain(["/usr/bin", "/usr/local/bin", "/bin", "/usr/sbin"].map(Into::into))
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("pasta"))
+        .find(|candidate| executable(candidate)))
+}
+
+/// The workspace's resolv.conf: the host's search domains and options, with
+/// pasta's DNS forwarder as the only nameserver.
+fn resolv_conf(host: &str) -> String {
+    let mut out: String = host
+        .lines()
+        .filter(|line| {
+            let word = line.split_whitespace().next().unwrap_or("");
+            matches!(word, "search" | "domain" | "options")
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    out.push_str(&format!("nameserver {DNS_FORWARD}\n"));
+    out
+}
+
+/// Written in place, never replaced: a running holder has this very inode
+/// bound over /etc/resolv.conf, so updated search domains reach it live.
+fn write_resolv(path: &Path) -> Result<()> {
+    use std::io::{Seek, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    let host = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    let content = resolv_conf(&host);
+    if std::fs::read_to_string(path).is_ok_and(|current| current == content) {
+        return Ok(());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .context("write workspace resolv.conf")?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    file.write_all(content.as_bytes())?;
+    file.set_len(content.len() as u64)?;
+    Ok(())
+}
+
+/// Write `prefix` then `value` in decimal then `suffix` and a NUL into
+/// `out`, without allocating (for use after fork).
+fn format_path(out: &mut [u8; 48], prefix: &[u8], value: u32, suffix: &[u8]) {
+    let mut digits = [0u8; 10];
+    let (mut rest, mut count) = (value, 0);
+    loop {
+        digits[count] = b'0' + (rest % 10) as u8;
+        count += 1;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    *out = [0; 48];
+    out[..prefix.len()].copy_from_slice(prefix);
+    let mut at = prefix.len();
+    for i in (0..count).rev() {
+        out[at] = digits[i];
+        at += 1;
+    }
+    out[at..at + suffix.len()].copy_from_slice(suffix);
+}
+
+/// Holder (after fork, before its namespaces): fork the pasta monitor. It
+/// stays in the host namespaces and waits on `life`, a pipe whose write end
+/// only the holder keeps: one byte starts pasta against the holder's
+/// namespaces; EOF (the holder exited, e.g. killed by teardown) kills pasta
+/// and ends the monitor. pasta clears a parent-death signal when it
+/// sandboxes itself, so it cannot be tied to the holder directly.
+unsafe fn fork_pasta(egress: &Egress, holder: libc::pid_t) -> IoResult<(libc::pid_t, RawFd)> {
+    unsafe {
+        let mut path = [0u8; 48];
+        format_path(&mut path, b"/proc/", holder as u32, b"/ns/user");
+        egress.paths[0].set(path);
+        format_path(&mut path, b"/proc/", holder as u32, b"/ns/net");
+        egress.paths[1].set(path);
+        let mut life = [0; 2];
+        check(libc::pipe2(life.as_mut_ptr(), libc::O_CLOEXEC))?;
+        let monitor = libc::fork();
+        if monitor < 0 {
+            let error = Error::last_os_error();
+            libc::close(life[0]);
+            libc::close(life[1]);
+            return Err(error);
+        }
+        if monitor == 0 {
+            pasta_monitor(egress, life[0], life[1]);
+        }
+        libc::close(life[0]);
+        Ok((monitor, life[1]))
+    }
+}
+
+/// The pasta monitor process (see `fork_pasta`); never returns.
+unsafe fn pasta_monitor(egress: &Egress, life: RawFd, holder_end: RawFd) -> ! {
+    unsafe {
+        libc::prctl(libc::PR_SET_NAME, c"world-pasta".as_ptr());
+        libc::close(holder_end);
+        // Only the null device on 0-2 and the life pipe on 3: nothing of
+        // the holder's (its report pipe, acknowledgment socket) stays open.
+        // The pipe is moved out of the way first: it and the null device
+        // can land on any of 0-3, which the dup2s below overwrite.
+        let life = libc::fcntl(life, libc::F_DUPFD, 10);
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if life < 0
+            || null < 0
+            || libc::dup2(null, 0) < 0
+            || libc::dup2(null, 1) < 0
+            || libc::dup2(null, 2) < 0
+            || libc::dup2(life, 3) < 0
+            || close_from(4).is_err()
+        {
+            libc::_exit(127);
+        }
+        let wait_byte = || {
+            let mut byte = 0u8;
+            loop {
+                match libc::read(3, (&mut byte as *mut u8).cast(), 1) {
+                    n if n < 0 && *libc::__errno_location() == libc::EINTR => {}
+                    n => return n == 1,
+                }
+            }
+        };
+        if !wait_byte() {
+            libc::_exit(0);
+        }
+        let pasta = libc::fork();
+        if pasta == 0 {
+            libc::close(3);
+            let env: [*const libc::c_char; 1] = [std::ptr::null()];
+            libc::execve(egress.program.as_ptr(), egress.argv.as_ptr(), env.as_ptr());
+            libc::_exit(127);
+        }
+        if pasta < 0 {
+            libc::_exit(1);
+        }
+        // Until the holder is gone (EOF), or pasta exits: then so does the
+        // monitor, which the holder notices while starting, and setup later.
+        let mut ready = libc::pollfd {
+            fd: 3,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            if libc::poll(&mut ready, 1, 500) > 0 && !wait_byte() {
+                break;
+            }
+            let mut status = 0;
+            if libc::waitpid(pasta, &mut status, libc::WNOHANG) == pasta {
+                libc::_exit(1);
+            }
+        }
+        libc::kill(pasta, libc::SIGKILL);
+        let mut status = 0;
+        while libc::waitpid(pasta, &mut status, 0) < 0 && *libc::__errno_location() == libc::EINTR {
+        }
+        libc::_exit(0)
+    }
+}
+
+/// Read `path` into `buffer` with raw system calls (for use after fork);
+/// the bytes read.
+unsafe fn read_raw<'a>(path: &CStr, buffer: &'a mut [u8]) -> &'a [u8] {
+    unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return &[];
+        }
+        let mut len = 0;
+        while len < buffer.len() {
+            let n = libc::read(fd, buffer[len..].as_mut_ptr().cast(), buffer.len() - len);
+            if n <= 0 {
+                break;
+            }
+            len += n as usize;
+        }
+        libc::close(fd);
+        &buffer[..len]
+    }
+}
+
+/// Whether a /proc/net/route table has a route on a real interface: pasta
+/// has configured an address (a default route is not required: an offline
+/// host may have none).
+fn configured_v4(table: &[u8]) -> bool {
+    table.split(|&b| b == b'\n').skip(1).any(|line| {
+        let iface = line
+            .split(|&b| b == b'\t' || b == b' ')
+            .find(|f| !f.is_empty());
+        iface.is_some_and(|iface| iface != b"lo")
+    })
+}
+
+/// Whether a /proc/net/ipv6_route table has a route on a real interface
+/// beyond what the kernel adds by itself (link-local, multicast; and the
+/// unreachable default it keeps on lo).
+fn configured_v6(table: &[u8]) -> bool {
+    // dest prefix src prefix next-hop metric refcnt use flags iface
+    table.split(|&b| b == b'\n').any(|line| {
+        let mut parts = line.split(|&b| b == b' ').filter(|f| !f.is_empty());
+        let fields: [&[u8]; 10] = std::array::from_fn(|_| parts.next().unwrap_or(b""));
+        !fields[9].is_empty()
+            && fields[9] != b"lo"
+            && !fields[0].starts_with(b"fe80")
+            && !fields[0].starts_with(b"ff")
+    })
+}
+
+/// Whether pasta has configured the calling process's network namespace.
+/// For use after fork: no allocation.
+unsafe fn network_configured() -> bool {
+    let mut buffer = [0u8; 16384];
+    unsafe {
+        configured_v4(read_raw(c"/proc/self/net/route", &mut buffer))
+            || configured_v6(read_raw(c"/proc/self/net/ipv6_route", &mut buffer))
+    }
+}
+
+/// Holder: let the monitor start pasta, then wait until it has configured
+/// the namespace. Fails if the monitor exits first (pasta could not start,
+/// e.g. no usable host interface) or setup takes longer than 5 seconds.
+/// `life` must stay open for the holder's lifetime.
+unsafe fn start_pasta(child: libc::pid_t, life: RawFd) -> IoResult<()> {
+    unsafe {
+        let byte = 1u8;
+        if libc::write(life, (&byte as *const u8).cast(), 1) != 1 {
+            return Err(Error::from_raw_os_error(libc::ENETDOWN));
+        }
+        let pause = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 20_000_000,
+        };
+        for _ in 0..250 {
+            if network_configured() {
+                return Ok(());
+            }
+            let mut status = 0;
+            if libc::waitpid(child, &mut status, libc::WNOHANG) == child {
+                break;
+            }
+            libc::nanosleep(&pause, std::ptr::null_mut());
+        }
+        Err(Error::from_raw_os_error(libc::ENETDOWN))
+    }
+}
+
 /// `/proc/self/fd/<fd>`: a path naming exactly the file behind `fd`.
 /// Built without allocating, for use after fork.
 struct FdPath([u8; 32]);
@@ -517,6 +875,37 @@ fn fd_path(fd: RawFd) -> FdPath {
         buffer[prefix.len() + i] = digits[count - 1 - i];
     }
     FdPath(buffer)
+}
+
+/// Holder: bind the workspace's resolv.conf over /etc/resolv.conf (and so,
+/// through a symlink, over what it points at) in the workspace mount
+/// namespace.
+unsafe fn bind_resolv(resolv: &CStr) -> IoResult<()> {
+    unsafe {
+        check(libc::mount(
+            resolv.as_ptr(),
+            c"/etc/resolv.conf".as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        ))?;
+    }
+    Ok(())
+}
+
+/// pre_exec (joined the workspace namespaces, still privileged there): the
+/// host may replace its resolv.conf (systemd-resolved renames a new one
+/// into place on network changes), which detaches the holder's bind; put
+/// the workspace's back. `own` is its (dev, ino). Best effort.
+pub(crate) unsafe fn heal_resolv(resolv: &CStr, own: (u64, u64)) {
+    unsafe {
+        let mut stat = std::mem::zeroed::<libc::stat>();
+        if libc::stat(c"/etc/resolv.conf".as_ptr(), &mut stat) == 0
+            && (stat.st_dev, stat.st_ino) != own
+        {
+            let _ = bind_resolv(resolv);
+        }
+    }
 }
 
 /// pre_exec: the workload gets no capabilities, even when the caller is
@@ -1666,6 +2055,13 @@ pub struct Holder {
     /// `None` for a holder started before workspaces had a private /tmp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mnt_ns: Option<u64>,
+    /// Started with pasta for outbound network.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub egress: bool,
+    /// The pasta monitor's PID and start time: when the holder dies, a
+    /// subreaper caller adopts the monitor and must reap it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    monitor: Option<(u32, u64)>,
 }
 
 /// Descriptors of a holder's namespaces; they keep the namespaces alive.
@@ -1674,6 +2070,37 @@ pub(crate) struct Namespaces {
     pub net: OwnedFd,
     /// `None` only for a holder that predates the private /tmp.
     pub mnt: Option<OwnedFd>,
+}
+
+/// The start time of `pid` if it is running: `None` once it has exited,
+/// even while it is still an unreaped zombie.
+/// Failing to read /proc (e.g. descriptor pressure) is an error, never
+/// mistaken for an exited process.
+fn live_start_time(pid: u32) -> Result<Option<u64>> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e).context("inspect the pasta monitor"),
+    };
+    // Fields after the parenthesized command name: state, then (field 22)
+    // the start time.
+    let rest = stat
+        .rsplit_once(')')
+        .map(|(_, rest)| rest.trim_start())
+        .context("parse process stat")?;
+    if rest.starts_with('Z') {
+        return Ok(None);
+    }
+    rest.split_whitespace()
+        .nth(19)
+        .and_then(|v| v.parse().ok())
+        .map(Some)
+        .context("parse process start time")
 }
 
 fn start_time(pid: u32) -> Result<u64> {
@@ -1696,7 +2123,36 @@ impl Holder {
             user_ns: inode("user")?,
             net_ns: inode("net")?,
             mnt_ns: Some(inode("mnt")?),
+            egress: false,
+            monitor: None,
         })
+    }
+
+    /// Reap the pasta monitor after the holder died, if this process adopted
+    /// it (a child subreaper); like `reap_if_child`, only through a pidfd
+    /// pinned to the recorded identity. Waits for it to exit, which it does
+    /// as soon as the holder is gone.
+    pub(crate) fn reap_monitor(&self) {
+        let Some((pid, started)) = self.monitor else {
+            return;
+        };
+        let Ok(pidfd) = open_pidfd(pid as libc::pid_t) else {
+            return;
+        };
+        if start_time(pid).ok() != Some(started) {
+            return;
+        }
+        reap_if_child(Some(&pidfd));
+    }
+
+    /// Whether pasta is still running: its monitor, recorded at setup,
+    /// exits when pasta does (and the holder reaps it at once), so the
+    /// monitor being alive with its recorded start time is the signal.
+    pub(crate) fn pasta_running(&self) -> Result<bool> {
+        let Some((pid, started)) = self.monitor else {
+            return Ok(false);
+        };
+        Ok(live_start_time(pid)? == Some(started))
     }
 
     /// Whether this holder predates the private /tmp: joining it would run
@@ -1770,12 +2226,34 @@ impl Holder {
     }
 }
 
+/// Holder: close the monitor's life pipe, which makes it kill pasta and
+/// exit, and reap it. It may already be reaped (it exited while pasta was
+/// starting).
+unsafe fn finish_monitor(monitor: libc::pid_t, life: RawFd) {
+    unsafe {
+        libc::close(life);
+        while libc::waitpid(monitor, std::ptr::null_mut(), 0) < 0
+            && *libc::__errno_location() == libc::EINTR
+        {}
+    }
+}
+
+/// Serializes tests that start holders: some make this process a child
+/// subreaper (a process-wide flag), which would let them adopt, or lose to
+/// init, the holders and pasta monitors of tests running alongside.
+#[cfg(test)]
+pub(crate) static HOLDER_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Holder status: started, but pasta could not connect the workspace.
+const NO_EGRESS: libc::pid_t = 1;
+
 /// Forked child of start_holder; never returns. The double fork reparents
 /// the holder to init (or a subreaper), which reaps it after teardown, so a
 /// long-lived caller of setup never accumulates zombies.
 unsafe fn holder_process(
     maps: &IdMaps,
     temp: &PrivateTemp,
+    egress: Option<&Egress>,
     report: RawFd,
     ack: RawFd,
     report_read: RawFd,
@@ -1816,39 +2294,104 @@ unsafe fn holder_process(
         if !send(libc::getpid()) {
             libc::_exit(125);
         }
-        // One byte from the caller, or exit on EOF: the caller went away.
+        // One byte from the caller; false on EOF: the caller went away (or
+        // gave up on the holder).
         let expect = || {
             let mut byte = 0u8;
             loop {
                 match libc::read(1, (&mut byte as *mut u8).cast(), 1) {
-                    1 => return,
+                    1 => return true,
                     n if n < 0 && *libc::__errno_location() == libc::EINTR => {}
-                    _ => libc::_exit(125),
+                    _ => return false,
                 }
             }
         };
         // Pinned: never run unpinned.
-        expect();
-        let enter = || enter_new_namespaces(maps).and_then(|()| enter_private_temp(temp));
-        if let Err(error) = cleanup.and_then(|()| enter()) {
-            send(-error.raw_os_error().unwrap_or(libc::EIO));
+        if !expect() {
             libc::_exit(125);
         }
+        let fail = |error: Error| -> ! {
+            send(-error.raw_os_error().unwrap_or(libc::EIO));
+            libc::_exit(125)
+        };
+        if let Err(error) = cleanup {
+            fail(error);
+        }
+        // pasta must run in the host namespaces: fork it before leaving
+        // them. It waits until they are set up; if we exit first, it
+        // sees EOF and exits too.
+        let pasta = match egress {
+            Some(egress) => match fork_pasta(egress, libc::getpid()) {
+                Ok(pasta) => Some(pasta),
+                Err(error) => fail(error),
+            },
+            None => None,
+        };
+        // Before reporting a failure or the loopback fallback, end the
+        // monitor and reap it here: a subreaper caller would otherwise
+        // adopt it, with no record to reap it by.
+        let fail_started = |error: Error| -> ! {
+            if let Some((monitor, life)) = pasta {
+                finish_monitor(monitor, life);
+            }
+            fail(error)
+        };
+        let enter = || enter_new_namespaces(maps).and_then(|()| enter_private_temp(temp));
+        if let Err(error) = enter() {
+            fail_started(error);
+        }
+        // Without a working pasta (an offline host, a broken binary) the
+        // workspace still works with loopback only, as before it had
+        // network.
+        let mut connected = None;
+        if let (Some(egress), Some((monitor, life))) = (egress, pasta) {
+            if start_pasta(monitor, life).is_ok() {
+                // A host without /etc/resolv.conf has nothing to replace.
+                if let Err(error) = bind_resolv(&egress.resolv)
+                    && error.raw_os_error() != Some(libc::ENOENT)
+                {
+                    fail_started(error);
+                }
+                connected = Some(life);
+            } else {
+                finish_monitor(monitor, life);
+            }
+        }
         libc::prctl(libc::PR_SET_NAME, c"world-holder".as_ptr());
-        if !send(0) {
+        let status = if pasta.is_some() && connected.is_none() {
+            NO_EGRESS
+        } else {
+            0
+        };
+        if !send(status) {
+            libc::_exit(125);
+        }
+        // With pasta running, its monitor's PID follows: the caller records
+        // it to tell whether pasta is alive and to reap an adopted monitor.
+        if let (Some((monitor, _)), Some(_)) = (pasta, connected)
+            && !send(monitor)
+        {
             libc::_exit(125);
         }
         // Recorded: a holder whose setup died before persisting its record
-        // could never be found or torn down, so it exits instead.
-        expect();
+        // could never be found or torn down, so it exits instead, and so
+        // does one the caller gives up on (see `StartedHolder::kill`). Its
+        // monitor is ended and reaped here first, as no one else could: a
+        // subreaper caller would adopt it with no record to reap it by.
+        if !expect() {
+            if let (Some((monitor, _)), Some(life)) = (pasta, connected) {
+                finish_monitor(monitor, life);
+            }
+            libc::_exit(125);
+        }
         libc::close(1);
-        hold()
+        hold(connected)
     }
 }
 
 /// Start a detached process that keeps new namespaces alive, with `temp`
 /// as its /tmp and /var/tmp.
-pub(crate) fn start_holder(temp: &PrivateTemp) -> Result<StartedHolder> {
+pub(crate) fn start_holder(temp: &PrivateTemp, egress: Option<&Egress>) -> Result<StartedHolder> {
     let maps = IdMaps::current();
     let mut fds = [0; 2];
     // SAFETY: pipe2 writes two new descriptors into fds on success.
@@ -1893,7 +2436,7 @@ pub(crate) fn start_holder(temp: &PrivateTemp) -> Result<StartedHolder> {
     // prepared above and never returns.
     let intermediate = unsafe { libc::fork() };
     if intermediate == 0 {
-        unsafe { holder_process(&maps, temp, report, ack, report_read, ack_write_fd) }
+        unsafe { holder_process(&maps, temp, egress, report, ack, report_read, ack_write_fd) }
     }
     // SAFETY: restores this thread's own previous mask.
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) };
@@ -1933,18 +2476,35 @@ pub(crate) fn start_holder(temp: &PrivateTemp) -> Result<StartedHolder> {
         return Err(error).context("start World namespace holder");
     }
     let status = next().inspect_err(|_| reap_if_child(pidfd.as_ref()))?;
-    if status != 0 {
+    if status != 0 && status != NO_EGRESS {
         // A subreaper caller adopted the failed holder: reap it.
         reap_if_child(pidfd.as_ref());
         return Err(Error::from_raw_os_error(-status)).context("start World namespace holder");
     }
+    let monitor = if egress.is_some() && status == 0 {
+        Some(next().inspect_err(|_| reap_if_child(pidfd.as_ref()))? as u32)
+    } else {
+        None
+    };
     let started = |holder| StartedHolder {
         holder,
         pid,
         pidfd,
         commit: Some(ack_write),
     };
-    match Holder::observe(pid as u32) {
+    let observed = Holder::observe(pid as u32).and_then(|mut holder| {
+        // A monitor that already exited (pasta died right after connecting)
+        // means no network: setup warns, and the next setup restarts the
+        // workspace. Failing to tell abandons the holder (below) rather
+        // than recording a live monitor as gone.
+        holder.monitor = match monitor {
+            Some(m) => live_start_time(m)?.map(|t| (m, t)),
+            None => None,
+        };
+        holder.egress = holder.monitor.is_some();
+        Ok(holder)
+    });
+    match observed {
         Ok(holder) => Ok(started(holder)),
         Err(err) => {
             let unrecorded = started(Holder {
@@ -1953,6 +2513,9 @@ pub(crate) fn start_holder(temp: &PrivateTemp) -> Result<StartedHolder> {
                 user_ns: 0,
                 net_ns: 0,
                 mnt_ns: None,
+                egress: false,
+                // Uncommitted: the holder ends its own monitor on kill.
+                monitor: None,
             });
             match unrecorded.kill() {
                 Ok(()) => Err(err),
@@ -1991,6 +2554,10 @@ fn reap_if_child(pidfd: Option<&OwnedFd>) {
 /// the identity before waitid(P_PIDFD) reaps it without blocking. A
 /// reused PID fails the start-time check and nothing is reaped.
 pub(crate) fn reap_stale_holder(holder: &Holder) {
+    // Its monitor exits as soon as it died (it may still be ending pasta):
+    // if we adopted it, wait for it, or its identity is lost with this
+    // record. Not our child: ECHILD at once.
+    holder.reap_monitor();
     let Ok(pidfd) = open_pidfd(holder.pid as libc::pid_t) else {
         return;
     };
@@ -2048,11 +2615,18 @@ impl StartedHolder {
         }
     }
 
-    /// Stop the holder if it cannot be recorded. Signalling the pinned
-    /// pidfd opens nothing and reads nothing from /proc, so descriptor
-    /// pressure cannot make this fail; without pidfd (before Linux 5.3)
-    /// the PID is still ours, as the holder only exits when signalled.
-    pub(crate) fn kill(&self) -> IoResult<()> {
+    /// Stop the holder if it cannot be recorded. Before commit it waits on
+    /// the commit channel: closing that makes it end and reap its pasta
+    /// monitor, then exit, and a subreaper caller reaps the holder through
+    /// the pinned pidfd. This opens nothing and reads nothing from /proc,
+    /// so descriptor pressure cannot make it fail. (After commit, it is
+    /// killed like `stop_holder` does.)
+    pub(crate) fn kill(mut self) -> IoResult<()> {
+        if let Some(commit) = self.commit.take() {
+            drop(commit);
+            reap_if_child(self.pidfd.as_ref());
+            return Ok(());
+        }
         // SAFETY: plain-integer signalling; the pidfd is open when present.
         let result = unsafe {
             match &self.pidfd {
@@ -2067,6 +2641,7 @@ impl StartedHolder {
         };
         check(result)?;
         reap_if_child(self.pidfd.as_ref());
+        self.holder.reap_monitor();
         Ok(())
     }
 }
@@ -2086,6 +2661,7 @@ pub(crate) fn stop_holder(holder: &Holder) -> Result<()> {
             // SAFETY: kill takes plain integers.
             check(unsafe { libc::kill(holder.pid as libc::pid_t, libc::SIGKILL) })?;
             reap_if_child(None);
+            holder.reap_monitor();
             return Ok(());
         }
     };
@@ -2104,6 +2680,7 @@ pub(crate) fn stop_holder(holder: &Holder) -> Result<()> {
         return Err(Error::last_os_error()).context("stop holder");
     }
     reap_if_child(Some(&pidfd));
+    holder.reap_monitor();
     Ok(())
 }
 
@@ -2126,11 +2703,27 @@ unsafe fn reset_signals() {
     }
 }
 
-unsafe fn hold() -> ! {
+/// Keep the namespaces alive until killed. `keep` is the pasta monitor's
+/// life pipe: open until the holder exits.
+unsafe fn hold(keep: Option<RawFd>) -> ! {
     unsafe {
-        if close_from(0).is_err() {
+        let closed = match keep {
+            Some(keep) => {
+                (0..keep).for_each(|fd| {
+                    libc::close(fd);
+                });
+                close_from(keep + 1)
+            }
+            None => close_from(0),
+        };
+        if closed.is_err() {
             libc::_exit(125);
         }
+        // The pasta monitor is the only child. It exits when pasta cannot
+        // start or dies (setup then restarts the workspace): reap it now
+        // if it already has, and let the kernel reap it when it does.
+        libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+        while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {}
         loop {
             libc::pause();
         }
@@ -2143,11 +2736,14 @@ mod tests {
     /// process died) must exit rather than run unrecorded.
     #[test]
     fn uncommitted_holder_exits() {
+        let _serial = super::HOLDER_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("var/tmp")).unwrap();
         std::fs::create_dir(root.path().join("tmp")).unwrap();
         let temp = super::PrivateTemp::new(root.path()).unwrap();
-        let started = super::start_holder(&temp).unwrap();
+        let started = super::start_holder(&temp, None).unwrap();
         let pid = started.holder.pid;
         assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
         drop(started);
@@ -2351,9 +2947,172 @@ mod tests {
     }
 
     #[test]
+    fn resolv_conf_keeps_search_and_options_but_only_the_forwarder() {
+        let host = "# comment\nnameserver 127.0.0.53\nnameserver 10.0.0.1\noptions edns0 trust-ad\nsearch example.com\n";
+        assert_eq!(
+            super::resolv_conf(host),
+            "options edns0 trust-ad\nsearch example.com\nnameserver 169.254.1.1\n"
+        );
+        assert_eq!(super::resolv_conf(""), "nameserver 169.254.1.1\n");
+    }
+
+    /// The file is updated in place: a running holder's bind keeps seeing it.
+    #[test]
+    fn write_resolv_keeps_the_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "stale content that is longer than the new one\n").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        super::write_resolv(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.ends_with("nameserver 169.254.1.1\n"), "{written}");
+        assert!(!written.contains("stale"));
+    }
+
+    /// A zombie still has a start time in /proc, but is not running.
+    #[test]
+    fn live_start_time_rejects_zombies() {
+        // SAFETY: the child exits at once without returning into the
+        // harness; the parent reaps it below.
+        let pid = unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                libc::_exit(0);
+            }
+            pid
+        };
+        let mut zombie = false;
+        for _ in 0..100 {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            if stat
+                .rsplit_once(')')
+                .unwrap()
+                .1
+                .trim_start()
+                .starts_with('Z')
+            {
+                zombie = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(zombie);
+        assert!(super::start_time(pid as u32).is_ok());
+        assert_eq!(super::live_start_time(pid as u32).unwrap(), None);
+        // SAFETY: reaps our own child.
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        // Gone entirely: also not live, and not an error.
+        assert_eq!(super::live_start_time(pid as u32).unwrap(), None);
+        let own = super::live_start_time(std::process::id()).unwrap();
+        assert_eq!(own, Some(super::start_time(std::process::id()).unwrap()));
+    }
+
+    #[test]
+    fn format_path_writes_a_nul_terminated_proc_path() {
+        let mut out = [0xffu8; 48];
+        super::format_path(&mut out, b"/proc/", 4194304, b"/ns/net");
+        let text = std::ffi::CStr::from_bytes_until_nul(&out).unwrap();
+        assert_eq!(text, c"/proc/4194304/ns/net");
+    }
+
+    #[test]
+    fn configured_routes_need_a_real_interface_not_a_default() {
+        let header = "Iface\tDestination\tGateway\tFlags\n";
+        assert!(!super::configured_v4(header.as_bytes()));
+        let lo = format!("{header}lo\t0000007F\t00000000\t0001\n");
+        assert!(!super::configured_v4(lo.as_bytes()));
+        // A subnet route without a default, as on an offline host.
+        let subnet = format!("{header}eno2\t0001000A\t00000000\t0001\n");
+        assert!(super::configured_v4(subnet.as_bytes()));
+        let line = |dest: &str, iface: &str| {
+            format!(
+                "{dest} 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001 {iface}\n"
+            )
+        };
+        let unreachable = line("00000000000000000000000000000000", "lo");
+        let kernel = line("fe800000000000000000000000000000", "eno2")
+            + &line("ff000000000000000000000000000000", "eno2");
+        assert!(!super::configured_v6((unreachable + &kernel).as_bytes()));
+        let prefix = line("fd3c6936458645b50000000000000000", "eno2");
+        assert!(super::configured_v6(prefix.as_bytes()));
+    }
+
+    #[test]
     fn fd_path_names_the_descriptor() {
         assert_eq!(super::fd_path(0).as_c_str(), c"/proc/self/fd/0");
         assert_eq!(super::fd_path(1234).as_c_str(), c"/proc/self/fd/1234");
+    }
+
+    /// A pasta that never connects makes the holder fall back to loopback;
+    /// it reaps the monitor itself first, so a subreaper caller that stops
+    /// the holder right away is not left with a zombie monitor.
+    #[test]
+    fn loopback_fallback_leaves_no_monitor_behind() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("var/tmp")).unwrap();
+        std::fs::create_dir(root.path().join("tmp")).unwrap();
+        let hanging = root.path().join("hanging-pasta");
+        std::fs::write(&hanging, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(
+            &hanging,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let temp = super::PrivateTemp::new(root.path()).unwrap();
+        let egress = super::Egress::with_program(root.path(), hanging).unwrap();
+        let _serial = super::HOLDER_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: prctl with integer arguments on this test process.
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+        let started = super::start_holder(&temp, Some(&egress)).unwrap();
+        assert!(!started.holder.egress);
+        started.kill().unwrap();
+        // SAFETY: as above.
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0) };
+        assert_eq!(adopted_monitors(), Vec::<std::path::PathBuf>::new());
+    }
+
+    /// pasta monitors this test process has adopted (as a subreaper).
+    fn adopted_monitors() -> Vec<std::path::PathBuf> {
+        let ours = format!("PPid:\t{}\n", std::process::id());
+        let monitors = std::fs::read_dir("/proc").unwrap().filter_map(|entry| {
+            let dir = entry.ok()?.path();
+            let comm = std::fs::read_to_string(dir.join("comm")).ok()?;
+            let status = std::fs::read_to_string(dir.join("status")).ok()?;
+            (comm.trim() == "world-pasta" && status.contains(&ours)).then_some(dir)
+        });
+        monitors.collect()
+    }
+
+    /// A connected holder that is given up before commit (its record could
+    /// not be persisted) ends its monitor itself: a subreaper caller is left
+    /// with neither the holder nor the monitor.
+    #[test]
+    fn uncommitted_connected_holder_takes_its_monitor_along() {
+        let Ok(Some(pasta)) = super::find_pasta() else {
+            return; // pasta is not installed
+        };
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("var/tmp")).unwrap();
+        std::fs::create_dir(root.path().join("tmp")).unwrap();
+        let temp = super::PrivateTemp::new(root.path()).unwrap();
+        let egress = super::Egress::with_program(root.path(), pasta).unwrap();
+        let _serial = super::HOLDER_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: prctl with integer arguments on this test process.
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+        let started = super::start_holder(&temp, Some(&egress)).unwrap();
+        assert!(started.holder.egress);
+        let holder = started.holder.pid;
+        started.kill().unwrap();
+        // SAFETY: as above.
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0) };
+        assert!(!std::path::Path::new(&format!("/proc/{holder}")).exists());
+        assert_eq!(adopted_monitors(), Vec::<std::path::PathBuf>::new());
     }
 
     #[test]
