@@ -2116,6 +2116,9 @@ mod tests {
         let pid = holder(state.path(), "adopted").unwrap().pid;
         let parent = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
         assert!(parent.contains(&format!("PPid:\t{}\n", std::process::id())));
+        // With pasta, the holder's monitor is adopted too once it dies.
+        let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"));
+        let monitor = children.unwrap_or_default();
         teardown(state.path(), &world).unwrap();
         // SAFETY: as above.
         unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0) };
@@ -2123,6 +2126,12 @@ mod tests {
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "holder left as a zombie"
         );
+        for child in monitor.split_whitespace() {
+            assert!(
+                !std::path::Path::new(&format!("/proc/{child}")).exists(),
+                "pasta monitor {child} left as a zombie"
+            );
+        }
     }
 
     /// A holder killed externally stays a zombie of a subreaper caller;
@@ -2137,6 +2146,8 @@ mod tests {
         let world = create_at(state.path(), "killed", work.path(), home.path()).unwrap();
         setup(state.path(), &world).unwrap();
         let old = holder(state.path(), "killed").unwrap().pid;
+        let children = std::fs::read_to_string(format!("/proc/{old}/task/{old}/children"));
+        let monitor = children.unwrap_or_default();
         // SAFETY: kill with integer arguments.
         unsafe { libc::kill(old as libc::pid_t, libc::SIGKILL) };
         std::thread::sleep(Duration::from_millis(100));
@@ -2148,6 +2159,12 @@ mod tests {
             !std::path::Path::new(&format!("/proc/{old}")).exists(),
             "killed holder left as a zombie"
         );
+        for child in monitor.split_whitespace() {
+            assert!(
+                !std::path::Path::new(&format!("/proc/{child}")).exists(),
+                "killed holder's pasta monitor {child} left as a zombie"
+            );
+        }
     }
 
     #[test]
