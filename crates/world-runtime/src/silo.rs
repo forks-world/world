@@ -1627,6 +1627,13 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let temp = crate::linux::PrivateTemp::new(&root)?;
+        let egress = crate::linux::Egress::new(&root)?;
+        if egress.is_none() && std::env::var_os("WORLD_PASTA").is_none() {
+            eprintln!(
+                "world: pasta not found (install the passt package); workspace {} has no outbound network",
+                world.id
+            );
+        }
         let _lock = lock(state)?;
         let mut holders = read_map::<crate::linux::Holder>(state, "holders.json")?;
         if let Some(holder) = holders.get(&world.id) {
@@ -1638,22 +1645,29 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
                         "world: restarting workspace {} to give it a private /tmp; processes already running keep the old namespace",
                         world.id
                     );
-                } else if holder.temp_is(&root) {
-                    return Ok(());
-                } else {
+                } else if !holder.temp_is(&root) {
                     // Its temp root was deleted, or the workspace moved to
                     // a new one (see `owned_temp_root`).
                     eprintln!(
                         "world: restarting workspace {} because its temp directory changed; processes already running keep the old namespace",
                         world.id
                     );
+                } else if egress.is_some() && (!holder.egress || !holder.pasta_running()) {
+                    // Started without pasta (not installed then, or before
+                    // workspaces had network), or pasta has died.
+                    eprintln!(
+                        "world: restarting workspace {} to connect its outbound network; processes already running keep the old namespace",
+                        world.id
+                    );
+                } else {
+                    return Ok(());
                 }
                 crate::linux::stop_holder(holder)?;
             } else {
                 crate::linux::reap_stale_holder(holder);
             }
         }
-        let started = crate::linux::start_holder(&temp)?;
+        let started = crate::linux::start_holder(&temp, egress.as_ref())?;
         holders.insert(world.id.clone(), started.holder);
         if let Err(err) = persist(state, "holders.json", &holders) {
             // An unrecorded holder could never be torn down or reused.
@@ -1792,6 +1806,21 @@ async fn linux_exec(
     let mnt = crate::linux::above_stdio(namespaces.mnt.context("workspace mount namespace")?)?;
     let (user_fd, mnt_fd, net_fd) = (user.as_raw_fd(), mnt.as_raw_fd(), net.as_raw_fd());
     let cwd = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    // The workspace's resolv.conf (see `linux::heal_resolv`).
+    let resolv = if holder.egress {
+        let path = root.join("resolv.conf");
+        std::fs::metadata(&path).ok().map(|meta| {
+            use std::os::unix::fs::MetadataExt;
+            let path = std::ffi::CString::new(path.into_os_string().into_encoded_bytes());
+            (path, (meta.dev(), meta.ino()))
+        })
+    } else {
+        None
+    };
+    let resolv = match resolv {
+        Some((path, own)) => Some((path?, own)),
+        None => None,
+    };
     // /tmp is the workspace's own; a TMPDIR elsewhere would be shared.
     let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
         .filter(|(key, _)| key != "WORLD_ID" && key != "TMPDIR")
@@ -1805,6 +1834,9 @@ async fn linux_exec(
             // Joining the mount namespace moved us to its root.
             if libc::chdir(cwd.as_ptr()) < 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            if let Some((path, own)) = &resolv {
+                crate::linux::heal_resolv(path, *own);
             }
             crate::linux::close_extra_descriptors()?;
             crate::linux::enter_pid_namespace()?;

@@ -489,6 +489,342 @@ unsafe fn enter_private_temp(temp: &PrivateTemp) -> IoResult<()> {
     Ok(())
 }
 
+/// Where DNS queries are sent inside a workspace: pasta forwards them to
+/// the host's resolver, which may itself be a host loopback address (e.g.
+/// systemd-resolved's 127.0.0.53) the workspace could not reach.
+const DNS_FORWARD: &str = "169.254.1.1";
+
+/// Outbound network for a workspace: pasta (from the passt project) runs
+/// in the host network namespace and connects the holder's network
+/// namespace to the host's network through a tap device, without root.
+/// Host loopback stays unreachable: no gateway mapping (`--no-map-gw`) and
+/// no port forwarding in either direction.
+pub(crate) struct Egress {
+    program: CString,
+    _args: Vec<CString>,
+    /// `/proc/<holder>/ns/{user,net}`, filled in by the holder (its PID is
+    /// only known after the fork) without allocating.
+    paths: Box<[std::cell::Cell<[u8; 48]>; 2]>,
+    argv: Vec<*const libc::c_char>,
+    /// The workspace's resolv.conf, bound over /etc/resolv.conf.
+    resolv: CString,
+}
+
+impl Egress {
+    /// `None` when pasta is not installed (or `WORLD_PASTA` is set empty):
+    /// the workspace then has loopback only.
+    pub(crate) fn new(root: &Path) -> Result<Option<Self>> {
+        let Some(program) = find_pasta()? else {
+            return Ok(None);
+        };
+        let resolv = root.join("resolv.conf");
+        write_resolv(&resolv)?;
+        let c = |s: &str| CString::new(s).expect("static argument");
+        let args: Vec<CString> = [
+            "pasta",
+            "--foreground",
+            "--quiet",
+            "--config-net",
+            "--no-map-gw",
+            "-t",
+            "none",
+            "-u",
+            "none",
+            "-T",
+            "none",
+            "-U",
+            "none",
+            "--dns-forward",
+            DNS_FORWARD,
+            // The holder's death (PR_SET_PDEATHSIG) ends pasta; watching the
+            // namespace path is not possible for /proc paths.
+            "--no-netns-quit",
+            "--userns",
+            "--netns",
+        ]
+        .into_iter()
+        .map(c)
+        .collect();
+        let paths = Box::new([
+            std::cell::Cell::new([0u8; 48]),
+            std::cell::Cell::new([0u8; 48]),
+        ]);
+        let (fixed, flags) = args.split_at(args.len() - 2);
+        let mut argv: Vec<*const libc::c_char> = fixed.iter().map(|a| a.as_ptr()).collect();
+        argv.extend([
+            flags[0].as_ptr(),
+            paths[0].as_ptr().cast(),
+            flags[1].as_ptr(),
+            paths[1].as_ptr().cast(),
+            std::ptr::null(),
+        ]);
+        Ok(Some(Self {
+            program: CString::new(program.into_os_string().into_encoded_bytes())?,
+            _args: args,
+            paths,
+            argv,
+            resolv: CString::new(resolv.into_os_string().into_encoded_bytes())?,
+        }))
+    }
+}
+
+/// pasta from `WORLD_PASTA` (empty disables it), else PATH or the usual
+/// system directories.
+fn find_pasta() -> Result<Option<std::path::PathBuf>> {
+    let executable = |p: &Path| {
+        p.is_file()
+            && CString::new(p.as_os_str().as_bytes())
+                // SAFETY: a NUL-terminated path and an integer mode.
+                .is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0)
+    };
+    if let Some(chosen) = std::env::var_os("WORLD_PASTA") {
+        if chosen.is_empty() {
+            return Ok(None);
+        }
+        let chosen = std::path::PathBuf::from(chosen);
+        ensure!(
+            executable(&chosen),
+            "WORLD_PASTA {} is not an executable",
+            chosen.display()
+        );
+        return Ok(Some(chosen));
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    Ok(std::env::split_paths(&path)
+        .chain(["/usr/bin", "/usr/local/bin", "/bin", "/usr/sbin"].map(Into::into))
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("pasta"))
+        .find(|candidate| executable(candidate)))
+}
+
+/// The workspace's resolv.conf: the host's search domains and options, with
+/// pasta's DNS forwarder as the only nameserver.
+fn resolv_conf(host: &str) -> String {
+    let mut out: String = host
+        .lines()
+        .filter(|line| {
+            let word = line.split_whitespace().next().unwrap_or("");
+            matches!(word, "search" | "domain" | "options")
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    out.push_str(&format!("nameserver {DNS_FORWARD}\n"));
+    out
+}
+
+fn write_resolv(path: &Path) -> Result<()> {
+    let host = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    let dir = path.parent().context("resolv.conf path")?;
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    std::io::Write::write_all(&mut temp, resolv_conf(&host).as_bytes())?;
+    std::fs::set_permissions(
+        temp.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )?;
+    temp.persist(path).context("write workspace resolv.conf")?;
+    Ok(())
+}
+
+/// Write `prefix` then `value` in decimal then `suffix` and a NUL into
+/// `out`, without allocating (for use after fork).
+fn format_path(out: &mut [u8; 48], prefix: &[u8], value: u32, suffix: &[u8]) {
+    let mut digits = [0u8; 10];
+    let (mut rest, mut count) = (value, 0);
+    loop {
+        digits[count] = b'0' + (rest % 10) as u8;
+        count += 1;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    *out = [0; 48];
+    out[..prefix.len()].copy_from_slice(prefix);
+    let mut at = prefix.len();
+    for i in (0..count).rev() {
+        out[at] = digits[i];
+        at += 1;
+    }
+    out[at..at + suffix.len()].copy_from_slice(suffix);
+}
+
+/// Holder (after fork, before its namespaces): fork the pasta monitor. It
+/// stays in the host namespaces and waits on `life`, a pipe whose write end
+/// only the holder keeps: one byte starts pasta against the holder's
+/// namespaces; EOF (the holder exited, e.g. killed by teardown) kills pasta
+/// and ends the monitor. pasta clears a parent-death signal when it
+/// sandboxes itself, so it cannot be tied to the holder directly.
+unsafe fn fork_pasta(egress: &Egress, holder: libc::pid_t) -> IoResult<(libc::pid_t, RawFd)> {
+    unsafe {
+        let mut path = [0u8; 48];
+        format_path(&mut path, b"/proc/", holder as u32, b"/ns/user");
+        egress.paths[0].set(path);
+        format_path(&mut path, b"/proc/", holder as u32, b"/ns/net");
+        egress.paths[1].set(path);
+        let mut life = [0; 2];
+        check(libc::pipe2(life.as_mut_ptr(), libc::O_CLOEXEC))?;
+        let monitor = libc::fork();
+        if monitor < 0 {
+            let error = Error::last_os_error();
+            libc::close(life[0]);
+            libc::close(life[1]);
+            return Err(error);
+        }
+        if monitor == 0 {
+            pasta_monitor(egress, life[0], life[1]);
+        }
+        libc::close(life[0]);
+        Ok((monitor, life[1]))
+    }
+}
+
+/// The pasta monitor process (see `fork_pasta`); never returns.
+unsafe fn pasta_monitor(egress: &Egress, life: RawFd, holder_end: RawFd) -> ! {
+    unsafe {
+        libc::prctl(libc::PR_SET_NAME, c"world-pasta".as_ptr());
+        libc::close(holder_end);
+        // Only the null device on 0-2 and the life pipe on 3: nothing of
+        // the holder's (its report pipe, acknowledgment socket) stays open.
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if null < 0
+            || libc::dup2(life, 3) < 0
+            || libc::dup2(null, 0) < 0
+            || libc::dup2(null, 1) < 0
+            || libc::dup2(null, 2) < 0
+            || close_from(4).is_err()
+        {
+            libc::_exit(127);
+        }
+        let wait_byte = || {
+            let mut byte = 0u8;
+            loop {
+                match libc::read(3, (&mut byte as *mut u8).cast(), 1) {
+                    n if n < 0 && *libc::__errno_location() == libc::EINTR => {}
+                    n => return n == 1,
+                }
+            }
+        };
+        if !wait_byte() {
+            libc::_exit(0);
+        }
+        let pasta = libc::fork();
+        if pasta == 0 {
+            libc::close(3);
+            let env: [*const libc::c_char; 1] = [std::ptr::null()];
+            libc::execve(egress.program.as_ptr(), egress.argv.as_ptr(), env.as_ptr());
+            libc::_exit(127);
+        }
+        if pasta < 0 {
+            libc::_exit(1);
+        }
+        // Until the holder is gone (EOF), or pasta exits: then so does the
+        // monitor, which the holder notices while starting, and setup later.
+        let mut ready = libc::pollfd {
+            fd: 3,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            if libc::poll(&mut ready, 1, 500) > 0 && !wait_byte() {
+                break;
+            }
+            let mut status = 0;
+            if libc::waitpid(pasta, &mut status, libc::WNOHANG) == pasta {
+                libc::_exit(1);
+            }
+        }
+        libc::kill(pasta, libc::SIGKILL);
+        let mut status = 0;
+        while libc::waitpid(pasta, &mut status, 0) < 0 && *libc::__errno_location() == libc::EINTR {
+        }
+        libc::_exit(0)
+    }
+}
+
+/// Read `path` into `buffer` with raw system calls (for use after fork);
+/// the bytes read.
+unsafe fn read_raw<'a>(path: &CStr, buffer: &'a mut [u8]) -> &'a [u8] {
+    unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return &[];
+        }
+        let mut len = 0;
+        while len < buffer.len() {
+            let n = libc::read(fd, buffer[len..].as_mut_ptr().cast(), buffer.len() - len);
+            if n <= 0 {
+                break;
+            }
+            len += n as usize;
+        }
+        libc::close(fd);
+        &buffer[..len]
+    }
+}
+
+/// Whether a /proc/net/route table has a default route on a real interface.
+fn default_route_v4(table: &[u8]) -> bool {
+    // Iface Destination ... ; the default route has destination 0.
+    table.split(|&b| b == b'\n').skip(1).any(|line| {
+        let mut fields = line
+            .split(|&b| b == b'\t' || b == b' ')
+            .filter(|f| !f.is_empty());
+        matches!((fields.next(), fields.next()), (Some(iface), Some(b"00000000")) if iface != b"lo")
+    })
+}
+
+/// Whether a /proc/net/ipv6_route table has a default route on a real
+/// interface (the kernel keeps an unreachable one on lo).
+fn default_route_v6(table: &[u8]) -> bool {
+    // dest prefix src prefix next-hop metric refcnt use flags iface
+    table.split(|&b| b == b'\n').any(|line| {
+        let mut parts = line.split(|&b| b == b' ').filter(|f| !f.is_empty());
+        let fields: [&[u8]; 10] = std::array::from_fn(|_| parts.next().unwrap_or(b""));
+        fields[0] == b"00000000000000000000000000000000"
+            && fields[1] == b"00"
+            && !fields[9].is_empty()
+            && fields[9] != b"lo"
+    })
+}
+
+/// Whether the calling process's network namespace has a default route on
+/// a real interface (IPv4 or IPv6): pasta has configured it. For use after
+/// fork: no allocation.
+unsafe fn has_default_route() -> bool {
+    let mut buffer = [0u8; 16384];
+    unsafe {
+        default_route_v4(read_raw(c"/proc/self/net/route", &mut buffer))
+            || default_route_v6(read_raw(c"/proc/self/net/ipv6_route", &mut buffer))
+    }
+}
+
+/// Holder: let the monitor start pasta, then wait until it has configured
+/// the namespace. Fails if the monitor exits first or setup takes longer
+/// than 5 seconds. `life` must stay open for the holder's lifetime.
+unsafe fn start_pasta(child: libc::pid_t, life: RawFd) -> IoResult<()> {
+    unsafe {
+        let byte = 1u8;
+        if libc::write(life, (&byte as *const u8).cast(), 1) != 1 {
+            return Err(Error::from_raw_os_error(libc::ENETDOWN));
+        }
+        let pause = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 20_000_000,
+        };
+        for _ in 0..250 {
+            if has_default_route() {
+                return Ok(());
+            }
+            let mut status = 0;
+            if libc::waitpid(child, &mut status, libc::WNOHANG) == child {
+                break;
+            }
+            libc::nanosleep(&pause, std::ptr::null_mut());
+        }
+        Err(Error::from_raw_os_error(libc::ENETDOWN))
+    }
+}
+
 /// `/proc/self/fd/<fd>`: a path naming exactly the file behind `fd`.
 /// Built without allocating, for use after fork.
 struct FdPath([u8; 32]);
@@ -517,6 +853,37 @@ fn fd_path(fd: RawFd) -> FdPath {
         buffer[prefix.len() + i] = digits[count - 1 - i];
     }
     FdPath(buffer)
+}
+
+/// Holder: bind the workspace's resolv.conf over /etc/resolv.conf (and so,
+/// through a symlink, over what it points at) in the workspace mount
+/// namespace.
+unsafe fn bind_resolv(resolv: &CStr) -> IoResult<()> {
+    unsafe {
+        check(libc::mount(
+            resolv.as_ptr(),
+            c"/etc/resolv.conf".as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        ))?;
+    }
+    Ok(())
+}
+
+/// pre_exec (joined the workspace namespaces, still privileged there): the
+/// host may replace its resolv.conf (systemd-resolved renames a new one
+/// into place on network changes), which detaches the holder's bind; put
+/// the workspace's back. `own` is its (dev, ino). Best effort.
+pub(crate) unsafe fn heal_resolv(resolv: &CStr, own: (u64, u64)) {
+    unsafe {
+        let mut stat = std::mem::zeroed::<libc::stat>();
+        if libc::stat(c"/etc/resolv.conf".as_ptr(), &mut stat) == 0
+            && (stat.st_dev, stat.st_ino) != own
+        {
+            let _ = bind_resolv(resolv);
+        }
+    }
 }
 
 /// pre_exec: the workload gets no capabilities, even when the caller is
@@ -1666,6 +2033,9 @@ pub struct Holder {
     /// `None` for a holder started before workspaces had a private /tmp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mnt_ns: Option<u64>,
+    /// Started with pasta for outbound network.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub egress: bool,
 }
 
 /// Descriptors of a holder's namespaces; they keep the namespaces alive.
@@ -1696,6 +2066,32 @@ impl Holder {
             user_ns: inode("user")?,
             net_ns: inode("net")?,
             mnt_ns: Some(inode("mnt")?),
+            egress: false,
+        })
+    }
+
+    /// Whether pasta (a child of the holder's pasta monitor) is still
+    /// running. Unknown (no `children` file: CONFIG_PROC_CHILDREN) counts as
+    /// running.
+    pub(crate) fn pasta_running(&self) -> bool {
+        let children =
+            |pid: &str| std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"));
+        let comm = |pid: &str| std::fs::read_to_string(format!("/proc/{pid}/comm"));
+        let Ok(monitors) = children(&self.pid.to_string()) else {
+            return true;
+        };
+        monitors.split_whitespace().any(|monitor| {
+            comm(monitor).is_ok_and(|c| c.trim() == "world-pasta")
+                && children(monitor).is_ok_and(|pastas| {
+                    pastas.split_whitespace().any(|pasta| {
+                        // A dead pasta is a zombie until the holder exits.
+                        let stat = std::fs::read_to_string(format!("/proc/{pasta}/stat"));
+                        stat.is_ok_and(|s| {
+                            !s.rsplit_once(')')
+                                .is_some_and(|(_, r)| r.trim_start().starts_with('Z'))
+                        })
+                    })
+                })
         })
     }
 
@@ -1776,6 +2172,7 @@ impl Holder {
 unsafe fn holder_process(
     maps: &IdMaps,
     temp: &PrivateTemp,
+    egress: Option<&Egress>,
     report: RawFd,
     ack: RawFd,
     report_read: RawFd,
@@ -1829,10 +2226,37 @@ unsafe fn holder_process(
         };
         // Pinned: never run unpinned.
         expect();
-        let enter = || enter_new_namespaces(maps).and_then(|()| enter_private_temp(temp));
-        if let Err(error) = cleanup.and_then(|()| enter()) {
+        let fail = |error: Error| -> ! {
             send(-error.raw_os_error().unwrap_or(libc::EIO));
-            libc::_exit(125);
+            libc::_exit(125)
+        };
+        if let Err(error) = cleanup {
+            fail(error);
+        }
+        // pasta must run in the host namespaces: fork it before leaving
+        // them. It waits until they are set up; if we exit first, it
+        // sees EOF and exits too.
+        let pasta = match egress {
+            Some(egress) => match fork_pasta(egress, libc::getpid()) {
+                Ok(pasta) => Some(pasta),
+                Err(error) => fail(error),
+            },
+            None => None,
+        };
+        let enter = || enter_new_namespaces(maps).and_then(|()| enter_private_temp(temp));
+        if let Err(error) = enter() {
+            fail(error);
+        }
+        if let (Some(egress), Some((child, life))) = (egress, pasta) {
+            // A host without /etc/resolv.conf has nothing to replace.
+            if let Err(error) = bind_resolv(&egress.resolv)
+                && error.raw_os_error() != Some(libc::ENOENT)
+            {
+                fail(error);
+            }
+            if let Err(error) = start_pasta(child, life) {
+                fail(error);
+            }
         }
         libc::prctl(libc::PR_SET_NAME, c"world-holder".as_ptr());
         if !send(0) {
@@ -1842,13 +2266,13 @@ unsafe fn holder_process(
         // could never be found or torn down, so it exits instead.
         expect();
         libc::close(1);
-        hold()
+        hold(pasta.map(|(_, life)| life))
     }
 }
 
 /// Start a detached process that keeps new namespaces alive, with `temp`
 /// as its /tmp and /var/tmp.
-pub(crate) fn start_holder(temp: &PrivateTemp) -> Result<StartedHolder> {
+pub(crate) fn start_holder(temp: &PrivateTemp, egress: Option<&Egress>) -> Result<StartedHolder> {
     let maps = IdMaps::current();
     let mut fds = [0; 2];
     // SAFETY: pipe2 writes two new descriptors into fds on success.
@@ -1893,7 +2317,7 @@ pub(crate) fn start_holder(temp: &PrivateTemp) -> Result<StartedHolder> {
     // prepared above and never returns.
     let intermediate = unsafe { libc::fork() };
     if intermediate == 0 {
-        unsafe { holder_process(&maps, temp, report, ack, report_read, ack_write_fd) }
+        unsafe { holder_process(&maps, temp, egress, report, ack, report_read, ack_write_fd) }
     }
     // SAFETY: restores this thread's own previous mask.
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) };
@@ -1936,6 +2360,9 @@ pub(crate) fn start_holder(temp: &PrivateTemp) -> Result<StartedHolder> {
     if status != 0 {
         // A subreaper caller adopted the failed holder: reap it.
         reap_if_child(pidfd.as_ref());
+        if -status == libc::ENETDOWN {
+            bail!("the workspace network did not come up: pasta failed to start");
+        }
         return Err(Error::from_raw_os_error(-status)).context("start World namespace holder");
     }
     let started = |holder| StartedHolder {
@@ -1945,7 +2372,10 @@ pub(crate) fn start_holder(temp: &PrivateTemp) -> Result<StartedHolder> {
         commit: Some(ack_write),
     };
     match Holder::observe(pid as u32) {
-        Ok(holder) => Ok(started(holder)),
+        Ok(mut holder) => {
+            holder.egress = egress.is_some();
+            Ok(started(holder))
+        }
         Err(err) => {
             let unrecorded = started(Holder {
                 pid: pid as u32,
@@ -1953,6 +2383,7 @@ pub(crate) fn start_holder(temp: &PrivateTemp) -> Result<StartedHolder> {
                 user_ns: 0,
                 net_ns: 0,
                 mnt_ns: None,
+                egress: false,
             });
             match unrecorded.kill() {
                 Ok(()) => Err(err),
@@ -2126,9 +2557,20 @@ unsafe fn reset_signals() {
     }
 }
 
-unsafe fn hold() -> ! {
+/// Keep the namespaces alive until killed. `keep` is the pasta monitor's
+/// life pipe: open until the holder exits.
+unsafe fn hold(keep: Option<RawFd>) -> ! {
     unsafe {
-        if close_from(0).is_err() {
+        let closed = match keep {
+            Some(keep) => {
+                (0..keep).for_each(|fd| {
+                    libc::close(fd);
+                });
+                close_from(keep + 1)
+            }
+            None => close_from(0),
+        };
+        if closed.is_err() {
             libc::_exit(125);
         }
         loop {
@@ -2147,7 +2589,7 @@ mod tests {
         std::fs::create_dir_all(root.path().join("var/tmp")).unwrap();
         std::fs::create_dir(root.path().join("tmp")).unwrap();
         let temp = super::PrivateTemp::new(root.path()).unwrap();
-        let started = super::start_holder(&temp).unwrap();
+        let started = super::start_holder(&temp, None).unwrap();
         let pid = started.holder.pid;
         assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
         drop(started);
@@ -2348,6 +2790,36 @@ mod tests {
         std::os::unix::fs::symlink(root.join("elsewhere"), root.join("tmp/a")).unwrap();
         assert_eq!(in_private_temp(&temp, || true), 1);
         assert!(!root.join("elsewhere/b").exists());
+    }
+
+    #[test]
+    fn resolv_conf_keeps_search_and_options_but_only_the_forwarder() {
+        let host = "# comment\nnameserver 127.0.0.53\nnameserver 10.0.0.1\noptions edns0 trust-ad\nsearch example.com\n";
+        assert_eq!(
+            super::resolv_conf(host),
+            "options edns0 trust-ad\nsearch example.com\nnameserver 169.254.1.1\n"
+        );
+        assert_eq!(super::resolv_conf(""), "nameserver 169.254.1.1\n");
+    }
+
+    #[test]
+    fn format_path_writes_a_nul_terminated_proc_path() {
+        let mut out = [0xffu8; 48];
+        super::format_path(&mut out, b"/proc/", 4194304, b"/ns/net");
+        let text = std::ffi::CStr::from_bytes_until_nul(&out).unwrap();
+        assert_eq!(text, c"/proc/4194304/ns/net");
+    }
+
+    #[test]
+    fn default_routes_ignore_loopback() {
+        let v4 = b"Iface\tDestination\tGateway\tFlags\nlo\t00000000\t00000000\t0001\neno2\t0001000A\t00000000\t0001\n";
+        assert!(!super::default_route_v4(v4));
+        let v4 = b"Iface\tDestination\tGateway\tFlags\neno2\t00000000\t0101000A\t0003\n";
+        assert!(super::default_route_v4(v4));
+        let lo = b"00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo\n";
+        assert!(!super::default_route_v6(lo));
+        let tap = b"00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00000003     eno2\n";
+        assert!(super::default_route_v6(tap));
     }
 
     #[test]
