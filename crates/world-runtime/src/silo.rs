@@ -1862,15 +1862,53 @@ async fn linux_exec(
     if cancel.is_cancelled() || Instant::now() >= deadline {
         return Ok(124);
     }
-    let workload = run::raw_workload(crate::linux::spawn(crate::linux::Spawn {
+    let child = crate::linux::spawn(crate::linux::Spawn {
         program: command[0].clone(),
         args: command[1..].to_vec(),
         cwd: dir,
         env,
         stdin,
         setup: Box::new(setup),
-    })?);
+    })?;
+    // The PID namespace the workload runs in: its listeners are what this
+    // exec forwards.
+    let owner = std::fs::metadata(format!("/proc/{}/ns/pid_for_children", child.pid))
+        .ok()
+        .map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            m.ino()
+        });
+    let workload = run::raw_workload(child);
+    // The host reaches the workspace's listeners at its own address while
+    // the workload runs (see `forward`); not being able to is no reason to
+    // fail the workload.
+    let forwarding = match crate::forward::NsConnector::start(user_fd, net_fd) {
+        Ok(connector) => {
+            let (state, id) = (state.to_path_buf(), world.id.clone());
+            let current = move || {
+                read_map::<crate::linux::Holder>(&state, "holders.json")
+                    .ok()?
+                    .get(&id)
+                    .map(|holder| holder.net_ns())
+            };
+            Some(crate::forward::Forwarding::start(
+                world.id.clone(),
+                world.ip,
+                connector,
+                owner,
+                Box::new(current),
+            ))
+        }
+        Err(err) => {
+            eprintln!(
+                "world: workspace {}: ports are not forwarded to the host: {err:#}",
+                world.id
+            );
+            None
+        }
+    };
     let result = run::wait(workload, deadline, cancel, &mut None, None).await;
+    drop(forwarding);
     drop((user, mnt, net));
     result
 }

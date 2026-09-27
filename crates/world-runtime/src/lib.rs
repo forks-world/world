@@ -1,4 +1,6 @@
 #[cfg(target_os = "linux")]
+mod forward;
+#[cfg(target_os = "linux")]
 pub mod linux;
 pub mod policy;
 pub mod proxy;

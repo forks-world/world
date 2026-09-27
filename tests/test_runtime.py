@@ -1510,6 +1510,121 @@ except OSError:
             else:
                 self.fail(f"{pid} still running after teardown")
 
+    def test_host_reaches_workspace_listeners_at_their_address(self):
+        ips = {}
+        for name in ["A", "B"]:
+            result = run(WORLD, "workspace", "--state-dir", self.state, "show", name)
+            ips[name] = json.loads(result.stdout)["ip"]
+
+        def fetch(address, expected):
+            # The forwarder rescans the workspace's listeners every second.
+            for _ in range(50):
+                result = run(PROBE, "get", address)
+                if result.returncode == 0 and result.stdout == expected:
+                    return True
+                time.sleep(0.1)
+            return False
+
+        with serving(self.command("A", "serve", "127.0.0.1:0", "A")) as (_, port):
+            with serving(self.command("B", "serve", f"127.0.0.1:{port}", "B")):
+                for name, ip in ips.items():
+                    self.assertTrue(fetch(f"{ip}:{port}", name), name)
+                # Another exec of A leaves the port to the server's exec.
+                other = subprocess.Popen([str(x) for x in self.command("A")[:-1] + ["/bin/sleep", "3"]],
+                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+                time.sleep(1.5)
+                for _ in range(10):
+                    result = run(PROBE, "get", f"{ips['A']}:{port}")
+                    self.assertEqual((result.returncode, result.stdout), (0, "A"), result.stderr)
+                other.wait(timeout=10)
+                self.assertTrue(fetch(f"{ips['A']}:{port}", "A"))
+                # Host localhost is not the workspace's.
+                self.assertNotIn(run(PROBE, "get", f"127.0.0.1:{port}").stdout, ["A", "B"])
+        # Once the server's exec ends, nothing is forwarded any more.
+        result = run(PROBE, "get", f"{ips['A']}:{port}")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_a_short_exec_does_not_take_over_host_sessions(self):
+        # Only the exec running the server forwards its port: sessions the
+        # host opens while an unrelated exec runs survive that exec ending.
+        ip = json.loads(run(WORLD, "workspace", "--state-dir", self.state, "show", "A").stdout)["ip"]
+        echo = """
+import socket, threading
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen()
+print("READY", s.getsockname()[1], flush=True)
+def serve(c):
+    while (data := c.recv(100)):
+        c.sendall(data)
+while True:
+    c, _ = s.accept()
+    threading.Thread(target=serve, args=(c,), daemon=True).start()
+"""
+        with serving(self.command("A")[:-1] + [sys.executable, "-c", echo]) as (_, port):
+            time.sleep(1.5)
+            short = subprocess.Popen([str(x) for x in self.command("A")[:-1] + ["/bin/sleep", "2"]],
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+            time.sleep(1.2)  # it has scanned the workspace's listeners by now
+            sessions = [socket.create_connection((ip, port), timeout=3) for _ in range(10)]
+            short.wait(timeout=10)
+            time.sleep(0.5)
+            for n, session in enumerate(sessions):
+                with session:
+                    session.sendall(b"ping%d" % n)
+                    self.assertEqual(session.recv(100), b"ping%d" % n)
+
+    def test_forwarding_outlives_a_torn_down_holder(self):
+        # A running workload keeps the old namespace after teardown; its
+        # listeners stay reachable while its exec runs.
+        work = self.root / "Q"
+        work.mkdir()
+        workspace = [WORLD, "workspace", "--state-dir", self.state]
+        self.assertEqual(run(*workspace, "create", "Q", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *workspace, "teardown", "Q")
+        self.assertEqual(run(*workspace, "setup", "Q").returncode, 0)
+        ip = json.loads(run(*workspace, "show", "Q").stdout)["ip"]
+        with serving(self.command("Q", "serve", "127.0.0.1:0", "Q")) as (_, port):
+            time.sleep(1.5)
+            self.assertEqual(run(PROBE, "get", f"{ip}:{port}").stdout, "Q")
+            self.assertEqual(run(*workspace, "teardown", "Q").returncode, 0)
+            time.sleep(2.5)
+            result = run(PROBE, "get", f"{ip}:{port}")
+            self.assertEqual((result.returncode, result.stdout), (0, "Q"), result.stderr)
+
+    def test_a_new_holder_retires_the_old_forwarding(self):
+        # After setup replaces the holder, a workload still running in the
+        # old namespace must not share the port with the new one.
+        work = self.root / "S"
+        work.mkdir()
+        workspace = [WORLD, "workspace", "--state-dir", self.state]
+        self.assertEqual(run(*workspace, "create", "S", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *workspace, "teardown", "S")
+        self.assertEqual(run(*workspace, "setup", "S").returncode, 0)
+        ip = json.loads(run(*workspace, "show", "S").stdout)["ip"]
+        with serving(self.command("S", "serve", "127.0.0.1:0", "OLD")) as (_, port):
+            time.sleep(1.5)
+            self.assertEqual(run(PROBE, "get", f"{ip}:{port}").stdout, "OLD")
+            self.assertEqual(run(*workspace, "teardown", "S").returncode, 0)
+            self.assertEqual(run(*workspace, "setup", "S").returncode, 0)
+            time.sleep(2.5)
+            self.assertNotEqual(run(PROBE, "get", f"{ip}:{port}").stdout, "OLD")
+            with serving(self.command("S", "serve", f"127.0.0.1:{port}", "NEW")):
+                time.sleep(1.5)
+                answers = {run(PROBE, "get", f"{ip}:{port}").stdout for _ in range(20)}
+                self.assertEqual(answers, {"NEW"})
+
+    def test_unforwardable_privileged_port_is_reported(self):
+        start = int(pathlib.Path("/proc/sys/net/ipv4/ip_unprivileged_port_start").read_text())
+        if start <= 80 or os.geteuid() == 0:
+            self.skipTest("the host lets this user bind port 80")
+        command = self.command("A")[:-1] + [
+            "/bin/sh", "-c", '"$0" serve 127.0.0.1:80 A >/dev/null & sleep 2.5', PROBE]
+        result = run(*command)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("port 80 cannot be reached from the host", result.stderr)
+        self.assertIn("ip_unprivileged_port_start", result.stderr)
+
     def test_workspace_rejects_tmp_workdir(self):
         for workdir in ["/tmp", "/var/tmp"]:
             result = run(WORLD, "workspace", "--state-dir", self.state, "create", "T", "--workdir", workdir)
