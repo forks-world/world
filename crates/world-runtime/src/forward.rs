@@ -401,8 +401,13 @@ pub(crate) async fn forward(
     });
     let connector = Arc::new(connector);
     // Dropped with this future (on `Forwarding` drop): every per-port task
-    // stops with it, and with each its relays.
+    // stops with it.
     let mut active: HashMap<u16, (SocketAddr, AbortOnDrop)> = HashMap::new();
+    // Relays belong to the whole forwarding, not to a port's accept task:
+    // a server that closes its listener (graceful shutdown, reload) keeps
+    // its established connections. Cancelled when this future is dropped.
+    let relays = tokio_util::sync::CancellationToken::new();
+    let _relays = relays.clone().drop_guard();
     let read =
         |name: &str| std::fs::read_to_string(format!("/proc/{pid}/net/{name}")).unwrap_or_default();
     // Announce only ports that open while this exec runs (its own server,
@@ -453,12 +458,16 @@ pub(crate) async fn forward(
                 );
             }
             let connector = connector.clone();
+            let relays = relays.clone();
             let task = tokio::spawn(async move {
-                let mut relays = tokio::task::JoinSet::new();
                 while let Ok((inbound, _)) = listener.accept().await {
-                    relays.spawn(relay(inbound, connector.clone(), target));
-                    // Forget finished relays.
-                    while relays.try_join_next().is_some() {}
+                    let (connector, relays) = (connector.clone(), relays.clone());
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = relays.cancelled() => {}
+                            _ = relay(inbound, connector, target) => {}
+                        }
+                    });
                 }
             });
             active.insert(port, (target, AbortOnDrop(task)));
@@ -500,73 +509,144 @@ impl Drop for Forwarding {
 mod tests {
     use super::*;
 
+    /// A real workspace holder with one listener inside its network
+    /// namespace (a socket made there by the connector, bound and
+    /// listening from here), and the connector to forward it with.
+    struct Fixture {
+        _serial: std::sync::MutexGuard<'static, ()>,
+        started: Option<crate::linux::StartedHolder>,
+        _namespaces: crate::linux::Namespaces,
+        connector: Option<NsConnector>,
+        inside: Option<std::net::TcpListener>,
+        port: u16,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let serial = crate::linux::HOLDER_TESTS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(root.path().join("var/tmp")).unwrap();
+            std::fs::create_dir(root.path().join("tmp")).unwrap();
+            let temp = crate::linux::PrivateTemp::new(root.path()).unwrap();
+            let started = crate::linux::start_holder(&temp, None).unwrap();
+            let namespaces = started.holder.open().unwrap();
+            let connector =
+                NsConnector::start(namespaces.user.as_raw_fd(), namespaces.net.as_raw_fd())
+                    .unwrap();
+            let fd = connector.socket(false).unwrap();
+            let address = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: 0,
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from(Ipv4Addr::LOCALHOST).to_be(),
+                },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: bind/listen on a socket we own.
+            unsafe {
+                check(libc::bind(
+                    fd.as_raw_fd(),
+                    (&address as *const libc::sockaddr_in).cast(),
+                    std::mem::size_of_val(&address) as libc::socklen_t,
+                ))
+                .unwrap();
+                check(libc::listen(fd.as_raw_fd(), 8)).unwrap();
+            }
+            // SAFETY: a listening socket we own.
+            let inside = unsafe { std::net::TcpListener::from_raw_fd(fd.into_raw_fd()) };
+            let port = inside.local_addr().unwrap().port();
+            Self {
+                _serial: serial,
+                started: Some(started),
+                _namespaces: namespaces,
+                connector: Some(connector),
+                inside: Some(inside),
+                port,
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.inside.take();
+            if let Some(started) = self.started.take() {
+                let _ = started.kill();
+            }
+        }
+    }
+
+    async fn reachable(host: SocketAddr, expected: bool) -> bool {
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(host).await.is_ok() == expected {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
     /// Dropping `Forwarding` stops every per-port listener, not just the
     /// scan: nothing stays exposed on the host after the workload.
     #[test]
     fn dropping_forwarding_closes_host_listeners() {
-        let _serial = crate::linux::HOLDER_TESTS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("var/tmp")).unwrap();
-        std::fs::create_dir(root.path().join("tmp")).unwrap();
-        let temp = crate::linux::PrivateTemp::new(root.path()).unwrap();
-        let started = crate::linux::start_holder(&temp, None).unwrap();
-        let namespaces = started.holder.open().unwrap();
-        let connector =
-            NsConnector::start(namespaces.user.as_raw_fd(), namespaces.net.as_raw_fd()).unwrap();
-        // A listener inside the workspace: a socket made there by the
-        // connector, bound and listening from here.
-        let inside = unsafe {
-            std::net::TcpListener::from_raw_fd(connector.socket(false).unwrap().into_raw_fd())
-        };
-        let socket = unsafe { OwnedFd::from_raw_fd(libc::dup(inside.as_raw_fd())) };
-        let address = libc::sockaddr_in {
-            sin_family: libc::AF_INET as libc::sa_family_t,
-            sin_port: 0,
-            sin_addr: libc::in_addr {
-                s_addr: u32::from(Ipv4Addr::LOCALHOST).to_be(),
-            },
-            sin_zero: [0; 8],
-        };
-        // SAFETY: bind/listen on a socket we own.
-        unsafe {
-            check(libc::bind(
-                socket.as_raw_fd(),
-                (&address as *const libc::sockaddr_in).cast(),
-                std::mem::size_of_val(&address) as libc::socklen_t,
-            ))
-            .unwrap();
-            check(libc::listen(socket.as_raw_fd(), 8)).unwrap();
-        }
-        let port = inside.local_addr().unwrap().port();
+        let mut fixture = Fixture::new();
         let ip = Ipv4Addr::new(127, 77, 250, 1);
-        let host = SocketAddr::new(IpAddr::V4(ip), port);
+        let host = SocketAddr::new(IpAddr::V4(ip), fixture.port);
+        let connector = fixture.connector.take().unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let forwarding = Forwarding::start("test".into(), ip, connector, Box::new(|| None));
-            let mut reached = false;
-            for _ in 0..50 {
-                if tokio::net::TcpStream::connect(host).await.is_ok() {
-                    reached = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            assert!(reached, "the workspace listener was not forwarded");
+            assert!(reachable(host, true).await, "not forwarded");
             drop(forwarding);
-            let mut closed = false;
-            for _ in 0..50 {
-                if tokio::net::TcpStream::connect(host).await.is_err() {
-                    closed = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            assert!(closed, "a host listener outlived its Forwarding");
+            assert!(
+                reachable(host, false).await,
+                "a host listener outlived its Forwarding"
+            );
         });
-        drop((inside, socket, namespaces));
-        started.kill().unwrap();
+    }
+
+    /// A server closing its listener (graceful shutdown) keeps its
+    /// established connections: the relays outlive the port's forward,
+    /// and end only with the whole `Forwarding`.
+    #[test]
+    fn established_relays_survive_a_closed_listener() {
+        use std::io::{Read, Write};
+        let mut fixture = Fixture::new();
+        let ip = Ipv4Addr::new(127, 77, 250, 2);
+        let host = SocketAddr::new(IpAddr::V4(ip), fixture.port);
+        let connector = fixture.connector.take().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let forwarding = runtime
+            .block_on(async { Forwarding::start("test".into(), ip, connector, Box::new(|| None)) });
+        let _enter = runtime.enter();
+        assert!(runtime.block_on(reachable(host, true)));
+        // That probe connection was accepted inside; drain it.
+        let inside = fixture.inside.take().unwrap();
+        inside.set_nonblocking(false).unwrap();
+        drop(inside.accept().unwrap());
+        let mut client = std::net::TcpStream::connect(host).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (mut server, _) = inside.accept().unwrap();
+        drop(inside); // the listener closes; the connection stays
+        assert!(
+            runtime.block_on(reachable(host, false)),
+            "port still forwarded"
+        );
+        client.write_all(b"ping").unwrap();
+        let mut buffer = [0u8; 4];
+        server.read_exact(&mut buffer).unwrap();
+        server.write_all(b"pong").unwrap();
+        client.read_exact(&mut buffer).unwrap();
+        assert_eq!(&buffer, b"pong");
+        drop(forwarding);
+        // Give the runtime a moment to cancel the relay.
+        runtime.block_on(tokio::time::sleep(Duration::from_millis(200)));
+        let mut rest = Vec::new();
+        assert!(matches!(client.read_to_end(&mut rest), Ok(0) | Err(_)));
     }
 
     #[test]
