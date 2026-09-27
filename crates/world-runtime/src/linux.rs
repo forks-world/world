@@ -2209,6 +2209,12 @@ unsafe fn finish_monitor(monitor: libc::pid_t, life: RawFd) {
     }
 }
 
+/// Serializes tests that make this process a child subreaper: the flag is
+/// process-wide, and one test turning it off would let another's adopted
+/// processes go to init instead.
+#[cfg(test)]
+pub(crate) static SUBREAPER_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Holder status: started, but pasta could not connect the workspace.
 const NO_EGRESS: libc::pid_t = 1;
 
@@ -2962,6 +2968,9 @@ mod tests {
         .unwrap();
         let temp = super::PrivateTemp::new(root.path()).unwrap();
         let egress = super::Egress::with_program(root.path(), hanging).unwrap();
+        let _serial = super::SUBREAPER_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // SAFETY: prctl with integer arguments on this test process.
         unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
         let started = super::start_holder(&temp, Some(&egress)).unwrap();
