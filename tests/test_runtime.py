@@ -1529,7 +1529,7 @@ except OSError:
             with serving(self.command("B", "serve", f"127.0.0.1:{port}", "B")):
                 for name, ip in ips.items():
                     self.assertTrue(fetch(f"{ip}:{port}", name), name)
-                # Another exec of A forwards the same port alongside.
+                # Another exec of A leaves the port to the server's exec.
                 other = subprocess.Popen([str(x) for x in self.command("A")[:-1] + ["/bin/sleep", "3"]],
                                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                          stderr=subprocess.DEVNULL)
@@ -1544,6 +1544,35 @@ except OSError:
         # Once the server's exec ends, nothing is forwarded any more.
         result = run(PROBE, "get", f"{ips['A']}:{port}")
         self.assertNotEqual(result.returncode, 0)
+
+    def test_a_short_exec_does_not_take_over_host_sessions(self):
+        # Only the exec running the server forwards its port: sessions the
+        # host opens while an unrelated exec runs survive that exec ending.
+        ip = json.loads(run(WORLD, "workspace", "--state-dir", self.state, "show", "A").stdout)["ip"]
+        echo = """
+import socket, threading
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen()
+print("READY", s.getsockname()[1], flush=True)
+def serve(c):
+    while (data := c.recv(100)):
+        c.sendall(data)
+while True:
+    c, _ = s.accept()
+    threading.Thread(target=serve, args=(c,), daemon=True).start()
+"""
+        with serving(self.command("A")[:-1] + [sys.executable, "-c", echo]) as (_, port):
+            time.sleep(1.5)
+            short = subprocess.Popen([str(x) for x in self.command("A")[:-1] + ["/bin/sleep", "2"]],
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+            time.sleep(1.2)  # it has scanned the workspace's listeners by now
+            sessions = [socket.create_connection((ip, port), timeout=3) for _ in range(10)]
+            short.wait(timeout=10)
+            time.sleep(0.5)
+            for n, session in enumerate(sessions):
+                with session:
+                    session.sendall(b"ping%d" % n)
+                    self.assertEqual(session.recv(100), b"ping%d" % n)
 
     def test_forwarding_outlives_a_torn_down_holder(self):
         # A running workload keeps the old namespace after teardown; its

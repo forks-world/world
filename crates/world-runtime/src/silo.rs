@@ -1862,14 +1862,23 @@ async fn linux_exec(
     if cancel.is_cancelled() || Instant::now() >= deadline {
         return Ok(124);
     }
-    let workload = run::raw_workload(crate::linux::spawn(crate::linux::Spawn {
+    let child = crate::linux::spawn(crate::linux::Spawn {
         program: command[0].clone(),
         args: command[1..].to_vec(),
         cwd: dir,
         env,
         stdin,
         setup: Box::new(setup),
-    })?);
+    })?;
+    // The PID namespace the workload runs in: its listeners are what this
+    // exec forwards.
+    let owner = std::fs::metadata(format!("/proc/{}/ns/pid_for_children", child.pid))
+        .ok()
+        .map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            m.ino()
+        });
+    let workload = run::raw_workload(child);
     // The host reaches the workspace's listeners at its own address while
     // the workload runs (see `forward`); not being able to is no reason to
     // fail the workload.
@@ -1886,6 +1895,7 @@ async fn linux_exec(
                 world.id.clone(),
                 world.ip,
                 connector,
+                owner,
                 Box::new(current),
             ))
         }

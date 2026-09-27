@@ -1,13 +1,14 @@
 //! Host access to a Linux workspace's listeners (issue #8).
 //!
 //! A workspace's servers listen inside its network namespace, usually on
-//! 127.0.0.1. While `world exec` runs a workload, it forwards every TCP port
-//! the workspace listens on from the workspace's own host address
+//! 127.0.0.1. While `world exec` runs a workload, it forwards the TCP ports
+//! that workload listens on from the workspace's own host address
 //! (`127.77.x.y`, from the registry) into the namespace: workspaces can use
 //! the same port and still be told apart from the host, as on macOS, where
-//! the workspace address is what their localhost binds to. Every running
-//! exec of a workspace forwards all of its listeners (with SO_REUSEPORT, so
-//! they coexist); a workspace process only runs while some exec does.
+//! the workspace address is what their localhost binds to. Only the exec
+//! whose workload owns a listening socket forwards its port, so a host
+//! connection is always relayed by the exec that runs its server, never
+//! cut short by an unrelated exec ending.
 //!
 //! Sockets into the namespace come from a small single-threaded connector
 //! process that joined the workspace's user and network namespaces (a
@@ -280,17 +281,21 @@ fn target(ip: IpAddr, port: u16) -> SocketAddr {
     SocketAddr::new(ip, port)
 }
 
-/// Parse a /proc/net/tcp{,6} table: the listening sockets, as the address
-/// to connect to inside the namespace, by port. IPv4 wins over IPv6.
-pub(crate) fn listeners(v4: &str, v6: &str) -> HashMap<u16, SocketAddr> {
+/// Parse a /proc/net/tcp{,6} table: the listening sockets by port, as the
+/// address to connect to inside the namespace and the socket's inode. IPv4
+/// wins over IPv6.
+pub(crate) fn listeners(v4: &str, v6: &str) -> HashMap<u16, (SocketAddr, u64)> {
     let mut found = HashMap::new();
     for (table, is_v6) in [(v6, true), (v4, false)] {
         for line in table.lines().skip(1) {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            // sl local_address rem_address st ...; 0A is LISTEN.
-            if fields.len() < 4 || fields[3] != "0A" {
+            // sl local_address rem_address st ... inode; 0A is LISTEN.
+            if fields.len() < 10 || fields[3] != "0A" {
                 continue;
             }
+            let Ok(inode) = fields[9].parse::<u64>() else {
+                continue;
+            };
             let Some((address, port)) = fields[1].split_once(':') else {
                 continue;
             };
@@ -314,15 +319,34 @@ pub(crate) fn listeners(v4: &str, v6: &str) -> HashMap<u16, SocketAddr> {
                 };
                 IpAddr::V4(Ipv4Addr::from(raw.to_le_bytes()))
             };
-            found.insert(port, target(ip, port));
+            found.insert(port, (target(ip, port), inode));
         }
     }
     found
 }
 
-/// A listener on `ip:port` on the host that other forwarding execs of the
-/// same workspace can share (SO_REUSEPORT).
-fn bind_shared(ip: Ipv4Addr, port: u16) -> IoResult<tokio::net::TcpListener> {
+/// Whether a process in the PID namespace `pidns` (an exec's workload) has
+/// the socket `inode` open. Processes we may not inspect are not ours.
+fn owned(inode: u64, pidns: u64) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let wanted = format!("socket:[{inode}]");
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    procs.flatten().any(|entry| {
+        let dir = entry.path();
+        std::fs::metadata(dir.join("ns/pid")).is_ok_and(|m| m.ino() == pidns)
+            && std::fs::read_dir(dir.join("fd")).is_ok_and(|fds| {
+                fds.flatten().any(|fd| {
+                    std::fs::read_link(fd.path())
+                        .is_ok_and(|link| link.as_os_str() == wanted.as_str())
+                })
+            })
+    })
+}
+
+/// A listener on `ip:port` on the host.
+fn bind_host(ip: Ipv4Addr, port: u16) -> IoResult<tokio::net::TcpListener> {
     // SAFETY: a new socket we own; setsockopt/bind/listen on it.
     unsafe {
         let fd = check(libc::socket(
@@ -332,15 +356,13 @@ fn bind_shared(ip: Ipv4Addr, port: u16) -> IoResult<tokio::net::TcpListener> {
         ))?;
         let socket = OwnedFd::from_raw_fd(fd);
         let one: libc::c_int = 1;
-        for option in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
-            check(libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                option,
-                (&one as *const libc::c_int).cast(),
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            ))?;
-        }
+        check(libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            (&one as *const libc::c_int).cast(),
+            std::mem::size_of_val(&one) as libc::socklen_t,
+        ))?;
         let address = libc::sockaddr_in {
             sin_family: libc::AF_INET as libc::sa_family_t,
             sin_port: port.to_be(),
@@ -377,21 +399,24 @@ async fn relay(
     Ok(())
 }
 
-/// Forward the workspace's listeners from `ip` on the host until dropped.
-/// Rescans every second, through the connector: it lives in the
-/// workspace's network namespace exactly as long as this exec, so neither
-/// a torn-down holder nor a reused PID changes what is seen.
+/// Forward the listeners of this exec's workload from `ip` on the host
+/// until dropped. Rescans every second, through the connector: it lives in
+/// the workspace's network namespace exactly as long as this exec, so
+/// neither a torn-down holder nor a reused PID changes what is seen.
+///
+/// `owner` is the PID namespace of this exec's workload: only listeners a
+/// process there has open are forwarded (`None`: all of them).
 ///
 /// `current` reports the network namespace (inode) of the workspace's
 /// current holder, if any. Once a different one is current (setup replaced
 /// the holder while this workload still runs in the old namespace), this
-/// forwarding retires: its SO_REUSEPORT listeners would otherwise share the
-/// workspace's ports with the new namespace's and split connections
-/// between them. With no holder at all (a plain teardown) it goes on.
+/// forwarding retires, giving the address's ports to the new namespace.
+/// With no holder at all (a plain teardown) it goes on.
 pub(crate) async fn forward(
     id: String,
     ip: Ipv4Addr,
     connector: NsConnector,
+    owner: Option<u64>,
     current: Box<dyn Fn() -> Option<u64> + Send>,
 ) {
     let pid = connector.pid;
@@ -410,10 +435,9 @@ pub(crate) async fn forward(
     let _relays = relays.clone().drop_guard();
     let read =
         |name: &str| std::fs::read_to_string(format!("/proc/{pid}/net/{name}")).unwrap_or_default();
-    // Announce only ports that open while this exec runs (its own server,
-    // typically), not every listener of the workspace on every exec.
-    let mut announced: std::collections::HashSet<u16> =
-        listeners(&read("tcp"), &read("tcp6")).into_keys().collect();
+    // Ownership by socket inode, checked once per listener.
+    let mut ours: HashMap<u64, bool> = HashMap::new();
+    let mut announced = std::collections::HashSet::new();
     let mut reported = std::collections::HashSet::new();
     loop {
         if let (Ok(own), Some(current)) = (&own, current())
@@ -426,17 +450,23 @@ pub(crate) async fn forward(
             }
             return;
         }
-        let wanted = listeners(&read("tcp"), &read("tcp6"));
+        let mut wanted = listeners(&read("tcp"), &read("tcp6"));
+        ours.retain(|inode, _| wanted.values().any(|(_, i)| i == inode));
+        if let Some(pidns) = owner {
+            wanted.retain(|_, (_, inode)| {
+                *ours.entry(*inode).or_insert_with(|| owned(*inode, pidns))
+            });
+        }
         // Also restart a relay whose target changed (e.g. the IPv4 listener
         // closed and an IPv6 one on the same port remains).
         active.retain(|port, (target, task)| {
-            wanted.get(port) == Some(target) && !task.0.is_finished()
+            wanted.get(port).map(|(t, _)| t) == Some(target) && !task.0.is_finished()
         });
-        for (&port, &target) in &wanted {
+        for (&port, &(target, _)) in &wanted {
             if active.contains_key(&port) {
                 continue;
             }
-            let listener = match bind_shared(ip, port) {
+            let listener = match bind_host(ip, port) {
                 Ok(listener) => listener,
                 Err(err) => {
                     if reported.insert(port) {
@@ -457,8 +487,7 @@ pub(crate) async fn forward(
                     "world: workspace {id}: port {port} is reachable from the host at {ip}:{port}"
                 );
             }
-            let connector = connector.clone();
-            let relays = relays.clone();
+            let (connector, relays) = (connector.clone(), relays.clone());
             let task = tokio::spawn(async move {
                 while let Ok((inbound, _)) = listener.accept().await {
                     let (connector, relays) = (connector.clone(), relays.clone());
@@ -493,9 +522,10 @@ impl Forwarding {
         id: String,
         ip: Ipv4Addr,
         connector: NsConnector,
+        owner: Option<u64>,
         current: Box<dyn Fn() -> Option<u64> + Send>,
     ) -> Self {
-        Self(tokio::spawn(forward(id, ip, connector, current)))
+        Self(tokio::spawn(forward(id, ip, connector, owner, current)))
     }
 }
 
@@ -597,7 +627,8 @@ mod tests {
         let connector = fixture.connector.take().unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let forwarding = Forwarding::start("test".into(), ip, connector, Box::new(|| None));
+            let forwarding =
+                Forwarding::start("test".into(), ip, connector, None, Box::new(|| None));
             assert!(reachable(host, true).await, "not forwarded");
             drop(forwarding);
             assert!(
@@ -618,8 +649,9 @@ mod tests {
         let host = SocketAddr::new(IpAddr::V4(ip), fixture.port);
         let connector = fixture.connector.take().unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let forwarding = runtime
-            .block_on(async { Forwarding::start("test".into(), ip, connector, Box::new(|| None)) });
+        let forwarding = runtime.block_on(async {
+            Forwarding::start("test".into(), ip, connector, None, Box::new(|| None))
+        });
         let _enter = runtime.enter();
         assert!(runtime.block_on(reachable(host, true)));
         // That probe connection was accepted inside; drain it.
@@ -661,13 +693,14 @@ mod tests {
    1: 00000000000000000000000000000000:1F91 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 5 1 0 100 0 0 10 0
 ";
         let found = listeners(v4, v6);
-        assert_eq!(found[&8081], "127.0.0.1:8081".parse().unwrap(), "IPv4 wins");
+        let at = |port: u16| found[&port];
         assert_eq!(
-            found[&8082],
-            "127.0.0.1:8082".parse().unwrap(),
-            "wildcard -> loopback"
+            at(8081),
+            ("127.0.0.1:8081".parse().unwrap(), 1),
+            "IPv4 wins"
         );
+        assert_eq!(at(8082), ("127.0.0.1:8082".parse().unwrap(), 2), "wildcard");
         assert!(!found.contains_key(&8083), "established, not listening");
-        assert_eq!(found[&8084], "[::1]:8084".parse().unwrap());
+        assert_eq!(at(8084), ("[::1]:8084".parse().unwrap(), 4));
     }
 }
