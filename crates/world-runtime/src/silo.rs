@@ -619,7 +619,15 @@ const SHARED_TEMP: [&str; 2] = ["/private/tmp", "/private/var/tmp"];
 const SHARED_TEMP: [&str; 2] = ["/tmp", "/var/tmp"];
 
 fn in_shared_temp(p: &Path) -> bool {
-    SHARED_TEMP.iter().any(|temp| p.starts_with(temp))
+    in_temp_dirs(p, &SHARED_TEMP.map(Path::new))
+}
+
+/// Below one of `dirs`, or below where it really is: on Linux /var/tmp may
+/// be a symlink to another volume, whose directory the workspace's own
+/// /var/tmp is mounted over, and callers compare canonical paths.
+fn in_temp_dirs(p: &Path, dirs: &[&Path]) -> bool {
+    dirs.iter()
+        .any(|dir| p.starts_with(dir) || dir.canonicalize().is_ok_and(|real| p.starts_with(real)))
 }
 
 fn reject_shared_temp(path: &Path, what: &str) -> Result<()> {
@@ -1921,6 +1929,20 @@ mod tests {
         check_root(&root_for(&home, Ipv4Addr::new(127, 77, 0, 1))).unwrap();
         let err = check_root(Path::new("/tmp/h/.world/tmp/127.77.0.1")).unwrap_err();
         assert!(err.to_string().contains("not usable"), "{err}");
+    }
+
+    /// A path below the real directory of a symlinked temp dir counts as
+    /// being in it: that directory is hidden inside the workspace.
+    #[test]
+    fn temp_dirs_include_their_symlink_targets() {
+        let root = workdir();
+        let root = root.path().canonicalize().unwrap();
+        let (volume, link) = (root.join("volume"), root.join("var-tmp"));
+        std::fs::create_dir(&volume).unwrap();
+        std::os::unix::fs::symlink(&volume, &link).unwrap();
+        assert!(in_temp_dirs(&volume.join("project"), &[&link]));
+        assert!(in_temp_dirs(&link.join("project"), &[&link]));
+        assert!(!in_temp_dirs(&root.join("elsewhere"), &[&link]));
     }
 
     /// End to end: a new workspace with a workdir under `/tmp` is refused
