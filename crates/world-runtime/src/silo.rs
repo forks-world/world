@@ -1874,11 +1874,21 @@ async fn linux_exec(
     // the workload runs (see `forward`); not being able to is no reason to
     // fail the workload.
     let forwarding = match crate::forward::NsConnector::start(user_fd, net_fd) {
-        Ok(connector) => Some(crate::forward::Forwarding::start(
-            world.id.clone(),
-            world.ip,
-            connector,
-        )),
+        Ok(connector) => {
+            let (state, id) = (state.to_path_buf(), world.id.clone());
+            let current = move || {
+                read_map::<crate::linux::Holder>(&state, "holders.json")
+                    .ok()?
+                    .get(&id)
+                    .map(|holder| holder.net_ns())
+            };
+            Some(crate::forward::Forwarding::start(
+                world.id.clone(),
+                world.ip,
+                connector,
+                Box::new(current),
+            ))
+        }
         Err(err) => {
             eprintln!(
                 "world: workspace {}: ports are not forwarded to the host: {err:#}",

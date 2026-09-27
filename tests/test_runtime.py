@@ -1563,6 +1563,28 @@ except OSError:
             result = run(PROBE, "get", f"{ip}:{port}")
             self.assertEqual((result.returncode, result.stdout), (0, "Q"), result.stderr)
 
+    def test_a_new_holder_retires_the_old_forwarding(self):
+        # After setup replaces the holder, a workload still running in the
+        # old namespace must not share the port with the new one.
+        work = self.root / "S"
+        work.mkdir()
+        workspace = [WORLD, "workspace", "--state-dir", self.state]
+        self.assertEqual(run(*workspace, "create", "S", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *workspace, "teardown", "S")
+        self.assertEqual(run(*workspace, "setup", "S").returncode, 0)
+        ip = json.loads(run(*workspace, "show", "S").stdout)["ip"]
+        with serving(self.command("S", "serve", "127.0.0.1:0", "OLD")) as (_, port):
+            time.sleep(1.5)
+            self.assertEqual(run(PROBE, "get", f"{ip}:{port}").stdout, "OLD")
+            self.assertEqual(run(*workspace, "teardown", "S").returncode, 0)
+            self.assertEqual(run(*workspace, "setup", "S").returncode, 0)
+            time.sleep(2.5)
+            self.assertNotEqual(run(PROBE, "get", f"{ip}:{port}").stdout, "OLD")
+            with serving(self.command("S", "serve", f"127.0.0.1:{port}", "NEW")):
+                time.sleep(1.5)
+                answers = {run(PROBE, "get", f"{ip}:{port}").stdout for _ in range(20)}
+                self.assertEqual(answers, {"NEW"})
+
     def test_unforwardable_privileged_port_is_reported(self):
         start = int(pathlib.Path("/proc/sys/net/ipv4/ip_unprivileged_port_start").read_text())
         if start <= 80 or os.geteuid() == 0:

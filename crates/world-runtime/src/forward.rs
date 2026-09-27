@@ -78,10 +78,33 @@ impl NsConnector {
         unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) };
         let pid = check(pid).context("start the workspace connector")?;
         drop(theirs);
-        Ok(Self {
+        let connector = Self {
             channel: Mutex::new(Some(ours)),
             pid,
-        })
+        };
+        // It reports once it has joined the namespaces: until then its
+        // /proc view (listeners, namespace identity) is still ours.
+        let mut ready = 0u8;
+        let channel = connector.channel.lock().unwrap_or_else(|e| e.into_inner());
+        let fd = channel.as_ref().map(|c| c.as_raw_fd()).unwrap_or(-1);
+        let n = loop {
+            // SAFETY: a one-byte read into a local.
+            let n = unsafe { libc::recv(fd, (&mut ready as *mut u8).cast(), 1, 0) };
+            if n < 0 && Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break n;
+        };
+        drop(channel);
+        if n != 1 || ready != 0 {
+            return Err(Error::from_raw_os_error(if n == 1 {
+                ready as i32
+            } else {
+                libc::EPIPE
+            }))
+            .context("join the workspace namespaces");
+        }
+        Ok(connector)
     }
 
     /// A new non-blocking, unconnected TCP socket in the workspace's network
@@ -180,7 +203,20 @@ unsafe fn connector(user: RawFd, net: RawFd, parent_end: RawFd, channel: RawFd) 
         // End with the exec that started us, even if it is killed.
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
         libc::prctl(libc::PR_SET_NAME, c"world-connect".as_ptr());
-        if libc::setns(user, libc::CLONE_NEWUSER) < 0 || libc::setns(net, libc::CLONE_NEWNET) < 0 {
+        let joined = libc::setns(user, libc::CLONE_NEWUSER) == 0
+            && libc::setns(net, libc::CLONE_NEWNET) == 0;
+        let status: u8 = if joined {
+            0
+        } else {
+            (*libc::__errno_location()).clamp(1, 255) as u8
+        };
+        libc::send(
+            channel,
+            (&status as *const u8).cast(),
+            1,
+            libc::MSG_NOSIGNAL,
+        );
+        if !joined {
             libc::_exit(1);
         }
         loop {
@@ -345,8 +381,24 @@ async fn relay(
 /// Rescans every second, through the connector: it lives in the
 /// workspace's network namespace exactly as long as this exec, so neither
 /// a torn-down holder nor a reused PID changes what is seen.
-pub(crate) async fn forward(id: String, ip: Ipv4Addr, connector: NsConnector) {
+///
+/// `current` reports the network namespace (inode) of the workspace's
+/// current holder, if any. Once a different one is current (setup replaced
+/// the holder while this workload still runs in the old namespace), this
+/// forwarding retires: its SO_REUSEPORT listeners would otherwise share the
+/// workspace's ports with the new namespace's and split connections
+/// between them. With no holder at all (a plain teardown) it goes on.
+pub(crate) async fn forward(
+    id: String,
+    ip: Ipv4Addr,
+    connector: NsConnector,
+    current: Box<dyn Fn() -> Option<u64> + Send>,
+) {
     let pid = connector.pid;
+    let own = std::fs::metadata(format!("/proc/{pid}/ns/net")).map(|m| {
+        use std::os::unix::fs::MetadataExt;
+        m.ino()
+    });
     let connector = Arc::new(connector);
     // Dropped with this future (on `Forwarding` drop): every per-port task
     // stops with it, and with each its relays.
@@ -359,6 +411,16 @@ pub(crate) async fn forward(id: String, ip: Ipv4Addr, connector: NsConnector) {
         listeners(&read("tcp"), &read("tcp6")).into_keys().collect();
     let mut reported = std::collections::HashSet::new();
     loop {
+        if let (Ok(own), Some(current)) = (&own, current())
+            && current != *own
+        {
+            if !active.is_empty() {
+                eprintln!(
+                    "world: workspace {id} was set up again; this workload's ports are no longer forwarded to the host"
+                );
+            }
+            return;
+        }
         let wanted = listeners(&read("tcp"), &read("tcp6"));
         // Also restart a relay whose target changed (e.g. the IPv4 listener
         // closed and an IPv6 one on the same port remains).
@@ -418,8 +480,13 @@ impl Drop for AbortOnDrop {
 pub(crate) struct Forwarding(tokio::task::JoinHandle<()>);
 
 impl Forwarding {
-    pub(crate) fn start(id: String, ip: Ipv4Addr, connector: NsConnector) -> Self {
-        Self(tokio::spawn(forward(id, ip, connector)))
+    pub(crate) fn start(
+        id: String,
+        ip: Ipv4Addr,
+        connector: NsConnector,
+        current: Box<dyn Fn() -> Option<u64> + Send>,
+    ) -> Self {
+        Self(tokio::spawn(forward(id, ip, connector, current)))
     }
 }
 
@@ -477,7 +544,7 @@ mod tests {
         let host = SocketAddr::new(IpAddr::V4(ip), port);
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let forwarding = Forwarding::start("test".into(), ip, connector);
+            let forwarding = Forwarding::start("test".into(), ip, connector, Box::new(|| None));
             let mut reached = false;
             for _ in 0..50 {
                 if tokio::net::TcpStream::connect(host).await.is_ok() {

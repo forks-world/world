@@ -2155,6 +2155,11 @@ impl Holder {
         Ok(live_start_time(pid)? == Some(started))
     }
 
+    /// The inode of the network namespace this holder keeps.
+    pub(crate) fn net_ns(&self) -> u64 {
+        self.net_ns
+    }
+
     /// Whether this holder predates the private /tmp: joining it would run
     /// the workload against the host /tmp.
     pub(crate) fn legacy(&self) -> bool {
