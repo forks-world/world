@@ -507,18 +507,25 @@ fn create_in(
         }
         return Ok(world);
     }
+    let home = home()?;
     let used: std::collections::HashSet<_> = worlds.values().map(|w| w.ip).collect();
     let ip = (1..=65534u32)
         .map(|n| Ipv4Addr::new(127, 77, (n >> 8) as u8, n as u8))
         // On Linux the address only identifies the workspace; its namespace
         // provides localhost, and all of 127/8 is always bindable.
-        .find(|ip| !used.contains(ip) && (cfg!(target_os = "linux") || !alias_ready(*ip)))
+        .filter(|ip| !used.contains(ip) && (cfg!(target_os = "linux") || !alias_ready(*ip)))
+        // Temp roots are keyed by address under HOME, which other registries
+        // (another --state-dir) share: skip addresses whose root exists.
+        .find(|ip| root_for(&home, *ip).symlink_metadata().is_err())
         .context("workspace address pool exhausted")?;
+    let temp_root = new_root(&home, ip)?;
+    // Claim the root now, so another registry under this HOME skips it.
+    temp_root_in(&home, ip)?;
     let world = World {
         id: id.into(),
         ip,
         workdir,
-        temp_root: Some(new_root(&home()?, ip)?),
+        temp_root: Some(temp_root),
     };
     worlds.insert(id.into(), world.clone());
     save(state, &worlds)?;
@@ -1943,6 +1950,18 @@ mod tests {
         assert!(in_temp_dirs(&volume.join("project"), &[&link]));
         assert!(in_temp_dirs(&link.join("project"), &[&link]));
         assert!(!in_temp_dirs(&root.join("elsewhere"), &[&link]));
+    }
+
+    /// Registries sharing a HOME (different --state-dir) must not hand out
+    /// the same temp root: an address whose root exists is skipped.
+    #[test]
+    fn registries_sharing_a_home_get_distinct_temp_roots() {
+        let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (work, home) = (workdir(), workdir());
+        let a = create_at(first.path(), "A", work.path(), home.path()).unwrap();
+        let b = create_at(second.path(), "A", work.path(), home.path()).unwrap();
+        assert_ne!(a.temp_root, b.temp_root);
+        assert!(a.temp_root.unwrap().is_dir());
     }
 
     /// End to end: a new workspace with a workdir under `/tmp` is refused
