@@ -2084,9 +2084,9 @@ impl Holder {
 
     /// Reap the pasta monitor after the holder died, if this process adopted
     /// it (a child subreaper); like `reap_if_child`, only through a pidfd
-    /// pinned to the recorded identity. `block` waits for it to exit (it
-    /// does as soon as the holder is gone).
-    pub(crate) fn reap_monitor(&self, block: bool) {
+    /// pinned to the recorded identity. Waits for it to exit, which it does
+    /// as soon as the holder is gone.
+    pub(crate) fn reap_monitor(&self) {
         let Some((pid, started)) = self.monitor else {
             return;
         };
@@ -2096,24 +2096,7 @@ impl Holder {
         if start_time(pid).ok() != Some(started) {
             return;
         }
-        if block {
-            reap_if_child(Some(&pidfd));
-            return;
-        }
-        const P_PIDFD: libc::idtype_t = 3;
-        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-        let id = pidfd.as_raw_fd() as libc::id_t;
-        // SAFETY: info is a live siginfo_t; the pidfd is open.
-        while unsafe {
-            libc::waitid(
-                P_PIDFD,
-                id,
-                info.as_mut_ptr(),
-                libc::WEXITED | libc::WNOHANG,
-            )
-        } < 0
-            && Error::last_os_error().raw_os_error() == Some(libc::EINTR)
-        {}
+        reap_if_child(Some(&pidfd));
     }
 
     /// The holder's pasta monitor, found among its children.
@@ -2516,8 +2499,10 @@ fn reap_if_child(pidfd: Option<&OwnedFd>) {
 /// the identity before waitid(P_PIDFD) reaps it without blocking. A
 /// reused PID fails the start-time check and nothing is reaped.
 pub(crate) fn reap_stale_holder(holder: &Holder) {
-    // Its monitor exited when it died: a zombie of ours if we adopted it.
-    holder.reap_monitor(false);
+    // Its monitor exits as soon as it died (it may still be ending pasta):
+    // if we adopted it, wait for it, or its identity is lost with this
+    // record. Not our child: ECHILD at once.
+    holder.reap_monitor();
     let Ok(pidfd) = open_pidfd(holder.pid as libc::pid_t) else {
         return;
     };
@@ -2594,7 +2579,7 @@ impl StartedHolder {
         };
         check(result)?;
         reap_if_child(self.pidfd.as_ref());
-        self.holder.reap_monitor(true);
+        self.holder.reap_monitor();
         Ok(())
     }
 }
@@ -2614,7 +2599,7 @@ pub(crate) fn stop_holder(holder: &Holder) -> Result<()> {
             // SAFETY: kill takes plain integers.
             check(unsafe { libc::kill(holder.pid as libc::pid_t, libc::SIGKILL) })?;
             reap_if_child(None);
-            holder.reap_monitor(true);
+            holder.reap_monitor();
             return Ok(());
         }
     };
@@ -2633,7 +2618,7 @@ pub(crate) fn stop_holder(holder: &Holder) -> Result<()> {
         return Err(Error::last_os_error()).context("stop holder");
     }
     reap_if_child(Some(&pidfd));
-    holder.reap_monitor(true);
+    holder.reap_monitor();
     Ok(())
 }
 
