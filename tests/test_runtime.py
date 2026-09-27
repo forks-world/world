@@ -1438,13 +1438,25 @@ except OSError:
             pasta = pathlib.Path(f"/proc/{monitor[0]}/task/{monitor[0]}/children").read_text().split()
             return holder, int(monitor[0]), int(pasta[0])
 
-        # A pasta that cannot connect (like an offline host) leaves the
-        # workspace usable with loopback only; setup connects it later.
+        # A pasta that never connects (like an offline host, here one that
+        # hangs until the holder gives up) leaves the workspace usable with
+        # loopback only; setup connects it later.
         self.assertEqual(run(*workspace, "teardown", "N").returncode, 0)
-        result = run(*workspace, "setup", "N", env=dict(os.environ, WORLD_PASTA="/bin/false"))
+        hanging = self.root / "hanging-pasta"
+        hanging.write_text("#!/bin/sh\nexec sleep 60\n")
+        hanging.chmod(0o755)
+        result = run(*workspace, "setup", "N", env=dict(os.environ, WORLD_PASTA=str(hanging)))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("loopback only", result.stderr)
         self.assertEqual(self.in_workspace("N", routes).stdout, "0\n")
+        # The abandoned monitor is reaped, not left as a zombie.
+        holder = json.loads((self.state / "holders.json").read_text())["N"]["pid"]
+        for _ in range(50):
+            if not pathlib.Path(f"/proc/{holder}/task/{holder}/children").read_text().split():
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("the holder kept a child after dropping pasta")
         result = run(*workspace, "setup", "N")
         self.assertIn("outbound network", result.stderr)
         self.assertNotEqual(self.in_workspace("N", routes).stdout, "0\n")

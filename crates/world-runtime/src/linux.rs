@@ -2587,6 +2587,11 @@ unsafe fn hold(keep: Option<RawFd>) -> ! {
         if closed.is_err() {
             libc::_exit(125);
         }
+        // The pasta monitor is the only child. It exits when pasta cannot
+        // start or dies (setup then restarts the workspace): reap it now
+        // if it already has, and let the kernel reap it when it does.
+        libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+        while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {}
         loop {
             libc::pause();
         }
