@@ -1870,7 +1870,26 @@ async fn linux_exec(
         stdin,
         setup: Box::new(setup),
     })?);
+    // The host reaches the workspace's listeners at its own address while
+    // the workload runs (see `forward`); not being able to is no reason to
+    // fail the workload.
+    let forwarding = match crate::forward::NsConnector::start(user_fd, net_fd) {
+        Ok(connector) => Some(crate::forward::Forwarding::start(
+            world.id.clone(),
+            holder.pid,
+            world.ip,
+            connector,
+        )),
+        Err(err) => {
+            eprintln!(
+                "world: workspace {}: ports are not forwarded to the host: {err:#}",
+                world.id
+            );
+            None
+        }
+    };
     let result = run::wait(workload, deadline, cancel, &mut None, None).await;
+    drop(forwarding);
     drop((user, mnt, net));
     result
 }

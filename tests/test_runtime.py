@@ -1510,6 +1510,41 @@ except OSError:
             else:
                 self.fail(f"{pid} still running after teardown")
 
+    def test_host_reaches_workspace_listeners_at_their_address(self):
+        ips = {}
+        for name in ["A", "B"]:
+            result = run(WORLD, "workspace", "--state-dir", self.state, "show", name)
+            ips[name] = json.loads(result.stdout)["ip"]
+
+        def fetch(address, expected):
+            # The forwarder rescans the workspace's listeners every second.
+            for _ in range(50):
+                result = run(PROBE, "get", address)
+                if result.returncode == 0 and result.stdout == expected:
+                    return True
+                time.sleep(0.1)
+            return False
+
+        with serving(self.command("A", "serve", "127.0.0.1:0", "A")) as (_, port):
+            with serving(self.command("B", "serve", f"127.0.0.1:{port}", "B")):
+                for name, ip in ips.items():
+                    self.assertTrue(fetch(f"{ip}:{port}", name), name)
+                # Another exec of A forwards the same port alongside.
+                other = subprocess.Popen([str(x) for x in self.command("A")[:-1] + ["/bin/sleep", "3"]],
+                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+                time.sleep(1.5)
+                for _ in range(10):
+                    result = run(PROBE, "get", f"{ips['A']}:{port}")
+                    self.assertEqual((result.returncode, result.stdout), (0, "A"), result.stderr)
+                other.wait(timeout=10)
+                self.assertTrue(fetch(f"{ips['A']}:{port}", "A"))
+                # Host localhost is not the workspace's.
+                self.assertNotIn(run(PROBE, "get", f"127.0.0.1:{port}").stdout, ["A", "B"])
+        # Once the server's exec ends, nothing is forwarded any more.
+        result = run(PROBE, "get", f"{ips['A']}:{port}")
+        self.assertNotEqual(result.returncode, 0)
+
     def test_workspace_rejects_tmp_workdir(self):
         for workdir in ["/tmp", "/var/tmp"]:
             result = run(WORLD, "workspace", "--state-dir", self.state, "create", "T", "--workdir", workdir)
