@@ -74,7 +74,7 @@ pub fn default_state_dir() -> Result<PathBuf> {
 fn default_state_dir_in(home: &Path) -> Result<PathBuf> {
     let base = home.join(".local/share/world");
     let (new, old) = (base.join("workspaces"), base.join("silo"));
-    if pending(&old, &new) == (false, false) {
+    if pending(&old, &new) == (false, false) && !pending_id(&old, &new, false) {
         return Ok(new);
     }
     let _new_lock = lock(&new)?;
@@ -109,6 +109,19 @@ fn default_state_dir_in(home: &Path) -> Result<PathBuf> {
             old.display(),
             new.display()
         );
+    }
+    // The registry's identity (see `registry_id`) must travel with it: left
+    // behind, the moved registry would get a new one while a fresh registry
+    // at `old` inherited the old one, and with it the moved one's temp roots.
+    if pending_id(&old, &new, move_registry) {
+        std::fs::rename(old.join("registry-id"), new.join("registry-id")).with_context(|| {
+            format!(
+                "moving workspace registry id from {} to {}",
+                old.display(),
+                new.display()
+            )
+        })?;
+        File::open(&new)?.sync_all()?;
     }
     // Linux also keeps live holder records (`holders.json`) alongside the
     // registry; move them too so upgrading doesn't orphan a running
@@ -156,6 +169,16 @@ fn is_file(p: &Path) -> bool {
 /// moving them alongside a registry `new` already had of its own -- a
 /// different registry that happens to occupy `new` -- could pair a holder
 /// record with the wrong workspace.
+/// Whether `old`'s `registry-id` still needs moving into `new`, under the
+/// same rule as `holders.json`: only with its own registry (`moving` now, or
+/// already moved by an earlier, possibly interrupted run).
+fn pending_id(old: &Path, new: &Path, moving: bool) -> bool {
+    trusted_old(old)
+        && is_file(&old.join("registry-id"))
+        && new.join("registry-id").symlink_metadata().is_err()
+        && (moving || old.join("registry.json").symlink_metadata().is_err())
+}
+
 fn pending(old: &Path, new: &Path) -> (bool, bool) {
     if !trusted_old(old) {
         return (false, false);
@@ -226,6 +249,29 @@ mod state_dir_tests {
         assert!(!old.join("registry.json").exists());
         assert!(!old.join("holders.json").exists());
         assert_eq!(std::fs::read(new.join("holders.json")).unwrap(), b"{}\n");
+    }
+
+    #[test]
+    fn migrates_the_registry_id_alongside_the_registry() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        let old = write_old_registry(&home, work.path());
+        std::fs::write(old.join("registry-id"), b"\"id\"\n").unwrap();
+        let new = default_state_dir_in(&home).unwrap();
+        assert!(!old.join("registry-id").exists());
+        assert_eq!(std::fs::read(new.join("registry-id")).unwrap(), b"\"id\"\n");
+    }
+
+    #[test]
+    fn resumes_an_interrupted_registry_id_migration() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        let old = write_old_registry(&home, work.path());
+        let new = default_state_dir_in(&home).unwrap();
+        // As if the id had been left behind by an interrupted run.
+        std::fs::write(old.join("registry-id"), b"\"id\"\n").unwrap();
+        default_state_dir_in(&home).unwrap();
+        assert_eq!(std::fs::read(new.join("registry-id")).unwrap(), b"\"id\"\n");
     }
 
     #[test]
