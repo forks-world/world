@@ -13,7 +13,7 @@ use std::{
     io::Write,
     net::{Ipv4Addr, SocketAddrV4, TcpListener},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    os::unix::ffi::OsStrExt,
+    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -74,7 +74,7 @@ pub fn default_state_dir() -> Result<PathBuf> {
 fn default_state_dir_in(home: &Path) -> Result<PathBuf> {
     let base = home.join(".local/share/world");
     let (new, old) = (base.join("workspaces"), base.join("silo"));
-    if pending(&old, &new) == (false, false) {
+    if pending(&old, &new) == (false, false) && !pending_id(&old, &new, false) {
         return Ok(new);
     }
     let _new_lock = lock(&new)?;
@@ -93,6 +93,22 @@ fn default_state_dir_in(home: &Path) -> Result<PathBuf> {
     // Re-check under both locks: another process may have raced us to the
     // migration, or created a fresh registry at `new`, since the check above.
     let (move_registry, move_holders) = pending(&old, &new);
+    // The registry's identity (see `registry_id`) must travel with it: left
+    // behind, the moved registry would get a new one while a fresh registry
+    // at `old` inherited the old one, and with it the moved one's temp roots.
+    // Moved first: interrupted before the registry follows, the next run
+    // still moves the registry (and no identity is left to pair wrongly);
+    // the other way round, a remnant id in `new` would stick to it.
+    if pending_id(&old, &new, move_registry) {
+        std::fs::rename(old.join("registry-id"), new.join("registry-id")).with_context(|| {
+            format!(
+                "moving workspace registry id from {} to {}",
+                old.display(),
+                new.display()
+            )
+        })?;
+        File::open(&new)?.sync_all()?;
+    }
     if move_registry {
         std::fs::rename(old.join("registry.json"), new.join("registry.json")).with_context(
             || {
@@ -156,6 +172,21 @@ fn is_file(p: &Path) -> bool {
 /// moving them alongside a registry `new` already had of its own -- a
 /// different registry that happens to occupy `new` -- could pair a holder
 /// record with the wrong workspace.
+/// Whether `old`'s `registry-id` still needs moving into `new`, under the
+/// same rule as `holders.json`: only with its own registry (`moving` now, or
+/// already moved by an earlier, possibly interrupted run).
+///
+/// A `registry-id` already in `new` without a `registry.json` there (a
+/// creation that failed after persisting its id) owns no recorded entry,
+/// so it is replaced when the registry moves in now.
+fn pending_id(old: &Path, new: &Path, moving: bool) -> bool {
+    trusted_old(old)
+        && is_file(&old.join("registry-id"))
+        && (moving
+            || (new.join("registry-id").symlink_metadata().is_err()
+                && old.join("registry.json").symlink_metadata().is_err()))
+}
+
 fn pending(old: &Path, new: &Path) -> (bool, bool) {
     if !trusted_old(old) {
         return (false, false);
@@ -226,6 +257,66 @@ mod state_dir_tests {
         assert!(!old.join("registry.json").exists());
         assert!(!old.join("holders.json").exists());
         assert_eq!(std::fs::read(new.join("holders.json")).unwrap(), b"{}\n");
+    }
+
+    #[test]
+    fn migrates_the_registry_id_alongside_the_registry() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        let old = write_old_registry(&home, work.path());
+        std::fs::write(old.join("registry-id"), b"\"id\"\n").unwrap();
+        let new = default_state_dir_in(&home).unwrap();
+        assert!(!old.join("registry-id").exists());
+        assert_eq!(std::fs::read(new.join("registry-id")).unwrap(), b"\"id\"\n");
+    }
+
+    #[test]
+    fn migrating_the_registry_replaces_a_remnant_id() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        let old = write_old_registry(&home, work.path());
+        std::fs::write(old.join("registry-id"), b"\"old\"\n").unwrap();
+        let new = new_dir(&home);
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("registry-id"), b"\"remnant\"\n").unwrap();
+        default_state_dir_in(&home).unwrap();
+        assert!(new.join("registry.json").exists());
+        assert_eq!(
+            std::fs::read(new.join("registry-id")).unwrap(),
+            b"\"old\"\n"
+        );
+        assert!(!old.join("registry-id").exists());
+    }
+
+    /// Interrupted after the id moved but before the registry did: the
+    /// next run moves the registry to its own identity.
+    #[test]
+    fn resumes_after_the_id_moved_ahead_of_the_registry() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        let old = write_old_registry(&home, work.path());
+        let new = new_dir(&home);
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("registry-id"), b"\"old\"\n").unwrap();
+        default_state_dir_in(&home).unwrap();
+        assert!(new.join("registry.json").exists());
+        assert!(!old.join("registry.json").exists());
+        assert_eq!(
+            std::fs::read(new.join("registry-id")).unwrap(),
+            b"\"old\"\n"
+        );
+    }
+
+    #[test]
+    fn resumes_an_interrupted_registry_id_migration() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        let old = write_old_registry(&home, work.path());
+        let new = default_state_dir_in(&home).unwrap();
+        // As if the id had been left behind by an interrupted run.
+        std::fs::write(old.join("registry-id"), b"\"id\"\n").unwrap();
+        default_state_dir_in(&home).unwrap();
+        assert_eq!(std::fs::read(new.join("registry-id")).unwrap(), b"\"id\"\n");
     }
 
     #[test]
@@ -497,8 +588,8 @@ fn create_in(
         }
         // Never recompute a stored root from the current process's HOME:
         // only a legacy entry (predating this field) still has none.
-        if cfg!(target_os = "macos") && world.temp_root.is_none() {
-            world.temp_root = Some(new_root(&home()?, world.ip)?);
+        if world.temp_root.is_none() {
+            fill_temp_root(&mut world, &worlds, &home()?, &root_owner(state, id)?)?;
             dirty = true;
         }
         if dirty {
@@ -507,27 +598,171 @@ fn create_in(
         }
         return Ok(world);
     }
-    let used: std::collections::HashSet<_> = worlds.values().map(|w| w.ip).collect();
-    let ip = (1..=65534u32)
-        .map(|n| Ipv4Addr::new(127, 77, (n >> 8) as u8, n as u8))
-        // On Linux the address only identifies the workspace; its namespace
-        // provides localhost, and all of 127/8 is always bindable.
-        .find(|ip| !used.contains(ip) && (cfg!(target_os = "linux") || !alias_ready(*ip)))
-        .context("workspace address pool exhausted")?;
+    let (ip, temp_root) = allocate(&worlds, &home()?, &root_owner(state, id)?)?;
     let world = World {
         id: id.into(),
         ip,
         workdir,
-        // Only macOS redirects /tmp; Linux records no temp root.
-        temp_root: if cfg!(target_os = "macos") {
-            Some(new_root(&home()?, ip)?)
-        } else {
-            None
-        },
+        temp_root: Some(temp_root),
     };
     worlds.insert(id.into(), world.clone());
     save(state, &worlds)?;
     Ok(world)
+}
+
+/// Marker in a temp root naming the registry entry that owns it.
+const ROOT_OWNER: &str = "owner";
+
+/// A random identity for the registry in `state`, created on first use and
+/// kept in the directory: unlike its path, it moves with the registry and
+/// is never inherited by a new registry created where an old one was.
+/// Callers hold the registry lock.
+fn registry_id(state: &Path) -> Result<String> {
+    match File::open(state.join("registry-id")) {
+        Ok(file) => {
+            let id: String = serde_json::from_reader(file).context("read registry-id")?;
+            ensure!(
+                id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+                "invalid registry-id"
+            );
+            return Ok(id);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("read registry-id"),
+    }
+    let bytes: [u8; 16] = rand::random();
+    let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    persist(state, "registry-id", &id)?;
+    Ok(id)
+}
+
+/// Identity of a registry entry, as recorded in the temp root it owns.
+fn root_owner(state: &Path, id: &str) -> Result<Vec<u8>> {
+    let mut owner = registry_id(state)?.into_bytes();
+    owner.push(b'\n');
+    owner.extend_from_slice(id.as_bytes());
+    owner.push(b'\n');
+    Ok(owner)
+}
+
+/// Claim `ip`'s temp root under `home` for `owner`. Temp roots are keyed by
+/// address under HOME, which registries with another `--state-dir` share,
+/// so the owner marker is created exclusively: of concurrent claimants
+/// only one wins. `None` when another owner holds the root, including one
+/// created before markers existed.
+fn claim_root(home: &Path, ip: Ipv4Addr, owner: &[u8]) -> Result<Option<PathBuf>> {
+    let root = new_root(home, ip)?;
+    let marker = root.join(ROOT_OWNER);
+    if root.symlink_metadata().is_ok() && marker.symlink_metadata().is_err() {
+        return Ok(None);
+    }
+    temp_root_in(home, ip)?;
+    Ok(mark_root(&root, owner)?.then_some(root))
+}
+
+/// Create `root`'s owner marker exclusively, or check the existing one:
+/// whether `owner` holds the root.
+fn mark_root(root: &Path, owner: &[u8]) -> Result<bool> {
+    let marker = root.join(ROOT_OWNER);
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&marker)
+    {
+        Ok(mut file) => {
+            file.write_all(owner)?;
+            file.sync_all()?;
+            Ok(true)
+        }
+        // A claimant still writing its marker reads as someone else's.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(std::fs::read(&marker)? == owner)
+        }
+        Err(e) => Err(e).context("claim workspace temp root"),
+    }
+}
+
+/// The recorded temp root of `world`, checked to still belong to it, with
+/// the entry as currently recorded. A root can be deleted and then claimed
+/// by another registry under the same HOME; reusing it would share /tmp
+/// with that workspace, so the workspace moves to a fresh address and root
+/// instead. A root without a marker (rebuilt after deletion, or created
+/// before markers existed) is claimed on the spot.
+pub fn owned_temp_root(state: &Path, world: &World) -> Result<(World, PathBuf)> {
+    let _lock = lock(state)?;
+    let mut worlds = registry(state)?;
+    let mut stored = worlds
+        .get(&world.id)
+        .cloned()
+        .context("unknown workspace; run world workspace create first")?;
+    valid(&stored, &world.id)?;
+    let root = temp_root(&stored)?;
+    let owner = root_owner(state, &stored.id)?;
+    if mark_root(&root, &owner)? {
+        return Ok((stored, root));
+    }
+    let home = root
+        .ancestors()
+        .nth(3)
+        .context("workspace temp root is too shallow")?
+        .to_path_buf();
+    let (ip, _) = allocate(&worlds, &home, &owner)?;
+    eprintln!(
+        "world: workspace {} moved from address {} to {}: its temp directory now belongs to another workspace; run world workspace setup {} again",
+        stored.id, stored.ip, ip, stored.id
+    );
+    stored.ip = ip;
+    stored.temp_root = Some(root_for(&home, ip));
+    worlds.insert(stored.id.clone(), stored.clone());
+    save(state, &worlds)?;
+    let root = temp_root(&stored)?;
+    Ok((stored, root))
+}
+
+/// A free address, with its temp root claimed for `owner`.
+fn allocate(
+    worlds: &BTreeMap<String, World>,
+    home: &Path,
+    owner: &[u8],
+) -> Result<(Ipv4Addr, PathBuf)> {
+    let used: std::collections::HashSet<_> = worlds.values().map(|w| w.ip).collect();
+    for n in 1..=65534u32 {
+        let ip = Ipv4Addr::new(127, 77, (n >> 8) as u8, n as u8);
+        // On Linux the address only identifies the workspace; its namespace
+        // provides localhost, and all of 127/8 is always bindable.
+        if used.contains(&ip) || (cfg!(not(target_os = "linux")) && alias_ready(ip)) {
+            continue;
+        }
+        if let Some(root) = claim_root(home, ip, owner)? {
+            return Ok((ip, root));
+        }
+    }
+    bail!("workspace address pool exhausted")
+}
+
+/// Give a legacy entry (predating `temp_root`) its temp root. Its address
+/// may already own a root claimed by another registry under this HOME
+/// (every registry starts at the same address); then it moves to a free
+/// one, as the address only identifies it on Linux.
+fn fill_temp_root(
+    world: &mut World,
+    worlds: &BTreeMap<String, World>,
+    home: &Path,
+    owner: &[u8],
+) -> Result<()> {
+    if let Some(root) = claim_root(home, world.ip, owner)? {
+        world.temp_root = Some(root);
+        return Ok(());
+    }
+    let (ip, root) = allocate(worlds, home, owner)?;
+    eprintln!(
+        "world: workspace {} moved from address {} to {}: another workspace under this HOME uses its temp directory; run world workspace setup {} again",
+        world.id, world.ip, ip, world.id
+    );
+    world.ip = ip;
+    world.temp_root = Some(root);
+    Ok(())
 }
 
 /// Take the exclusive registry lock, creating `state` first if needed. The
@@ -596,7 +831,7 @@ fn get_in(state: &Path, id: &str, home: impl FnOnce() -> Result<PathBuf>) -> Res
         .remove(id)
         .context("unknown workspace; run world workspace create first")?;
     valid(&world, id)?;
-    if !cfg!(target_os = "macos") || world.temp_root.is_some() {
+    if world.temp_root.is_some() {
         return Ok(world);
     }
     // Legacy entry: fill in the temp root under lock, re-reading first in
@@ -607,19 +842,32 @@ fn get_in(state: &Path, id: &str, home: impl FnOnce() -> Result<PathBuf>) -> Res
         .remove(id)
         .context("unknown workspace; run world workspace create first")?;
     valid(&stored, id)?;
-    if cfg!(target_os = "macos") && stored.temp_root.is_none() {
-        stored.temp_root = Some(new_root(&home()?, stored.ip)?);
+    if stored.temp_root.is_none() {
+        fill_temp_root(&mut stored, &worlds, &home()?, &root_owner(state, id)?)?;
         worlds.insert(id.into(), stored.clone());
         save(state, &worlds)?;
     }
     Ok(stored)
 }
 
-/// Host temp directories every process shares; `world exec` redirects them.
+/// Host temp directories every process shares, as canonical paths; `world
+/// exec` replaces them with the workspace's own (macOS: redirected by the
+/// shim; Linux: bind-mounted in the workspace mount namespace).
+#[cfg(target_os = "macos")]
 const SHARED_TEMP: [&str; 2] = ["/private/tmp", "/private/var/tmp"];
+#[cfg(not(target_os = "macos"))]
+const SHARED_TEMP: [&str; 2] = ["/tmp", "/var/tmp"];
 
 fn in_shared_temp(p: &Path) -> bool {
-    SHARED_TEMP.iter().any(|temp| p.starts_with(temp))
+    in_temp_dirs(p, &SHARED_TEMP.map(Path::new))
+}
+
+/// Below one of `dirs`, or below where it really is: on Linux /var/tmp may
+/// be a symlink to another volume, whose directory the workspace's own
+/// /var/tmp is mounted over, and callers compare canonical paths.
+fn in_temp_dirs(p: &Path, dirs: &[&Path]) -> bool {
+    dirs.iter()
+        .any(|dir| p.starts_with(dir) || dir.canonicalize().is_ok_and(|real| p.starts_with(real)))
 }
 
 fn reject_shared_temp(path: &Path, what: &str) -> Result<()> {
@@ -631,29 +879,23 @@ fn reject_shared_temp(path: &Path, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Only macOS redirects host temp dirs, so only there is a workdir under
-/// them unusable; Linux runs such a workdir normally.
+/// A workdir under a host temp dir would be hidden by the workspace's own.
 fn check_workdir(dir: &Path) -> Result<()> {
-    if cfg!(target_os = "macos") {
-        reject_shared_temp(dir, "workdir")
-    } else {
-        Ok(())
-    }
+    reject_shared_temp(dir, "workdir")
 }
 
-/// A recorded workdir `world exec` now refuses (legacy macOS /tmp layout).
+/// A recorded workdir `world exec` now refuses (legacy /tmp layout).
 ///
-/// Old builds of `world workspace create` accepted a workdir straight under
-/// `/tmp` or `/var/tmp` (before symlink resolution made that `/private/tmp`
-/// or `/private/var/tmp`, which `reject_shared_temp` already rejects for new
-/// entries). After a reboot macOS also clears `/tmp`, so the directory may no
+/// Old builds of `world workspace create` accepted a workdir under `/tmp` or
+/// `/var/tmp` (on macOS before symlink resolution made that `/private/tmp`
+/// or `/private/var/tmp`; on Linux before workspaces had their own /tmp).
+/// After a reboot `/tmp` may also have been cleared, so the directory may no
 /// longer even exist -- `canonicalize` then fails and the raw-prefix checks
 /// below are what catch it.
 fn stale_workdir(stored: &Path) -> bool {
-    cfg!(target_os = "macos")
-        && (in_shared_temp(stored)
-            || ["/tmp", "/var/tmp"].iter().any(|t| stored.starts_with(t))
-            || stored.canonicalize().is_ok_and(|p| in_shared_temp(&p)))
+    in_shared_temp(stored)
+        || ["/tmp", "/var/tmp"].iter().any(|t| stored.starts_with(t))
+        || stored.canonicalize().is_ok_and(|p| in_shared_temp(&p))
 }
 
 /// Canonical `HOME` of the process running `world`, rejecting one below a
@@ -682,8 +924,26 @@ fn root_for(home: &Path, ip: Ipv4Addr) -> PathBuf {
 /// already recorded is read back, so a root that was valid when written but
 /// would no longer pass (e.g. after this limit was tightened) is refused
 /// rather than silently trusted.
+///
+/// Linux bind-mounts the root at /tmp instead of rewriting paths, so only
+/// the shape rules apply there, not the shim's length cap.
 fn check_root(root: &Path) -> Result<()> {
     let b = root.as_os_str().as_bytes();
+    if cfg!(not(target_os = "macos")) {
+        let normalized = root.is_absolute()
+            && !root.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            });
+        ensure!(
+            normalized && !in_shared_temp(root),
+            "workspace temp root {} is not usable: it must be absolute, normalized and outside host temp directories",
+            root.display()
+        );
+        return Ok(());
+    }
     if b.len() > world_tmp_path::MAX_ROOT_LEN {
         bail!(
             "workspace temp root {} is {} bytes; it must be at most {} bytes (use a shorter HOME)",
@@ -1362,18 +1622,38 @@ fn holder(state: &Path, id: &str) -> Result<crate::linux::Holder> {
 /// holding the workspace network namespace; no privilege is required.
 pub fn setup(state: &Path, world: &World) -> Result<()> {
     supported()?;
+    let (world, root) = owned_temp_root(state, world)?;
+    let world = &world;
     #[cfg(target_os = "linux")]
     {
+        let temp = crate::linux::PrivateTemp::new(&root)?;
         let _lock = lock(state)?;
         let mut holders = read_map::<crate::linux::Holder>(state, "holders.json")?;
         if let Some(holder) = holders.get(&world.id) {
             // A transient verification error must not orphan a live holder.
             if holder.verify()?.is_some() {
-                return Ok(());
+                if holder.legacy() {
+                    // Started before workspaces had a private /tmp.
+                    eprintln!(
+                        "world: restarting workspace {} to give it a private /tmp; processes already running keep the old namespace",
+                        world.id
+                    );
+                } else if holder.temp_is(&root) {
+                    return Ok(());
+                } else {
+                    // Its temp root was deleted, or the workspace moved to
+                    // a new one (see `owned_temp_root`).
+                    eprintln!(
+                        "world: restarting workspace {} because its temp directory changed; processes already running keep the old namespace",
+                        world.id
+                    );
+                }
+                crate::linux::stop_holder(holder)?;
+            } else {
+                crate::linux::reap_stale_holder(holder);
             }
-            crate::linux::reap_stale_holder(holder);
         }
-        let started = crate::linux::start_holder()?;
+        let started = crate::linux::start_holder(&temp)?;
         holders.insert(world.id.clone(), started.holder);
         if let Err(err) = persist(state, "holders.json", &holders) {
             // An unrecorded holder could never be torn down or reused.
@@ -1390,7 +1670,7 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = state;
+        let _ = (state, root);
         if alias_ready(world.ip) {
             return Ok(());
         }
@@ -1455,8 +1735,7 @@ pub async fn exec(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = state;
-        macos_exec(world, command, duration, cancel).await
+        macos_exec(state, world, command, duration, cancel).await
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -1477,31 +1756,61 @@ async fn linux_exec(
 ) -> Result<i32> {
     use std::os::fd::AsRawFd;
     let deadline = Instant::now() + duration;
-    let dir = run::workdir(&world.workdir)?;
+    let dir = exec_workdir(&world)?;
     // The checked descriptor itself, never whatever fd 0 is at spawn: a
     // host socket swapped in by another thread would cross into the World.
     let stdin = run::pin_stdin_with(false)?;
-    let (user, net) = holder(state, &world.id)?.open().with_context(|| {
+    let holder = holder(state, &world.id)?;
+    if holder.legacy() {
+        bail!(
+            "workspace {} was set up before it had a private /tmp; run world workspace setup {} again",
+            world.id,
+            world.id
+        );
+    }
+    let root = world
+        .temp_root
+        .as_ref()
+        .context("workspace has no temp root")?;
+    if !holder.temp_is(root) {
+        bail!(
+            "workspace {}'s temp directory changed since setup; run world workspace setup {} again",
+            world.id,
+            world.id
+        );
+    }
+    let namespaces = holder.open().with_context(|| {
         format!(
             "workspace namespace is not running; run world workspace setup {}",
             world.id
         )
     })?;
     let (user, net) = (
-        crate::linux::above_stdio(user)?,
-        crate::linux::above_stdio(net)?,
+        crate::linux::above_stdio(namespaces.user)?,
+        crate::linux::above_stdio(namespaces.net)?,
     );
-    let (user_fd, net_fd) = (user.as_raw_fd(), net.as_raw_fd());
+    let mnt = crate::linux::above_stdio(namespaces.mnt.context("workspace mount namespace")?)?;
+    let (user_fd, mnt_fd, net_fd) = (user.as_raw_fd(), mnt.as_raw_fd(), net.as_raw_fd());
+    let cwd = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    // /tmp is the workspace's own; a TMPDIR elsewhere would be shared.
     let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
-        .filter(|(key, _)| key != "WORLD_ID")
+        .filter(|(key, _)| key != "WORLD_ID" && key != "TMPDIR")
         .collect();
     env.push(("WORLD_ID".into(), world.id.clone().into()));
+    env.push(("TMPDIR".into(), "/tmp".into()));
     let setup = move || -> std::io::Result<()> {
         // SAFETY: raw system calls on open descriptors (see linux::Spawn).
         unsafe {
-            crate::linux::join_namespaces(user_fd, net_fd)?;
+            crate::linux::join_namespaces(user_fd, mnt_fd, net_fd)?;
+            // Joining the mount namespace moved us to its root.
+            if libc::chdir(cwd.as_ptr()) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             crate::linux::close_extra_descriptors()?;
-            crate::linux::enter_pid_namespace()
+            crate::linux::enter_pid_namespace()?;
+            // Root keeps capabilities in the workspace user namespace; it
+            // must not unmount or replace mounts of the shared namespace.
+            crate::linux::drop_capabilities()
         }
     };
     if cancel.is_cancelled() || Instant::now() >= deadline {
@@ -1516,18 +1825,18 @@ async fn linux_exec(
         setup: Box::new(setup),
     })?);
     let result = run::wait(workload, deadline, cancel, &mut None, None).await;
-    drop((user, net));
+    drop((user, mnt, net));
     result
 }
 
 /// The workdir to execute in, refusing one `world exec` cannot run against:
-/// a live host temp directory it would redirect out from under itself, or a
-/// legacy entry recorded under one before that redirection existed.
-#[cfg(target_os = "macos")]
+/// a live host temp directory it would hide behind the workspace's own, or a
+/// legacy entry recorded under one before workspaces had a private /tmp.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn exec_workdir(world: &World) -> Result<PathBuf> {
     if stale_workdir(&world.workdir) {
         bail!(
-            "workspace {}'s workdir {} is under /tmp or /var/tmp, which world exec redirects inside the workspace; re-point it with `world workspace create {} --workdir <dir outside /tmp>`",
+            "workspace {}'s workdir {} is under /tmp or /var/tmp, which world exec replaces inside the workspace; re-point it with `world workspace create {} --workdir <dir outside /tmp>`",
             world.id,
             world.workdir.display(),
             world.id
@@ -1540,11 +1849,15 @@ fn exec_workdir(world: &World) -> Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 async fn macos_exec(
+    state: &Path,
     world: World,
     command: Vec<OsString>,
     duration: Duration,
     cancel: CancellationToken,
 ) -> Result<i32> {
+    // May move the workspace to a new address if its root was taken over;
+    // the alias check below then asks for setup again.
+    let (world, temp) = owned_temp_root(state, &world)?;
     if !alias_ready(world.ip) {
         bail!(
             "workspace loopback alias is not configured; run world workspace setup {}",
@@ -1552,7 +1865,6 @@ async fn macos_exec(
         );
     }
     let dir = exec_workdir(&world)?;
-    let temp = temp_root(&world)?;
     let executable = resolve_executable(&command[0], &dir, &temp)?;
     let library = std::env::current_exe()?
         .parent()
@@ -1705,14 +2017,29 @@ fn resolve_executable_with_path(
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
+
+    /// A workdir outside the host temp dirs, which workspaces now refuse.
+    fn workdir() -> tempfile::TempDir {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-work");
+        std::fs::create_dir_all(&base).unwrap();
+        tempfile::tempdir_in(base).unwrap()
+    }
+
+    /// `create` under a throwaway HOME, so the temp root never lands in the
+    /// real one.
+    fn create_at(state: &Path, id: &str, work: &Path, home: &Path) -> Result<World> {
+        let home = home.canonicalize().unwrap();
+        create_in(state, id, work, || Ok(home))
+    }
+
     /// The library API must work from any executable, not only `world`:
     /// this test binary would not understand a re-exec with CLI arguments.
     #[cfg(target_os = "linux")]
     #[test]
     fn setup_works_from_an_embedding_executable() {
         let state = tempfile::tempdir().unwrap();
-        let work = tempfile::tempdir().unwrap();
-        let world = create(state.path(), "embedded", work.path()).unwrap();
+        let (work, home) = (workdir(), workdir());
+        let world = create_at(state.path(), "embedded", work.path(), home.path()).unwrap();
         setup(state.path(), &world).unwrap();
         let holder = holder(state.path(), "embedded").unwrap();
         assert!(
@@ -1737,8 +2064,8 @@ mod tests {
         // SAFETY: prctl with integer arguments on this test process.
         unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
         let state = tempfile::tempdir().unwrap();
-        let work = tempfile::tempdir().unwrap();
-        let world = create(state.path(), "adopted", work.path()).unwrap();
+        let (work, home) = (workdir(), workdir());
+        let world = create_at(state.path(), "adopted", work.path(), home.path()).unwrap();
         setup(state.path(), &world).unwrap();
         let pid = holder(state.path(), "adopted").unwrap().pid;
         let parent = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
@@ -1760,8 +2087,8 @@ mod tests {
         // SAFETY: prctl with integer arguments on this test process.
         unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
         let state = tempfile::tempdir().unwrap();
-        let work = tempfile::tempdir().unwrap();
-        let world = create(state.path(), "killed", work.path()).unwrap();
+        let (work, home) = (workdir(), workdir());
+        let world = create_at(state.path(), "killed", work.path(), home.path()).unwrap();
         setup(state.path(), &world).unwrap();
         let old = holder(state.path(), "killed").unwrap().pid;
         // SAFETY: kill with integer arguments.
@@ -1780,27 +2107,29 @@ mod tests {
     #[test]
     fn allocation_serializes_world_identity() {
         let state = tempfile::tempdir().unwrap();
-        let work = tempfile::tempdir().unwrap();
+        let (work, home) = (workdir(), workdir());
         let mut jobs = Vec::new();
         for _ in 0..8 {
             let s = state.path().to_path_buf();
-            let w = work.path().to_path_buf();
-            jobs.push(std::thread::spawn(move || create(&s, "A", &w).unwrap().ip));
+            let (w, h) = (work.path().to_path_buf(), home.path().to_path_buf());
+            jobs.push(std::thread::spawn(move || {
+                create_at(&s, "A", &w, &h).unwrap().ip
+            }));
         }
         let ips: Vec<_> = jobs.into_iter().map(|j| j.join().unwrap()).collect();
         assert!(ips.iter().all(|ip| ip == &ips[0]));
-        let other = create(state.path(), "B", work.path()).unwrap();
+        let other = create_at(state.path(), "B", work.path(), home.path()).unwrap();
         assert_ne!(other.ip, ips[0]);
-        let another = tempfile::tempdir().unwrap();
-        assert!(create(state.path(), "A", another.path()).is_err());
+        let another = workdir();
+        assert!(create_at(state.path(), "A", another.path(), home.path()).is_err());
     }
 
-    /// `stale_workdir` only excuses a workdir mismatch on macOS: Linux never
-    /// redirects `/tmp`, so a real directory under it is an ordinary workdir
-    /// and swapping it for another must still be rejected.
+    /// A workdir under `/tmp` recorded before Linux workspaces had a private
+    /// /tmp can no longer be executed against, so `create` re-points it,
+    /// keeping the address and filling in the temp root.
     #[cfg(target_os = "linux")]
     #[test]
-    fn create_in_rejects_workdir_swap_from_a_real_tmp_dir() {
+    fn create_in_repoints_a_legacy_tmp_workdir() {
         let state = tempfile::tempdir().unwrap();
         let stored = tempfile::Builder::new()
             .prefix("wt-")
@@ -1818,23 +2147,31 @@ mod tests {
             },
         );
         save(state.path(), &worlds).unwrap();
-        let other = tempfile::tempdir().unwrap();
-        let home = || -> Result<PathBuf> { panic!("home should not be needed on Linux") };
-        let err = create_in(state.path(), "A", other.path(), home).unwrap_err();
+        let (other, home) = (workdir(), workdir());
+        let home_path = home.path().canonicalize().unwrap();
+        let world = create_in(state.path(), "A", other.path(), || Ok(home_path.clone())).unwrap();
+        assert_eq!(world.workdir, other.path().canonicalize().unwrap());
+        assert_eq!(world.ip, Ipv4Addr::new(127, 77, 0, 9));
+        assert_eq!(world.temp_root, Some(root_for(&home_path, world.ip)));
+        // Re-pointed: a different workdir is again someone else's.
+        let third = workdir();
+        let err = create_in(state.path(), "A", third.path(), || unreachable!()).unwrap_err();
         assert!(
             err.to_string().contains("belongs to another workdir"),
             "{err}"
         );
     }
 
-    /// Linux never redirects `/tmp`, so a workdir under it (including the
-    /// `/private` form macOS's symlink resolution would produce) is usable
-    /// as-is.
+    /// Linux hides /tmp and /var/tmp behind the workspace's own, so a
+    /// workdir below them is refused; `/private/tmp` is not special there.
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_accepts_a_workdir_under_private_tmp() {
+    fn linux_rejects_a_workdir_under_tmp() {
+        for dir in ["/tmp/w", "/var/tmp/w"] {
+            let err = check_workdir(Path::new(dir)).unwrap_err();
+            assert!(err.to_string().contains("must not be under /tmp"), "{err}");
+        }
         check_workdir(Path::new("/private/tmp/w")).unwrap();
-        check_workdir(Path::new("/private/var/tmp/w")).unwrap();
     }
 
     /// macOS redirects host temp dirs, so a workdir under either raw form
@@ -1846,19 +2183,204 @@ mod tests {
         assert!(err.to_string().contains("must not be under /tmp"), "{err}");
     }
 
-    /// End to end: on Linux, creating a workspace with a workdir under
-    /// `/tmp` succeeds and never needs `home` (only macOS's temp-root
-    /// redirection depends on it).
+    /// The 512-byte cap exists for the macOS shim; Linux bind-mounts the
+    /// root at /tmp, so a long HOME is fine.
     #[cfg(target_os = "linux")]
     #[test]
-    fn create_in_accepts_a_real_tmp_workdir_on_linux() {
+    fn linux_accepts_a_long_temp_root() {
+        let home = Path::new("/").join("h".repeat(600));
+        check_root(&root_for(&home, Ipv4Addr::new(127, 77, 0, 1))).unwrap();
+        let err = check_root(Path::new("/tmp/h/.world/tmp/127.77.0.1")).unwrap_err();
+        assert!(err.to_string().contains("not usable"), "{err}");
+    }
+
+    /// A path below the real directory of a symlinked temp dir counts as
+    /// being in it: that directory is hidden inside the workspace.
+    #[test]
+    fn temp_dirs_include_their_symlink_targets() {
+        let root = workdir();
+        let root = root.path().canonicalize().unwrap();
+        let (volume, link) = (root.join("volume"), root.join("var-tmp"));
+        std::fs::create_dir(&volume).unwrap();
+        std::os::unix::fs::symlink(&volume, &link).unwrap();
+        assert!(in_temp_dirs(&volume.join("project"), &[&link]));
+        assert!(in_temp_dirs(&link.join("project"), &[&link]));
+        assert!(!in_temp_dirs(&root.join("elsewhere"), &[&link]));
+    }
+
+    /// Registries sharing a HOME (different --state-dir) must not hand out
+    /// the same temp root: an address whose root exists is skipped.
+    #[test]
+    fn registries_sharing_a_home_get_distinct_temp_roots() {
+        let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (work, home) = (workdir(), workdir());
+        let a = create_at(first.path(), "A", work.path(), home.path()).unwrap();
+        let b = create_at(second.path(), "A", work.path(), home.path()).unwrap();
+        assert_ne!(a.temp_root, b.temp_root);
+        assert!(a.temp_root.unwrap().is_dir());
+    }
+
+    /// Claims are exclusive: registries creating concurrently under one
+    /// HOME still end up with distinct temp roots.
+    #[test]
+    fn concurrent_registries_claim_distinct_temp_roots() {
+        let (work, home) = (workdir(), workdir());
+        let states: Vec<_> = (0..8).map(|_| tempfile::tempdir().unwrap()).collect();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(states.len()));
+        let jobs: Vec<_> = states
+            .iter()
+            .map(|state| {
+                let (s, w, h) = (
+                    state.path().to_owned(),
+                    work.path().to_owned(),
+                    home.path().to_owned(),
+                );
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    create_at(&s, "A", &w, &h).unwrap().temp_root.unwrap()
+                })
+            })
+            .collect();
+        let roots: std::collections::HashSet<_> =
+            jobs.into_iter().map(|job| job.join().unwrap()).collect();
+        assert_eq!(roots.len(), states.len());
+    }
+
+    /// Legacy entries of two registries under one HOME share the address
+    /// every registry starts at; filling in their temp roots must keep them
+    /// apart, moving the second to a free address.
+    #[test]
+    fn legacy_entries_sharing_an_address_get_distinct_temp_roots() {
+        let (work, home) = (workdir(), workdir());
+        let home_path = home.path().canonicalize().unwrap();
+        let states = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        for state in &states {
+            let mut worlds = BTreeMap::new();
+            let legacy = World {
+                id: "A".into(),
+                ip: Ipv4Addr::new(127, 77, 0, 1),
+                workdir: work.path().canonicalize().unwrap(),
+                temp_root: None,
+            };
+            worlds.insert("A".to_string(), legacy);
+            save(state.path(), &worlds).unwrap();
+        }
+        let first = get_in(states[0].path(), "A", || Ok(home_path.clone())).unwrap();
+        let second = get_in(states[1].path(), "A", || Ok(home_path.clone())).unwrap();
+        assert_eq!(first.ip, Ipv4Addr::new(127, 77, 0, 1));
+        assert_ne!(second.ip, first.ip);
+        assert_ne!(second.temp_root, first.temp_root);
+        // Recorded: a later lookup keeps the moved address.
+        assert_eq!(
+            get_in(states[1].path(), "A", || unreachable!()).unwrap().ip,
+            second.ip
+        );
+    }
+
+    /// A moved registry keeps its identity; a new registry created at the old
+    /// path must not inherit the roots the moved one still uses.
+    #[test]
+    fn a_new_registry_at_a_moved_ones_path_gets_its_own_roots() {
+        let (base, work, home) = (tempfile::tempdir().unwrap(), workdir(), workdir());
+        let (old, moved) = (base.path().join("old"), base.path().join("moved"));
+        let first = create_at(&old, "A", work.path(), home.path()).unwrap();
+        std::fs::rename(&old, &moved).unwrap();
+        let second = create_at(&old, "A", work.path(), home.path()).unwrap();
+        assert_ne!(second.temp_root, first.temp_root);
+        assert_eq!(get(&moved, "A").unwrap().temp_root, first.temp_root);
+    }
+
+    /// A recorded root that was deleted and then claimed by another
+    /// registry under the same HOME is not reused: the workspace moves to a
+    /// fresh address and root, recorded in its registry.
+    #[test]
+    fn owned_temp_root_moves_off_a_root_taken_by_another_registry() {
+        let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (work, home) = (workdir(), workdir());
+        let a = create_at(first.path(), "A", work.path(), home.path()).unwrap();
+        let taken = a.temp_root.clone().unwrap();
+        std::fs::remove_dir_all(&taken).unwrap();
+        let b = create_at(second.path(), "B", work.path(), home.path()).unwrap();
+        assert_eq!(b.temp_root.as_ref(), Some(&taken));
+        let (moved, root) = owned_temp_root(first.path(), &a).unwrap();
+        assert_ne!(moved.ip, a.ip);
+        assert_ne!(root, taken);
+        assert_eq!(moved.temp_root.as_ref(), Some(&root));
+        assert_eq!(get(first.path(), "A").unwrap().ip, moved.ip);
+        // The other registry's claim is untouched.
+        let owner = std::fs::read(taken.join(ROOT_OWNER)).unwrap();
+        assert_eq!(owner, root_owner(second.path(), "B").unwrap());
+    }
+
+    /// A recorded root without a marker (rebuilt, or from before markers)
+    /// is claimed in place; a deleted one nobody took is rebuilt in place.
+    #[test]
+    fn owned_temp_root_keeps_an_unclaimed_root() {
+        let (state, work, home) = (tempfile::tempdir().unwrap(), workdir(), workdir());
+        let a = create_at(state.path(), "A", work.path(), home.path()).unwrap();
+        let recorded = a.temp_root.clone().unwrap();
+        std::fs::remove_file(recorded.join(ROOT_OWNER)).unwrap();
+        let (kept, root) = owned_temp_root(state.path(), &a).unwrap();
+        assert_eq!((kept.ip, &root), (a.ip, &recorded));
+        let owner = std::fs::read(recorded.join(ROOT_OWNER)).unwrap();
+        assert_eq!(owner, root_owner(state.path(), "A").unwrap());
+
+        std::fs::remove_dir_all(&recorded).unwrap();
+        let (kept, root) = owned_temp_root(state.path(), &a).unwrap();
+        assert_eq!((kept.ip, &root), (a.ip, &recorded));
+        assert!(root.join("tmp").is_dir() && root.join("var/tmp").is_dir());
+    }
+
+    /// A holder left on a deleted (or abandoned) temp root is replaced by
+    /// setup rather than kept as already running.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_restarts_a_holder_whose_temp_root_changed() {
+        let (state, work, home) = (tempfile::tempdir().unwrap(), workdir(), workdir());
+        let world = create_at(state.path(), "T", work.path(), home.path()).unwrap();
+        setup(state.path(), &world).unwrap();
+        let first = holder(state.path(), "T").unwrap();
+        let root = world.temp_root.clone().unwrap();
+        assert!(first.temp_is(&root));
+        std::fs::remove_dir_all(&root).unwrap();
+        setup(state.path(), &world).unwrap();
+        let second = holder(state.path(), "T").unwrap();
+        assert_ne!(second.pid, first.pid);
+        assert!(second.temp_is(&root));
+        // Only the private /var/tmp replaced: also a changed temp directory.
+        std::fs::remove_dir_all(root.join("var/tmp")).unwrap();
+        std::fs::create_dir(root.join("var/tmp")).unwrap();
+        let var_mounted = Path::new("/var/tmp")
+            .canonicalize()
+            .is_ok_and(|p| !p.starts_with("/tmp"));
+        assert_eq!(second.temp_is(&root), !var_mounted);
+        teardown(state.path(), &world).unwrap();
+    }
+
+    /// A root that predates owner markers belongs to someone: skip it.
+    #[test]
+    fn allocation_skips_a_root_without_an_owner() {
+        let (state, work, home) = (tempfile::tempdir().unwrap(), workdir(), workdir());
+        let home_path = home.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root_for(&home_path, Ipv4Addr::new(127, 77, 0, 1))).unwrap();
+        let world = create_at(state.path(), "A", work.path(), home.path()).unwrap();
+        assert_eq!(world.ip, Ipv4Addr::new(127, 77, 0, 2));
+    }
+
+    /// End to end: a new workspace with a workdir under `/tmp` is refused
+    /// before anything is recorded.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_in_rejects_a_tmp_workdir_on_linux() {
         let state = tempfile::tempdir().unwrap();
         let work = tempfile::Builder::new()
             .prefix("wt-")
             .tempdir_in("/tmp")
             .unwrap();
-        let home = || -> Result<PathBuf> { panic!("home should not be needed on Linux") };
-        create_in(state.path(), "A", work.path(), home).unwrap();
+        let err = create_in(state.path(), "A", work.path(), || unreachable!()).unwrap_err();
+        assert!(err.to_string().contains("must not be under /tmp"), "{err}");
+        assert!(registry(state.path()).unwrap().is_empty());
     }
 
     #[cfg(target_os = "macos")]

@@ -13,7 +13,7 @@ use crate::{
     proxy::Proxy,
     run::{self, RunOptions},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use rand::Rng;
 use std::{
     ffi::{CStr, CString},
@@ -353,13 +353,170 @@ pub(crate) unsafe fn reset_caught_handlers() {
 }
 
 /// pre_exec: join namespaces held by another process. User namespace first:
-/// it grants the capability needed to join the network namespace it owns.
-pub(crate) unsafe fn join_namespaces(user: RawFd, net: RawFd) -> IoResult<()> {
+/// it grants the capabilities needed to join the namespaces it owns. Joining
+/// the mount namespace resets the working directory to its root, so the
+/// caller must chdir afterwards.
+pub(crate) unsafe fn join_namespaces(user: RawFd, mnt: RawFd, net: RawFd) -> IoResult<()> {
     unsafe {
         check(libc::setns(user, libc::CLONE_NEWUSER))?;
+        check(libc::setns(mnt, libc::CLONE_NEWNS))?;
         check(libc::setns(net, libc::CLONE_NEWNET))?;
     }
     Ok(())
+}
+
+/// The workspace's own /tmp and /var/tmp, bound over the host ones in the
+/// holder's mount namespace.
+pub(crate) struct PrivateTemp {
+    tmp: CString,
+    var_tmp: CString,
+    /// The host /var/tmp's real directory, when it lies outside /tmp.
+    var_tmp_outside: Option<CString>,
+    /// When the host /var/tmp resolves below /tmp: the path components to
+    /// create in the private /tmp, whose last directory the private /var/tmp
+    /// is bound over, so the host symlink still reaches it.
+    var_tmp_inside: Vec<CString>,
+}
+
+/// Where the host /var/tmp really is, symlinks resolved (it may point at,
+/// say, a persistent volume, or into /tmp).
+#[derive(Debug, PartialEq)]
+enum VarTmp {
+    /// No /var/tmp entry at all (e.g. a minimal container): nothing to
+    /// replace. Creating one takes root, so this is a stable state.
+    Absent,
+    /// /tmp itself: the replaced /tmp serves both, as on the host.
+    SameAsTmp,
+    /// A directory outside /tmp, replaced in place.
+    Outside(std::path::PathBuf),
+    /// A directory below /tmp, relative to it: recreated in the private /tmp.
+    InsideTmp(std::path::PathBuf),
+}
+
+/// Anything but a missing entry or a resolvable directory (a dangling
+/// symlink, a lookup error) fails: skipping the mount would let the host
+/// /var/tmp show through once it resolves.
+fn var_tmp_placement(var_tmp: &Path, tmp: &Path) -> Result<VarTmp> {
+    if let Err(error) = var_tmp.symlink_metadata() {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(VarTmp::Absent);
+        }
+        return Err(error).context("inspect host /var/tmp");
+    }
+    let target = var_tmp
+        .canonicalize()
+        .context("resolve host /var/tmp; fix it and run setup again")?;
+    ensure!(target.is_dir(), "host /var/tmp is not a directory");
+    let tmp = tmp.canonicalize().context("resolve host /tmp")?;
+    Ok(match target.strip_prefix(&tmp) {
+        Ok(rest) if rest.as_os_str().is_empty() => VarTmp::SameAsTmp,
+        Ok(rest) => VarTmp::InsideTmp(rest.to_path_buf()),
+        Err(_) => VarTmp::Outside(target),
+    })
+}
+
+impl PrivateTemp {
+    /// `root` is a hardened temp root (see `silo::temp_root`) holding `tmp`
+    /// and `var/tmp`.
+    pub(crate) fn new(root: &Path) -> Result<Self> {
+        let c = |p: std::path::PathBuf| {
+            CString::new(p.into_os_string().into_encoded_bytes()).context("path contains NUL")
+        };
+        let (mut var_tmp_outside, mut var_tmp_inside) = (None, Vec::new());
+        match var_tmp_placement(Path::new("/var/tmp"), Path::new("/tmp"))? {
+            VarTmp::Absent | VarTmp::SameAsTmp => {}
+            VarTmp::Outside(target) => var_tmp_outside = Some(c(target)?),
+            VarTmp::InsideTmp(rest) => {
+                for part in rest.components() {
+                    var_tmp_inside.push(c(part.as_os_str().into())?);
+                }
+            }
+        }
+        Ok(Self {
+            tmp: c(root.join("tmp"))?,
+            var_tmp: c(root.join("var/tmp"))?,
+            var_tmp_outside,
+            var_tmp_inside,
+        })
+    }
+}
+
+/// Holder (inside its new user namespace): a mount namespace in which the
+/// host /tmp and /var/tmp are replaced by the workspace's own directories.
+/// Mounts stay slaves of the host's, so host mounts made later still appear
+/// while nothing mounted here reaches the host.
+unsafe fn enter_private_temp(temp: &PrivateTemp) -> IoResult<()> {
+    unsafe {
+        check(libc::unshare(libc::CLONE_NEWNS))?;
+        check(libc::mount(
+            std::ptr::null(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_SLAVE,
+            std::ptr::null(),
+        ))?;
+        let bind = |source: &CStr, target: &CStr| {
+            check(libc::mount(
+                source.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            ))
+        };
+        if let Some(target) = &temp.var_tmp_outside {
+            bind(&temp.var_tmp, target)?;
+        }
+        bind(&temp.tmp, c"/tmp")?;
+        if !temp.var_tmp_inside.is_empty() {
+            // The private /tmp persists and the workspace writes to it: walk
+            // it by descriptor, refusing symlinks, then bind over the exact
+            // directory reached.
+            let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            let mut dir = OwnedFd::from_raw_fd(check(libc::open(c"/tmp".as_ptr(), flags))?);
+            for name in &temp.var_tmp_inside {
+                if libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o755) < 0
+                    && *libc::__errno_location() != libc::EEXIST
+                {
+                    return Err(Error::last_os_error());
+                }
+                let next = check(libc::openat(dir.as_raw_fd(), name.as_ptr(), flags))?;
+                dir = OwnedFd::from_raw_fd(next);
+            }
+            bind(&temp.var_tmp, fd_path(dir.as_raw_fd()).as_c_str())?;
+        }
+    }
+    Ok(())
+}
+
+/// `/proc/self/fd/<fd>`: a path naming exactly the file behind `fd`.
+/// Built without allocating, for use after fork.
+struct FdPath([u8; 32]);
+
+impl FdPath {
+    fn as_c_str(&self) -> &CStr {
+        CStr::from_bytes_until_nul(&self.0).expect("NUL-terminated")
+    }
+}
+
+fn fd_path(fd: RawFd) -> FdPath {
+    let mut buffer = [0u8; 32];
+    let prefix = b"/proc/self/fd/";
+    buffer[..prefix.len()].copy_from_slice(prefix);
+    let mut digits = [0u8; 10];
+    let (mut value, mut count) = (fd as u32, 0);
+    loop {
+        digits[count] = b'0' + (value % 10) as u8;
+        count += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    for i in 0..count {
+        buffer[prefix.len() + i] = digits[count - 1 - i];
+    }
+    FdPath(buffer)
 }
 
 /// pre_exec: the workload gets no capabilities, even when the caller is
@@ -1506,6 +1663,17 @@ pub struct Holder {
     start_time: u64,
     user_ns: u64,
     net_ns: u64,
+    /// `None` for a holder started before workspaces had a private /tmp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mnt_ns: Option<u64>,
+}
+
+/// Descriptors of a holder's namespaces; they keep the namespaces alive.
+pub(crate) struct Namespaces {
+    pub user: OwnedFd,
+    pub net: OwnedFd,
+    /// `None` only for a holder that predates the private /tmp.
+    pub mnt: Option<OwnedFd>,
 }
 
 fn start_time(pid: u32) -> Result<u64> {
@@ -1527,11 +1695,38 @@ impl Holder {
             start_time: start_time(pid)?,
             user_ns: inode("user")?,
             net_ns: inode("net")?,
+            mnt_ns: Some(inode("mnt")?),
         })
     }
 
+    /// Whether this holder predates the private /tmp: joining it would run
+    /// the workload against the host /tmp.
+    pub(crate) fn legacy(&self) -> bool {
+        self.mnt_ns.is_none()
+    }
+
+    /// Whether the /tmp and /var/tmp this holder has mounted are still
+    /// those of the temp root `root`. Deleting a temp root (or part of it)
+    /// leaves the holder on the deleted directories, and a root the
+    /// workspace moved away from is no longer its own; either way the
+    /// holder must be replaced. Any failure to tell counts as a mismatch.
+    pub(crate) fn temp_is(&self, root: &Path) -> bool {
+        let id = |p: &Path| std::fs::metadata(p).map(|m| (m.dev(), m.ino()));
+        let same = |seen: &str, own: &str| {
+            let mounted = id(Path::new(&format!("/proc/{}/root{seen}", self.pid)));
+            matches!((mounted, id(&root.join(own))), (Ok(a), Ok(b)) if a == b)
+        };
+        // /var/tmp has a mount of its own unless the host has none, or it
+        // is /tmp itself (see `var_tmp_placement`).
+        let var_tmp_mounted = matches!(
+            var_tmp_placement(Path::new("/var/tmp"), Path::new("/tmp")),
+            Ok(VarTmp::Outside(_) | VarTmp::InsideTmp(_))
+        );
+        same("/tmp", "tmp") && (!var_tmp_mounted || same("/var/tmp", "var/tmp"))
+    }
+
     /// Open the held namespaces, verifying they still belong to this holder.
-    pub(crate) fn open(&self) -> Result<(OwnedFd, OwnedFd)> {
+    pub(crate) fn open(&self) -> Result<Namespaces> {
         self.verify()?
             .context("World namespace holder is no longer running")
     }
@@ -1540,7 +1735,7 @@ impl Holder {
     /// longer exists, or its namespaces or start time differ from the
     /// record. Anything else (e.g. EMFILE) is an error, so callers keep the
     /// record instead of forgetting a live holder.
-    pub(crate) fn verify(&self) -> Result<Option<(OwnedFd, OwnedFd)>> {
+    pub(crate) fn verify(&self) -> Result<Option<Namespaces>> {
         let gone = |err: &std::io::Error| {
             err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ESRCH)
         };
@@ -1558,9 +1753,16 @@ impl Holder {
         let Some(net) = open("net", self.net_ns)? else {
             return Ok(None);
         };
+        let mnt = match self.mnt_ns {
+            Some(expected) => match open("mnt", expected)? {
+                Some(mnt) => Some(mnt),
+                None => return Ok(None),
+            },
+            None => None,
+        };
         // Checked after opening: descriptors keep the namespaces alive.
         match start_time(self.pid) {
-            Ok(time) if time == self.start_time => Ok(Some((user, net))),
+            Ok(time) if time == self.start_time => Ok(Some(Namespaces { user, net, mnt })),
             Ok(_) => Ok(None),
             Err(err) if err.downcast_ref::<std::io::Error>().is_some_and(gone) => Ok(None),
             Err(err) => Err(err),
@@ -1573,6 +1775,7 @@ impl Holder {
 /// long-lived caller of setup never accumulates zombies.
 unsafe fn holder_process(
     maps: &IdMaps,
+    temp: &PrivateTemp,
     report: RawFd,
     ack: RawFd,
     report_read: RawFd,
@@ -1626,7 +1829,8 @@ unsafe fn holder_process(
         };
         // Pinned: never run unpinned.
         expect();
-        if let Err(error) = cleanup.and_then(|()| enter_new_namespaces(maps)) {
+        let enter = || enter_new_namespaces(maps).and_then(|()| enter_private_temp(temp));
+        if let Err(error) = cleanup.and_then(|()| enter()) {
             send(-error.raw_os_error().unwrap_or(libc::EIO));
             libc::_exit(125);
         }
@@ -1642,8 +1846,9 @@ unsafe fn holder_process(
     }
 }
 
-/// Start a detached process that keeps new namespaces alive.
-pub(crate) fn start_holder() -> Result<StartedHolder> {
+/// Start a detached process that keeps new namespaces alive, with `temp`
+/// as its /tmp and /var/tmp.
+pub(crate) fn start_holder(temp: &PrivateTemp) -> Result<StartedHolder> {
     let maps = IdMaps::current();
     let mut fds = [0; 2];
     // SAFETY: pipe2 writes two new descriptors into fds on success.
@@ -1688,7 +1893,7 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
     // prepared above and never returns.
     let intermediate = unsafe { libc::fork() };
     if intermediate == 0 {
-        unsafe { holder_process(&maps, report, ack, report_read, ack_write_fd) }
+        unsafe { holder_process(&maps, temp, report, ack, report_read, ack_write_fd) }
     }
     // SAFETY: restores this thread's own previous mask.
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) };
@@ -1747,6 +1952,7 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
                 start_time: 0,
                 user_ns: 0,
                 net_ns: 0,
+                mnt_ns: None,
             });
             match unrecorded.kill() {
                 Ok(()) => Err(err),
@@ -1937,7 +2143,11 @@ mod tests {
     /// process died) must exit rather than run unrecorded.
     #[test]
     fn uncommitted_holder_exits() {
-        let started = super::start_holder().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("var/tmp")).unwrap();
+        std::fs::create_dir(root.path().join("tmp")).unwrap();
+        let temp = super::PrivateTemp::new(root.path()).unwrap();
+        let started = super::start_holder(&temp).unwrap();
         let pid = started.holder.pid;
         assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
         drop(started);
@@ -2053,6 +2263,97 @@ mod tests {
             let errno = error.root_cause().downcast_ref::<std::io::Error>();
             assert_eq!(errno.and_then(|e| e.raw_os_error()), Some(libc::EACCES));
         });
+    }
+
+    /// A /var/tmp symlink is followed to its real directory; one into /tmp
+    /// is kept relative to it, and exactly /tmp shares its replacement.
+    #[test]
+    fn var_tmp_placement_follows_symlinks() {
+        use super::VarTmp;
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let (tmp, volume) = (root.join("tmp"), root.join("volume"));
+        std::fs::create_dir_all(tmp.join("inner")).unwrap();
+        std::fs::create_dir(&volume).unwrap();
+        let (outside, inside) = (root.join("var-outside"), root.join("var-inside"));
+        std::os::unix::fs::symlink(&volume, &outside).unwrap();
+        std::os::unix::fs::symlink(tmp.join("inner"), &inside).unwrap();
+        let same = root.join("var-same");
+        std::os::unix::fs::symlink(&tmp, &same).unwrap();
+        let place = |p: &std::path::Path| super::var_tmp_placement(p, &tmp).unwrap();
+        assert_eq!(place(&outside), VarTmp::Outside(volume.clone()));
+        assert_eq!(place(&volume), VarTmp::Outside(volume));
+        assert_eq!(place(&inside), VarTmp::InsideTmp("inner".into()));
+        assert_eq!(place(&same), VarTmp::SameAsTmp);
+        assert_eq!(place(&root.join("missing")), VarTmp::Absent);
+        // A dangling symlink may resolve later: refuse rather than skip.
+        let dangling = root.join("var-dangling");
+        std::os::unix::fs::symlink(root.join("not-yet"), &dangling).unwrap();
+        assert!(super::var_tmp_placement(&dangling, &tmp).is_err());
+        let file = root.join("file");
+        std::fs::write(&file, "").unwrap();
+        assert!(super::var_tmp_placement(&file, &tmp).is_err());
+    }
+
+    /// Run `enter_private_temp` in a forked child with its own user and
+    /// mount namespaces (the host is untouched), then `check` there; the
+    /// child's exit status is the result.
+    fn in_private_temp(temp: &super::PrivateTemp, check: impl FnOnce() -> bool) -> i32 {
+        let maps = super::IdMaps::current();
+        // SAFETY: the child makes raw system calls on data prepared above
+        // and exits without returning into the test harness.
+        unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                let ok = super::enter_new_namespaces(&maps).is_ok()
+                    && super::enter_private_temp(temp).is_ok()
+                    && check();
+                libc::_exit(if ok { 0 } else { 1 });
+            }
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+            libc::WEXITSTATUS(status)
+        }
+    }
+
+    /// A /var/tmp below /tmp is recreated in the private /tmp and gets the
+    /// private /var/tmp; a symlink the workspace left on that path is
+    /// refused rather than followed.
+    #[test]
+    fn var_tmp_inside_tmp_is_rebuilt_without_following_symlinks() {
+        // Outside /tmp, like real temp roots: /tmp is replaced in the child.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-work");
+        std::fs::create_dir_all(&base).unwrap();
+        let root = tempfile::tempdir_in(base).unwrap();
+        let root = root.path().canonicalize().unwrap();
+        for dir in ["tmp", "var/tmp", "elsewhere"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let c = |p: &str| std::ffi::CString::new(p).unwrap();
+        let temp = super::PrivateTemp {
+            tmp: c(root.join("tmp").to_str().unwrap()),
+            var_tmp: c(root.join("var/tmp").to_str().unwrap()),
+            var_tmp_outside: None,
+            var_tmp_inside: vec![c("a"), c("b")],
+        };
+        let marker = c("/tmp/a/b/marker");
+        let written = in_private_temp(&temp, || unsafe {
+            libc::open(marker.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o600) >= 0
+        });
+        assert_eq!(written, 0);
+        assert!(root.join("var/tmp/marker").exists());
+        assert!(root.join("tmp/a/b").is_dir());
+
+        std::fs::remove_dir_all(root.join("tmp/a")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("tmp/a")).unwrap();
+        assert_eq!(in_private_temp(&temp, || true), 1);
+        assert!(!root.join("elsewhere/b").exists());
+    }
+
+    #[test]
+    fn fd_path_names_the_descriptor() {
+        assert_eq!(super::fd_path(0).as_c_str(), c"/proc/self/fd/0");
+        assert_eq!(super::fd_path(1234).as_c_str(), c"/proc/self/fd/1234");
     }
 
     #[test]
