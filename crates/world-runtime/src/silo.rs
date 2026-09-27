@@ -522,9 +522,32 @@ fn create_in(
 /// Marker in a temp root naming the registry entry that owns it.
 const ROOT_OWNER: &str = "owner";
 
+/// A random identity for the registry in `state`, created on first use and
+/// kept in the directory: unlike its path, it moves with the registry and
+/// is never inherited by a new registry created where an old one was.
+/// Callers hold the registry lock.
+fn registry_id(state: &Path) -> Result<String> {
+    match File::open(state.join("registry-id")) {
+        Ok(file) => {
+            let id: String = serde_json::from_reader(file).context("read registry-id")?;
+            ensure!(
+                id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+                "invalid registry-id"
+            );
+            return Ok(id);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("read registry-id"),
+    }
+    let bytes: [u8; 16] = rand::random();
+    let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    persist(state, "registry-id", &id)?;
+    Ok(id)
+}
+
 /// Identity of a registry entry, as recorded in the temp root it owns.
 fn root_owner(state: &Path, id: &str) -> Result<Vec<u8>> {
-    let mut owner = state.canonicalize()?.into_os_string().into_encoded_bytes();
+    let mut owner = registry_id(state)?.into_bytes();
     owner.push(b'\n');
     owner.extend_from_slice(id.as_bytes());
     owner.push(b'\n');
@@ -2095,6 +2118,19 @@ mod tests {
             get_in(states[1].path(), "A", || unreachable!()).unwrap().ip,
             second.ip
         );
+    }
+
+    /// A moved registry keeps its identity; a new registry created at the old
+    /// path must not inherit the roots the moved one still uses.
+    #[test]
+    fn a_new_registry_at_a_moved_ones_path_gets_its_own_roots() {
+        let (base, work, home) = (tempfile::tempdir().unwrap(), workdir(), workdir());
+        let (old, moved) = (base.path().join("old"), base.path().join("moved"));
+        let first = create_at(&old, "A", work.path(), home.path()).unwrap();
+        std::fs::rename(&old, &moved).unwrap();
+        let second = create_at(&old, "A", work.path(), home.path()).unwrap();
+        assert_ne!(second.temp_root, first.temp_root);
+        assert_eq!(get(&moved, "A").unwrap().temp_root, first.temp_root);
     }
 
     /// A root that predates owner markers belongs to someone: skip it.

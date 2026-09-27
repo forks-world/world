@@ -372,9 +372,9 @@ pub(crate) struct PrivateTemp {
     var_tmp: CString,
     /// The host /var/tmp's real directory, when it lies outside /tmp.
     var_tmp_outside: Option<CString>,
-    /// When the host /var/tmp resolves below /tmp: the directories to create
-    /// in the private /tmp, the last of which the private /var/tmp is bound
-    /// over, so the host symlink still reaches it.
+    /// When the host /var/tmp resolves below /tmp: the path components to
+    /// create in the private /tmp, whose last directory the private /var/tmp
+    /// is bound over, so the host symlink still reaches it.
     var_tmp_inside: Vec<CString>,
 }
 
@@ -427,10 +427,8 @@ impl PrivateTemp {
             VarTmp::Absent | VarTmp::SameAsTmp => {}
             VarTmp::Outside(target) => var_tmp_outside = Some(c(target)?),
             VarTmp::InsideTmp(rest) => {
-                let mut dir = std::path::PathBuf::from("/tmp");
                 for part in rest.components() {
-                    dir.push(part);
-                    var_tmp_inside.push(c(dir.clone())?);
+                    var_tmp_inside.push(c(part.as_os_str().into())?);
                 }
             }
         }
@@ -470,16 +468,55 @@ unsafe fn enter_private_temp(temp: &PrivateTemp) -> IoResult<()> {
             bind(&temp.var_tmp, target)?;
         }
         bind(&temp.tmp, c"/tmp")?;
-        for dir in &temp.var_tmp_inside {
-            if libc::mkdir(dir.as_ptr(), 0o755) < 0 && *libc::__errno_location() != libc::EEXIST {
-                return Err(Error::last_os_error());
+        if !temp.var_tmp_inside.is_empty() {
+            // The private /tmp persists and the workspace writes to it: walk
+            // it by descriptor, refusing symlinks, then bind over the exact
+            // directory reached.
+            let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            let mut dir = OwnedFd::from_raw_fd(check(libc::open(c"/tmp".as_ptr(), flags))?);
+            for name in &temp.var_tmp_inside {
+                if libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o755) < 0
+                    && *libc::__errno_location() != libc::EEXIST
+                {
+                    return Err(Error::last_os_error());
+                }
+                let next = check(libc::openat(dir.as_raw_fd(), name.as_ptr(), flags))?;
+                dir = OwnedFd::from_raw_fd(next);
             }
-        }
-        if let Some(target) = temp.var_tmp_inside.last() {
-            bind(&temp.var_tmp, target)?;
+            bind(&temp.var_tmp, fd_path(dir.as_raw_fd()).as_c_str())?;
         }
     }
     Ok(())
+}
+
+/// `/proc/self/fd/<fd>`: a path naming exactly the file behind `fd`.
+/// Built without allocating, for use after fork.
+struct FdPath([u8; 32]);
+
+impl FdPath {
+    fn as_c_str(&self) -> &CStr {
+        CStr::from_bytes_until_nul(&self.0).expect("NUL-terminated")
+    }
+}
+
+fn fd_path(fd: RawFd) -> FdPath {
+    let mut buffer = [0u8; 32];
+    let prefix = b"/proc/self/fd/";
+    buffer[..prefix.len()].copy_from_slice(prefix);
+    let mut digits = [0u8; 10];
+    let (mut value, mut count) = (fd as u32, 0);
+    loop {
+        digits[count] = b'0' + (value % 10) as u8;
+        count += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    for i in 0..count {
+        buffer[prefix.len() + i] = digits[count - 1 - i];
+    }
+    FdPath(buffer)
 }
 
 /// pre_exec: the workload gets no capabilities, even when the caller is
@@ -2236,6 +2273,67 @@ mod tests {
         let file = root.join("file");
         std::fs::write(&file, "").unwrap();
         assert!(super::var_tmp_placement(&file, &tmp).is_err());
+    }
+
+    /// Run `enter_private_temp` in a forked child with its own user and
+    /// mount namespaces (the host is untouched), then `check` there; the
+    /// child's exit status is the result.
+    fn in_private_temp(temp: &super::PrivateTemp, check: impl FnOnce() -> bool) -> i32 {
+        let maps = super::IdMaps::current();
+        // SAFETY: the child makes raw system calls on data prepared above
+        // and exits without returning into the test harness.
+        unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                let ok = super::enter_new_namespaces(&maps).is_ok()
+                    && super::enter_private_temp(temp).is_ok()
+                    && check();
+                libc::_exit(if ok { 0 } else { 1 });
+            }
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+            libc::WEXITSTATUS(status)
+        }
+    }
+
+    /// A /var/tmp below /tmp is recreated in the private /tmp and gets the
+    /// private /var/tmp; a symlink the workspace left on that path is
+    /// refused rather than followed.
+    #[test]
+    fn var_tmp_inside_tmp_is_rebuilt_without_following_symlinks() {
+        // Outside /tmp, like real temp roots: /tmp is replaced in the child.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-work");
+        std::fs::create_dir_all(&base).unwrap();
+        let root = tempfile::tempdir_in(base).unwrap();
+        let root = root.path().canonicalize().unwrap();
+        for dir in ["tmp", "var/tmp", "elsewhere"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let c = |p: &str| std::ffi::CString::new(p).unwrap();
+        let temp = super::PrivateTemp {
+            tmp: c(root.join("tmp").to_str().unwrap()),
+            var_tmp: c(root.join("var/tmp").to_str().unwrap()),
+            var_tmp_outside: None,
+            var_tmp_inside: vec![c("a"), c("b")],
+        };
+        let marker = c("/tmp/a/b/marker");
+        let written = in_private_temp(&temp, || unsafe {
+            libc::open(marker.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o600) >= 0
+        });
+        assert_eq!(written, 0);
+        assert!(root.join("var/tmp/marker").exists());
+        assert!(root.join("tmp/a/b").is_dir());
+
+        std::fs::remove_dir_all(root.join("tmp/a")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("tmp/a")).unwrap();
+        assert_eq!(in_private_temp(&temp, || true), 1);
+        assert!(!root.join("elsewhere/b").exists());
+    }
+
+    #[test]
+    fn fd_path_names_the_descriptor() {
+        assert_eq!(super::fd_path(0).as_c_str(), c"/proc/self/fd/0");
+        assert_eq!(super::fd_path(1234).as_c_str(), c"/proc/self/fd/1234");
     }
 
     #[test]
