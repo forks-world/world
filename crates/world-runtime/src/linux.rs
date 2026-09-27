@@ -1705,14 +1705,24 @@ impl Holder {
         self.mnt_ns.is_none()
     }
 
-    /// Whether the /tmp this holder has mounted is still `tmp`. Deleting a
-    /// temp root leaves the holder on the deleted directory, and a root the
+    /// Whether the /tmp and /var/tmp this holder has mounted are still
+    /// those of the temp root `root`. Deleting a temp root (or part of it)
+    /// leaves the holder on the deleted directories, and a root the
     /// workspace moved away from is no longer its own; either way the
     /// holder must be replaced. Any failure to tell counts as a mismatch.
-    pub(crate) fn temp_is(&self, tmp: &Path) -> bool {
+    pub(crate) fn temp_is(&self, root: &Path) -> bool {
         let id = |p: &Path| std::fs::metadata(p).map(|m| (m.dev(), m.ino()));
-        let mounted = id(Path::new(&format!("/proc/{}/root/tmp", self.pid)));
-        matches!((mounted, id(tmp)), (Ok(a), Ok(b)) if a == b)
+        let same = |seen: &str, own: &str| {
+            let mounted = id(Path::new(&format!("/proc/{}/root{seen}", self.pid)));
+            matches!((mounted, id(&root.join(own))), (Ok(a), Ok(b)) if a == b)
+        };
+        // /var/tmp has a mount of its own unless the host has none, or it
+        // is /tmp itself (see `var_tmp_placement`).
+        let var_tmp_mounted = matches!(
+            var_tmp_placement(Path::new("/var/tmp"), Path::new("/tmp")),
+            Ok(VarTmp::Outside(_) | VarTmp::InsideTmp(_))
+        );
+        same("/tmp", "tmp") && (!var_tmp_mounted || same("/var/tmp", "var/tmp"))
     }
 
     /// Open the held namespaces, verifying they still belong to this holder.

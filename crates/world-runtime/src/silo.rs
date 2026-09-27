@@ -172,11 +172,16 @@ fn is_file(p: &Path) -> bool {
 /// Whether `old`'s `registry-id` still needs moving into `new`, under the
 /// same rule as `holders.json`: only with its own registry (`moving` now, or
 /// already moved by an earlier, possibly interrupted run).
+///
+/// A `registry-id` already in `new` without a `registry.json` there (a
+/// creation that failed after persisting its id) owns no recorded entry,
+/// so it is replaced when the registry moves in now.
 fn pending_id(old: &Path, new: &Path, moving: bool) -> bool {
     trusted_old(old)
         && is_file(&old.join("registry-id"))
-        && new.join("registry-id").symlink_metadata().is_err()
-        && (moving || old.join("registry.json").symlink_metadata().is_err())
+        && (moving
+            || (new.join("registry-id").symlink_metadata().is_err()
+                && old.join("registry.json").symlink_metadata().is_err()))
 }
 
 fn pending(old: &Path, new: &Path) -> (bool, bool) {
@@ -260,6 +265,24 @@ mod state_dir_tests {
         let new = default_state_dir_in(&home).unwrap();
         assert!(!old.join("registry-id").exists());
         assert_eq!(std::fs::read(new.join("registry-id")).unwrap(), b"\"id\"\n");
+    }
+
+    #[test]
+    fn migrating_the_registry_replaces_a_remnant_id() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        let old = write_old_registry(&home, work.path());
+        std::fs::write(old.join("registry-id"), b"\"old\"\n").unwrap();
+        let new = new_dir(&home);
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("registry-id"), b"\"remnant\"\n").unwrap();
+        default_state_dir_in(&home).unwrap();
+        assert!(new.join("registry.json").exists());
+        assert_eq!(
+            std::fs::read(new.join("registry-id")).unwrap(),
+            b"\"old\"\n"
+        );
+        assert!(!old.join("registry-id").exists());
     }
 
     #[test]
@@ -1593,7 +1616,7 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
                         "world: restarting workspace {} to give it a private /tmp; processes already running keep the old namespace",
                         world.id
                     );
-                } else if holder.temp_is(&root.join("tmp")) {
+                } else if holder.temp_is(&root) {
                     return Ok(());
                 } else {
                     // Its temp root was deleted, or the workspace moved to
@@ -1723,12 +1746,11 @@ async fn linux_exec(
             world.id
         );
     }
-    let tmp = world
+    let root = world
         .temp_root
         .as_ref()
-        .context("workspace has no temp root")?
-        .join("tmp");
-    if !holder.temp_is(&tmp) {
+        .context("workspace has no temp root")?;
+    if !holder.temp_is(root) {
         bail!(
             "workspace {}'s temp directory changed since setup; run world workspace setup {} again",
             world.id,
@@ -2298,12 +2320,19 @@ mod tests {
         setup(state.path(), &world).unwrap();
         let first = holder(state.path(), "T").unwrap();
         let root = world.temp_root.clone().unwrap();
-        assert!(first.temp_is(&root.join("tmp")));
+        assert!(first.temp_is(&root));
         std::fs::remove_dir_all(&root).unwrap();
         setup(state.path(), &world).unwrap();
         let second = holder(state.path(), "T").unwrap();
         assert_ne!(second.pid, first.pid);
-        assert!(second.temp_is(&root.join("tmp")));
+        assert!(second.temp_is(&root));
+        // Only the private /var/tmp replaced: also a changed temp directory.
+        std::fs::remove_dir_all(root.join("var/tmp")).unwrap();
+        std::fs::create_dir(root.join("var/tmp")).unwrap();
+        let var_mounted = Path::new("/var/tmp")
+            .canonicalize()
+            .is_ok_and(|p| !p.starts_with("/tmp"));
+        assert_eq!(second.temp_is(&root), !var_mounted);
         teardown(state.path(), &world).unwrap();
     }
 
