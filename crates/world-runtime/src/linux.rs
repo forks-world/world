@@ -763,45 +763,47 @@ unsafe fn read_raw<'a>(path: &CStr, buffer: &'a mut [u8]) -> &'a [u8] {
     }
 }
 
-/// Whether a /proc/net/route table has a default route on a real interface.
-fn default_route_v4(table: &[u8]) -> bool {
-    // Iface Destination ... ; the default route has destination 0.
+/// Whether a /proc/net/route table has a route on a real interface: pasta
+/// has configured an address (a default route is not required: an offline
+/// host may have none).
+fn configured_v4(table: &[u8]) -> bool {
     table.split(|&b| b == b'\n').skip(1).any(|line| {
-        let mut fields = line
+        let iface = line
             .split(|&b| b == b'\t' || b == b' ')
-            .filter(|f| !f.is_empty());
-        matches!((fields.next(), fields.next()), (Some(iface), Some(b"00000000")) if iface != b"lo")
+            .find(|f| !f.is_empty());
+        iface.is_some_and(|iface| iface != b"lo")
     })
 }
 
-/// Whether a /proc/net/ipv6_route table has a default route on a real
-/// interface (the kernel keeps an unreachable one on lo).
-fn default_route_v6(table: &[u8]) -> bool {
+/// Whether a /proc/net/ipv6_route table has a route on a real interface
+/// beyond what the kernel adds by itself (link-local, multicast; and the
+/// unreachable default it keeps on lo).
+fn configured_v6(table: &[u8]) -> bool {
     // dest prefix src prefix next-hop metric refcnt use flags iface
     table.split(|&b| b == b'\n').any(|line| {
         let mut parts = line.split(|&b| b == b' ').filter(|f| !f.is_empty());
         let fields: [&[u8]; 10] = std::array::from_fn(|_| parts.next().unwrap_or(b""));
-        fields[0] == b"00000000000000000000000000000000"
-            && fields[1] == b"00"
-            && !fields[9].is_empty()
+        !fields[9].is_empty()
             && fields[9] != b"lo"
+            && !fields[0].starts_with(b"fe80")
+            && !fields[0].starts_with(b"ff")
     })
 }
 
-/// Whether the calling process's network namespace has a default route on
-/// a real interface (IPv4 or IPv6): pasta has configured it. For use after
-/// fork: no allocation.
-unsafe fn has_default_route() -> bool {
+/// Whether pasta has configured the calling process's network namespace.
+/// For use after fork: no allocation.
+unsafe fn network_configured() -> bool {
     let mut buffer = [0u8; 16384];
     unsafe {
-        default_route_v4(read_raw(c"/proc/self/net/route", &mut buffer))
-            || default_route_v6(read_raw(c"/proc/self/net/ipv6_route", &mut buffer))
+        configured_v4(read_raw(c"/proc/self/net/route", &mut buffer))
+            || configured_v6(read_raw(c"/proc/self/net/ipv6_route", &mut buffer))
     }
 }
 
 /// Holder: let the monitor start pasta, then wait until it has configured
-/// the namespace. Fails if the monitor exits first or setup takes longer
-/// than 5 seconds. `life` must stay open for the holder's lifetime.
+/// the namespace. Fails if the monitor exits first (pasta could not start,
+/// e.g. no usable host interface) or setup takes longer than 5 seconds.
+/// `life` must stay open for the holder's lifetime.
 unsafe fn start_pasta(child: libc::pid_t, life: RawFd) -> IoResult<()> {
     unsafe {
         let byte = 1u8;
@@ -813,7 +815,7 @@ unsafe fn start_pasta(child: libc::pid_t, life: RawFd) -> IoResult<()> {
             tv_nsec: 20_000_000,
         };
         for _ in 0..250 {
-            if has_default_route() {
+            if network_configured() {
                 return Ok(());
             }
             let mut status = 0;
@@ -2167,6 +2169,9 @@ impl Holder {
     }
 }
 
+/// Holder status: started, but pasta could not connect the workspace.
+const NO_EGRESS: libc::pid_t = 1;
+
 /// Forked child of start_holder; never returns. The double fork reparents
 /// the holder to init (or a subreaper), which reaps it after teardown, so a
 /// long-lived caller of setup never accumulates zombies.
@@ -2248,26 +2253,37 @@ unsafe fn holder_process(
         if let Err(error) = enter() {
             fail(error);
         }
+        // Without a working pasta (an offline host, a broken binary) the
+        // workspace still works with loopback only, as before it had
+        // network: closing the life pipe ends the monitor and pasta.
+        let mut connected = None;
         if let (Some(egress), Some((child, life))) = (egress, pasta) {
-            // A host without /etc/resolv.conf has nothing to replace.
-            if let Err(error) = bind_resolv(&egress.resolv)
-                && error.raw_os_error() != Some(libc::ENOENT)
-            {
-                fail(error);
-            }
-            if let Err(error) = start_pasta(child, life) {
-                fail(error);
+            if start_pasta(child, life).is_ok() {
+                // A host without /etc/resolv.conf has nothing to replace.
+                if let Err(error) = bind_resolv(&egress.resolv)
+                    && error.raw_os_error() != Some(libc::ENOENT)
+                {
+                    fail(error);
+                }
+                connected = Some(life);
+            } else {
+                libc::close(life);
             }
         }
         libc::prctl(libc::PR_SET_NAME, c"world-holder".as_ptr());
-        if !send(0) {
+        let status = if pasta.is_some() && connected.is_none() {
+            NO_EGRESS
+        } else {
+            0
+        };
+        if !send(status) {
             libc::_exit(125);
         }
         // Recorded: a holder whose setup died before persisting its record
         // could never be found or torn down, so it exits instead.
         expect();
         libc::close(1);
-        hold(pasta.map(|(_, life)| life))
+        hold(connected)
     }
 }
 
@@ -2358,12 +2374,9 @@ pub(crate) fn start_holder(temp: &PrivateTemp, egress: Option<&Egress>) -> Resul
         return Err(error).context("start World namespace holder");
     }
     let status = next().inspect_err(|_| reap_if_child(pidfd.as_ref()))?;
-    if status != 0 {
+    if status != 0 && status != NO_EGRESS {
         // A subreaper caller adopted the failed holder: reap it.
         reap_if_child(pidfd.as_ref());
-        if -status == libc::ENETDOWN {
-            bail!("the workspace network did not come up: pasta failed to start");
-        }
         return Err(Error::from_raw_os_error(-status)).context("start World namespace holder");
     }
     let started = |holder| StartedHolder {
@@ -2374,7 +2387,7 @@ pub(crate) fn start_holder(temp: &PrivateTemp, egress: Option<&Egress>) -> Resul
     };
     match Holder::observe(pid as u32) {
         Ok(mut holder) => {
-            holder.egress = egress.is_some();
+            holder.egress = egress.is_some() && status == 0;
             Ok(started(holder))
         }
         Err(err) => {
@@ -2812,15 +2825,25 @@ mod tests {
     }
 
     #[test]
-    fn default_routes_ignore_loopback() {
-        let v4 = b"Iface\tDestination\tGateway\tFlags\nlo\t00000000\t00000000\t0001\neno2\t0001000A\t00000000\t0001\n";
-        assert!(!super::default_route_v4(v4));
-        let v4 = b"Iface\tDestination\tGateway\tFlags\neno2\t00000000\t0101000A\t0003\n";
-        assert!(super::default_route_v4(v4));
-        let lo = b"00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo\n";
-        assert!(!super::default_route_v6(lo));
-        let tap = b"00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00000003     eno2\n";
-        assert!(super::default_route_v6(tap));
+    fn configured_routes_need_a_real_interface_not_a_default() {
+        let header = "Iface\tDestination\tGateway\tFlags\n";
+        assert!(!super::configured_v4(header.as_bytes()));
+        let lo = format!("{header}lo\t0000007F\t00000000\t0001\n");
+        assert!(!super::configured_v4(lo.as_bytes()));
+        // A subnet route without a default, as on an offline host.
+        let subnet = format!("{header}eno2\t0001000A\t00000000\t0001\n");
+        assert!(super::configured_v4(subnet.as_bytes()));
+        let line = |dest: &str, iface: &str| {
+            format!(
+                "{dest} 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001 {iface}\n"
+            )
+        };
+        let unreachable = line("00000000000000000000000000000000", "lo");
+        let kernel = line("fe800000000000000000000000000000", "eno2")
+            + &line("ff000000000000000000000000000000", "eno2");
+        assert!(!super::configured_v6((unreachable + &kernel).as_bytes()));
+        let prefix = line("fd3c6936458645b50000000000000000", "eno2");
+        assert!(super::configured_v6(prefix.as_bytes()));
     }
 
     #[test]

@@ -1438,6 +1438,17 @@ except OSError:
             pasta = pathlib.Path(f"/proc/{monitor[0]}/task/{monitor[0]}/children").read_text().split()
             return holder, int(monitor[0]), int(pasta[0])
 
+        # A pasta that cannot connect (like an offline host) leaves the
+        # workspace usable with loopback only; setup connects it later.
+        self.assertEqual(run(*workspace, "teardown", "N").returncode, 0)
+        result = run(*workspace, "setup", "N", env=dict(os.environ, WORLD_PASTA="/bin/false"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("loopback only", result.stderr)
+        self.assertEqual(self.in_workspace("N", routes).stdout, "0\n")
+        result = run(*workspace, "setup", "N")
+        self.assertIn("outbound network", result.stderr)
+        self.assertNotEqual(self.in_workspace("N", routes).stdout, "0\n")
+
         # An explicit opt-out takes the network away again, and back.
         result = run(*workspace, "setup", "N", env=dict(os.environ, WORLD_PASTA=""))
         self.assertIn("without outbound network", result.stderr)

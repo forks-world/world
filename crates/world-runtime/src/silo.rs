@@ -1676,6 +1676,12 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
             }
         }
         let started = crate::linux::start_holder(&temp, egress.as_ref())?;
+        if egress.is_some() && !started.holder.egress {
+            eprintln!(
+                "world: pasta could not connect workspace {} (no usable host network?); it has loopback only until setup runs again",
+                world.id
+            );
+        }
         holders.insert(world.id.clone(), started.holder);
         if let Err(err) = persist(state, "holders.json", &holders) {
             // An unrecorded holder could never be torn down or reused.
