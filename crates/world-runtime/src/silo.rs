@@ -1652,6 +1652,14 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
                         "world: restarting workspace {} because its temp directory changed; processes already running keep the old namespace",
                         world.id
                     );
+                } else if holder.egress
+                    && std::env::var_os("WORLD_PASTA").is_some_and(|v| v.is_empty())
+                {
+                    // Outbound network explicitly disabled.
+                    eprintln!(
+                        "world: restarting workspace {} without outbound network (WORLD_PASTA is empty); processes already running keep the old namespace",
+                        world.id
+                    );
                 } else if egress.is_some() && (!holder.egress || !holder.pasta_running()) {
                     // Started without pasta (not installed then, or before
                     // workspaces had network), or pasta has died.

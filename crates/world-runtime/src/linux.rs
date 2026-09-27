@@ -587,7 +587,8 @@ fn find_pasta() -> Result<Option<std::path::PathBuf>> {
             "WORLD_PASTA {} is not an executable",
             chosen.display()
         );
-        return Ok(Some(chosen));
+        // The holder execs it from /, not from this directory.
+        return Ok(Some(std::path::absolute(&chosen)?));
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
     Ok(std::env::split_paths(&path)
