@@ -353,11 +353,70 @@ pub(crate) unsafe fn reset_caught_handlers() {
 }
 
 /// pre_exec: join namespaces held by another process. User namespace first:
-/// it grants the capability needed to join the network namespace it owns.
-pub(crate) unsafe fn join_namespaces(user: RawFd, net: RawFd) -> IoResult<()> {
+/// it grants the capabilities needed to join the namespaces it owns. Joining
+/// the mount namespace resets the working directory to its root, so the
+/// caller must chdir afterwards.
+pub(crate) unsafe fn join_namespaces(user: RawFd, mnt: RawFd, net: RawFd) -> IoResult<()> {
     unsafe {
         check(libc::setns(user, libc::CLONE_NEWUSER))?;
+        check(libc::setns(mnt, libc::CLONE_NEWNS))?;
         check(libc::setns(net, libc::CLONE_NEWNET))?;
+    }
+    Ok(())
+}
+
+/// The workspace's own /tmp and /var/tmp, bound over the host ones in the
+/// holder's mount namespace.
+pub(crate) struct PrivateTemp {
+    tmp: CString,
+    var_tmp: CString,
+}
+
+impl PrivateTemp {
+    /// `root` is a hardened temp root (see `silo::temp_root`) holding `tmp`
+    /// and `var/tmp`.
+    pub(crate) fn new(root: &Path) -> Result<Self> {
+        let c = |p: std::path::PathBuf| {
+            CString::new(p.into_os_string().into_encoded_bytes()).context("path contains NUL")
+        };
+        Ok(Self {
+            tmp: c(root.join("tmp"))?,
+            var_tmp: c(root.join("var/tmp"))?,
+        })
+    }
+}
+
+/// Holder (inside its new user namespace): a mount namespace in which the
+/// host /tmp and /var/tmp are replaced by the workspace's own directories.
+/// Mounts stay slaves of the host's, so host mounts made later still appear
+/// while nothing mounted here reaches the host. A /var/tmp that is not a
+/// real directory (absent, or a symlink into /tmp) is left alone.
+unsafe fn enter_private_temp(temp: &PrivateTemp) -> IoResult<()> {
+    unsafe {
+        check(libc::unshare(libc::CLONE_NEWNS))?;
+        check(libc::mount(
+            std::ptr::null(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_SLAVE,
+            std::ptr::null(),
+        ))?;
+        let bind = |source: &CStr, target: &CStr| {
+            check(libc::mount(
+                source.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            ))
+        };
+        let mut stat = std::mem::zeroed::<libc::stat>();
+        if libc::lstat(c"/var/tmp".as_ptr(), &mut stat) == 0
+            && stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+        {
+            bind(&temp.var_tmp, c"/var/tmp")?;
+        }
+        bind(&temp.tmp, c"/tmp")?;
     }
     Ok(())
 }
@@ -1506,6 +1565,17 @@ pub struct Holder {
     start_time: u64,
     user_ns: u64,
     net_ns: u64,
+    /// `None` for a holder started before workspaces had a private /tmp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mnt_ns: Option<u64>,
+}
+
+/// Descriptors of a holder's namespaces; they keep the namespaces alive.
+pub(crate) struct Namespaces {
+    pub user: OwnedFd,
+    pub net: OwnedFd,
+    /// `None` only for a holder that predates the private /tmp.
+    pub mnt: Option<OwnedFd>,
 }
 
 fn start_time(pid: u32) -> Result<u64> {
@@ -1527,11 +1597,18 @@ impl Holder {
             start_time: start_time(pid)?,
             user_ns: inode("user")?,
             net_ns: inode("net")?,
+            mnt_ns: Some(inode("mnt")?),
         })
     }
 
+    /// Whether this holder predates the private /tmp: joining it would run
+    /// the workload against the host /tmp.
+    pub(crate) fn legacy(&self) -> bool {
+        self.mnt_ns.is_none()
+    }
+
     /// Open the held namespaces, verifying they still belong to this holder.
-    pub(crate) fn open(&self) -> Result<(OwnedFd, OwnedFd)> {
+    pub(crate) fn open(&self) -> Result<Namespaces> {
         self.verify()?
             .context("World namespace holder is no longer running")
     }
@@ -1540,7 +1617,7 @@ impl Holder {
     /// longer exists, or its namespaces or start time differ from the
     /// record. Anything else (e.g. EMFILE) is an error, so callers keep the
     /// record instead of forgetting a live holder.
-    pub(crate) fn verify(&self) -> Result<Option<(OwnedFd, OwnedFd)>> {
+    pub(crate) fn verify(&self) -> Result<Option<Namespaces>> {
         let gone = |err: &std::io::Error| {
             err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ESRCH)
         };
@@ -1558,9 +1635,16 @@ impl Holder {
         let Some(net) = open("net", self.net_ns)? else {
             return Ok(None);
         };
+        let mnt = match self.mnt_ns {
+            Some(expected) => match open("mnt", expected)? {
+                Some(mnt) => Some(mnt),
+                None => return Ok(None),
+            },
+            None => None,
+        };
         // Checked after opening: descriptors keep the namespaces alive.
         match start_time(self.pid) {
-            Ok(time) if time == self.start_time => Ok(Some((user, net))),
+            Ok(time) if time == self.start_time => Ok(Some(Namespaces { user, net, mnt })),
             Ok(_) => Ok(None),
             Err(err) if err.downcast_ref::<std::io::Error>().is_some_and(gone) => Ok(None),
             Err(err) => Err(err),
@@ -1573,6 +1657,7 @@ impl Holder {
 /// long-lived caller of setup never accumulates zombies.
 unsafe fn holder_process(
     maps: &IdMaps,
+    temp: &PrivateTemp,
     report: RawFd,
     ack: RawFd,
     report_read: RawFd,
@@ -1626,7 +1711,8 @@ unsafe fn holder_process(
         };
         // Pinned: never run unpinned.
         expect();
-        if let Err(error) = cleanup.and_then(|()| enter_new_namespaces(maps)) {
+        let enter = || enter_new_namespaces(maps).and_then(|()| enter_private_temp(temp));
+        if let Err(error) = cleanup.and_then(|()| enter()) {
             send(-error.raw_os_error().unwrap_or(libc::EIO));
             libc::_exit(125);
         }
@@ -1642,8 +1728,9 @@ unsafe fn holder_process(
     }
 }
 
-/// Start a detached process that keeps new namespaces alive.
-pub(crate) fn start_holder() -> Result<StartedHolder> {
+/// Start a detached process that keeps new namespaces alive, with `temp`
+/// as its /tmp and /var/tmp.
+pub(crate) fn start_holder(temp: &PrivateTemp) -> Result<StartedHolder> {
     let maps = IdMaps::current();
     let mut fds = [0; 2];
     // SAFETY: pipe2 writes two new descriptors into fds on success.
@@ -1688,7 +1775,7 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
     // prepared above and never returns.
     let intermediate = unsafe { libc::fork() };
     if intermediate == 0 {
-        unsafe { holder_process(&maps, report, ack, report_read, ack_write_fd) }
+        unsafe { holder_process(&maps, temp, report, ack, report_read, ack_write_fd) }
     }
     // SAFETY: restores this thread's own previous mask.
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) };
@@ -1747,6 +1834,7 @@ pub(crate) fn start_holder() -> Result<StartedHolder> {
                 start_time: 0,
                 user_ns: 0,
                 net_ns: 0,
+                mnt_ns: None,
             });
             match unrecorded.kill() {
                 Ok(()) => Err(err),
@@ -1937,7 +2025,11 @@ mod tests {
     /// process died) must exit rather than run unrecorded.
     #[test]
     fn uncommitted_holder_exits() {
-        let started = super::start_holder().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("var/tmp")).unwrap();
+        std::fs::create_dir(root.path().join("tmp")).unwrap();
+        let temp = super::PrivateTemp::new(root.path()).unwrap();
+        let started = super::start_holder(&temp).unwrap();
         let pid = started.holder.pid;
         assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
         drop(started);

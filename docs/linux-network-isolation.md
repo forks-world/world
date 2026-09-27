@@ -41,9 +41,9 @@ Linux 与 macOS 使用同一个 CLI（`world network exec`、`world workspace ..
 ## 同端口 localhost（Workspace）
 
 ```sh
-mkdir -p /tmp/world-a /tmp/world-b
-./target/debug/world workspace create A --workdir /tmp/world-a
-./target/debug/world workspace create B --workdir /tmp/world-b
+mkdir -p ~/world-a ~/world-b
+./target/debug/world workspace create A --workdir ~/world-a
+./target/debug/world workspace create B --workdir ~/world-b
 ./target/debug/world workspace setup A
 ./target/debug/world workspace setup B
 ./target/debug/world exec A -- python3 -m http.server 8080 --bind 127.0.0.1
@@ -51,11 +51,13 @@ mkdir -p /tmp/world-a /tmp/world-b
 ./target/debug/world exec A -- curl --noproxy '*' http://localhost:8080/
 ```
 
-- 在 Linux 上，`setup` 不需要 sudo：它启动一个脱离终端的 holder 进程（进程名 `world-holder`，单线程，由 init 回收；不依赖 `world` 可执行文件，嵌入 `world_runtime` 的程序也能使用），由它持有该 World 的 user namespace 和 network namespace。holder 的 PID、启动时间和 namespace inode 记录在状态目录的 `holders.json` 中；重复 `setup` 是幂等的。
-- `exec` 校验 holder 身份后，用 `setns` 加入这两个 namespace，再执行命令。同一个 World 的多次 `exec` 共享同一个内核网络栈。不同 World 的 localhost 完全独立，都可以绑定同一地址和端口，包括 `127.0.0.1`、`0.0.0.0`、`::1`、`::`、UDP，以及 1024 以下的端口。
+- 在 Linux 上，`setup` 不需要 sudo：它启动一个脱离终端的 holder 进程（进程名 `world-holder`，单线程，由 init 回收；不依赖 `world` 可执行文件，嵌入 `world_runtime` 的程序也能使用），由它持有该 World 的 user namespace、network namespace 和 mount namespace。holder 的 PID、启动时间和 namespace inode 记录在状态目录的 `holders.json` 中；重复 `setup` 是幂等的。
+- `exec` 校验 holder 身份后，用 `setns` 加入这些 namespace，再执行命令。同一个 World 的多次 `exec` 共享同一个内核网络栈。不同 World 的 localhost 完全独立，都可以绑定同一地址和端口，包括 `127.0.0.1`、`0.0.0.0`、`::1`、`::`、UDP，以及 1024 以下的端口。
 - 程序形态不限：脚本、系统程序、静态链接程序和 setuid 程序都可以运行。其中 setuid 位在 namespace 中不会提升权限。注册表里的 `ip` 字段在 Linux 上只是标识，不参与网络。
 - World 内只有 loopback：宿主访问不到 World 内的监听，World 内也没有外网，客户端必须同样通过 `world exec` 启动。继承的 `http_proxy` 等变量指向宿主代理时，World 内同样无法连接，访问 localhost 时应设置 `no_proxy` 或使用 `--noproxy`。与 macOS 一样，文件系统 Unix socket 不受限制。
-- Linux 上 `/tmp` 暂不按 Workspace 隔离，不设置 `WORLD_TMP`/`TMPDIR`；这与 macOS 的临时目录重定向（见 [macOS 网络运行时](macos-network-isolation.md#临时目录)）不同，共享 `/tmp` 路径的多个 Workspace 之间仍可能冲突。因此 Workspace 工作目录可以位于 `/tmp`、`/var/tmp`（含 `/private` 形式）之下。
+- **私有临时目录**：holder 的 mount namespace 中，`/tmp` 和 `/var/tmp` 被 bind mount 为该 Workspace 的私有目录 `~/.world/tmp/<内部地址>/{tmp,var/tmp}`（`~` 为创建该 Workspace 时的 `HOME`，记录在 `show` 的 `temp_root` 中，与 macOS 相同），`exec` 把 `TMPDIR` 设为 `/tmp`。同名锁文件和 Unix socket（例如 Postgres 的 `/tmp/.s.PGSQL.5432`）在不同 Workspace 之间互不冲突，同一 Workspace 的多次 `exec` 共享它们；路径保持 `/tmp/...` 原样，没有 macOS 重定向带来的 socket 路径长度问题。宿主 `/tmp` 在 Workspace 内不可见，包括其中的 `SSH_AUTH_SOCK`、`/tmp/.X11-unix` 等宿主 socket；宿主上的普通进程也看不到 Workspace 的 `/tmp`，需要通过 `world exec` 访问。宿主之后新挂载的文件系统仍会出现在 Workspace 中（mount 传播为 slave），Workspace 内的挂载不会传回宿主。私有目录不随 Workspace 清理，也不在重启时清空。
+- 因此 Workspace 工作目录不能位于 `/tmp`、`/var/tmp` 之下，`create` 会拒绝；旧版本按 `/tmp/world-a` 创建的 Workspace 可以用 `world workspace create <ID> --workdir <其他目录>` 改指新目录，内部地址不变（旧目录中的文件不会被移动）。
+- 旧版本 `setup` 启动的 holder 没有私有 `/tmp`：`exec` 会拒绝执行并提示重新 `setup`，`setup` 会替换这个 holder。已经在运行的进程继续使用旧 namespace，因此替换前后的进程之间 localhost 不互通。
 - 在库中调用 `silo::setup` 的长期运行进程如果是 child subreaper，holder 会被它收养；Linux 5.4+ 上 teardown 会用 `waitid(P_PIDFD)` 精确回收，更早的内核上无法安全地按 PID 回收，需要调用者自行回收子进程。被外部杀死的 holder 会在下一次 `setup`/`teardown` 时，先用 pidfd 固定并核对启动时间，确认身份后再回收。如果 `pidfd_open` 被调用者自己的 seccomp 策略拒绝，`setup` 会失败，holder 在创建任何 namespace 之前就退出；这时同样需要调用者自行回收。
 - `world workspace teardown A` 停止 holder：先用 pidfd 固定进程再校验身份，避免 PID 复用误杀；Linux 5.3 以前没有 pidfd，会在校验后立即按 PID 发送信号。已经在运行的 World 进程会继续持有旧的 namespace，但之后的 `exec` 无法再加入它。holder 被杀死或机器重启后，需要重新 `setup`；新 namespace 不会与仍在运行的旧进程共享。
 

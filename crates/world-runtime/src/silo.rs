@@ -497,7 +497,7 @@ fn create_in(
         }
         // Never recompute a stored root from the current process's HOME:
         // only a legacy entry (predating this field) still has none.
-        if cfg!(target_os = "macos") && world.temp_root.is_none() {
+        if world.temp_root.is_none() {
             world.temp_root = Some(new_root(&home()?, world.ip)?);
             dirty = true;
         }
@@ -518,12 +518,7 @@ fn create_in(
         id: id.into(),
         ip,
         workdir,
-        // Only macOS redirects /tmp; Linux records no temp root.
-        temp_root: if cfg!(target_os = "macos") {
-            Some(new_root(&home()?, ip)?)
-        } else {
-            None
-        },
+        temp_root: Some(new_root(&home()?, ip)?),
     };
     worlds.insert(id.into(), world.clone());
     save(state, &worlds)?;
@@ -596,7 +591,7 @@ fn get_in(state: &Path, id: &str, home: impl FnOnce() -> Result<PathBuf>) -> Res
         .remove(id)
         .context("unknown workspace; run world workspace create first")?;
     valid(&world, id)?;
-    if !cfg!(target_os = "macos") || world.temp_root.is_some() {
+    if world.temp_root.is_some() {
         return Ok(world);
     }
     // Legacy entry: fill in the temp root under lock, re-reading first in
@@ -607,7 +602,7 @@ fn get_in(state: &Path, id: &str, home: impl FnOnce() -> Result<PathBuf>) -> Res
         .remove(id)
         .context("unknown workspace; run world workspace create first")?;
     valid(&stored, id)?;
-    if cfg!(target_os = "macos") && stored.temp_root.is_none() {
+    if stored.temp_root.is_none() {
         stored.temp_root = Some(new_root(&home()?, stored.ip)?);
         worlds.insert(id.into(), stored.clone());
         save(state, &worlds)?;
@@ -615,8 +610,13 @@ fn get_in(state: &Path, id: &str, home: impl FnOnce() -> Result<PathBuf>) -> Res
     Ok(stored)
 }
 
-/// Host temp directories every process shares; `world exec` redirects them.
+/// Host temp directories every process shares, as canonical paths; `world
+/// exec` replaces them with the workspace's own (macOS: redirected by the
+/// shim; Linux: bind-mounted in the workspace mount namespace).
+#[cfg(target_os = "macos")]
 const SHARED_TEMP: [&str; 2] = ["/private/tmp", "/private/var/tmp"];
+#[cfg(not(target_os = "macos"))]
+const SHARED_TEMP: [&str; 2] = ["/tmp", "/var/tmp"];
 
 fn in_shared_temp(p: &Path) -> bool {
     SHARED_TEMP.iter().any(|temp| p.starts_with(temp))
@@ -631,29 +631,23 @@ fn reject_shared_temp(path: &Path, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Only macOS redirects host temp dirs, so only there is a workdir under
-/// them unusable; Linux runs such a workdir normally.
+/// A workdir under a host temp dir would be hidden by the workspace's own.
 fn check_workdir(dir: &Path) -> Result<()> {
-    if cfg!(target_os = "macos") {
-        reject_shared_temp(dir, "workdir")
-    } else {
-        Ok(())
-    }
+    reject_shared_temp(dir, "workdir")
 }
 
-/// A recorded workdir `world exec` now refuses (legacy macOS /tmp layout).
+/// A recorded workdir `world exec` now refuses (legacy /tmp layout).
 ///
-/// Old builds of `world workspace create` accepted a workdir straight under
-/// `/tmp` or `/var/tmp` (before symlink resolution made that `/private/tmp`
-/// or `/private/var/tmp`, which `reject_shared_temp` already rejects for new
-/// entries). After a reboot macOS also clears `/tmp`, so the directory may no
+/// Old builds of `world workspace create` accepted a workdir under `/tmp` or
+/// `/var/tmp` (on macOS before symlink resolution made that `/private/tmp`
+/// or `/private/var/tmp`; on Linux before workspaces had their own /tmp).
+/// After a reboot `/tmp` may also have been cleared, so the directory may no
 /// longer even exist -- `canonicalize` then fails and the raw-prefix checks
 /// below are what catch it.
 fn stale_workdir(stored: &Path) -> bool {
-    cfg!(target_os = "macos")
-        && (in_shared_temp(stored)
-            || ["/tmp", "/var/tmp"].iter().any(|t| stored.starts_with(t))
-            || stored.canonicalize().is_ok_and(|p| in_shared_temp(&p)))
+    in_shared_temp(stored)
+        || ["/tmp", "/var/tmp"].iter().any(|t| stored.starts_with(t))
+        || stored.canonicalize().is_ok_and(|p| in_shared_temp(&p))
 }
 
 /// Canonical `HOME` of the process running `world`, rejecting one below a
@@ -1364,16 +1358,26 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
     supported()?;
     #[cfg(target_os = "linux")]
     {
+        let temp = crate::linux::PrivateTemp::new(&temp_root(world)?)?;
         let _lock = lock(state)?;
         let mut holders = read_map::<crate::linux::Holder>(state, "holders.json")?;
         if let Some(holder) = holders.get(&world.id) {
             // A transient verification error must not orphan a live holder.
             if holder.verify()?.is_some() {
-                return Ok(());
+                if !holder.legacy() {
+                    return Ok(());
+                }
+                // Started before workspaces had a private /tmp: replace it.
+                eprintln!(
+                    "world: restarting workspace {} to give it a private /tmp; processes already running keep the old namespace",
+                    world.id
+                );
+                crate::linux::stop_holder(holder)?;
+            } else {
+                crate::linux::reap_stale_holder(holder);
             }
-            crate::linux::reap_stale_holder(holder);
         }
-        let started = crate::linux::start_holder()?;
+        let started = crate::linux::start_holder(&temp)?;
         holders.insert(world.id.clone(), started.holder);
         if let Err(err) = persist(state, "holders.json", &holders) {
             // An unrecorded holder could never be torn down or reused.
@@ -1477,29 +1481,45 @@ async fn linux_exec(
 ) -> Result<i32> {
     use std::os::fd::AsRawFd;
     let deadline = Instant::now() + duration;
-    let dir = run::workdir(&world.workdir)?;
+    let dir = exec_workdir(&world)?;
     // The checked descriptor itself, never whatever fd 0 is at spawn: a
     // host socket swapped in by another thread would cross into the World.
     let stdin = run::pin_stdin_with(false)?;
-    let (user, net) = holder(state, &world.id)?.open().with_context(|| {
+    let holder = holder(state, &world.id)?;
+    if holder.legacy() {
+        bail!(
+            "workspace {} was set up before it had a private /tmp; run world workspace setup {} again",
+            world.id,
+            world.id
+        );
+    }
+    let namespaces = holder.open().with_context(|| {
         format!(
             "workspace namespace is not running; run world workspace setup {}",
             world.id
         )
     })?;
     let (user, net) = (
-        crate::linux::above_stdio(user)?,
-        crate::linux::above_stdio(net)?,
+        crate::linux::above_stdio(namespaces.user)?,
+        crate::linux::above_stdio(namespaces.net)?,
     );
-    let (user_fd, net_fd) = (user.as_raw_fd(), net.as_raw_fd());
+    let mnt = crate::linux::above_stdio(namespaces.mnt.context("workspace mount namespace")?)?;
+    let (user_fd, mnt_fd, net_fd) = (user.as_raw_fd(), mnt.as_raw_fd(), net.as_raw_fd());
+    let cwd = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    // /tmp is the workspace's own; a TMPDIR elsewhere would be shared.
     let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
-        .filter(|(key, _)| key != "WORLD_ID")
+        .filter(|(key, _)| key != "WORLD_ID" && key != "TMPDIR")
         .collect();
     env.push(("WORLD_ID".into(), world.id.clone().into()));
+    env.push(("TMPDIR".into(), "/tmp".into()));
     let setup = move || -> std::io::Result<()> {
         // SAFETY: raw system calls on open descriptors (see linux::Spawn).
         unsafe {
-            crate::linux::join_namespaces(user_fd, net_fd)?;
+            crate::linux::join_namespaces(user_fd, mnt_fd, net_fd)?;
+            // Joining the mount namespace moved us to its root.
+            if libc::chdir(cwd.as_ptr()) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             crate::linux::close_extra_descriptors()?;
             crate::linux::enter_pid_namespace()
         }
@@ -1516,18 +1536,18 @@ async fn linux_exec(
         setup: Box::new(setup),
     })?);
     let result = run::wait(workload, deadline, cancel, &mut None, None).await;
-    drop((user, net));
+    drop((user, mnt, net));
     result
 }
 
 /// The workdir to execute in, refusing one `world exec` cannot run against:
-/// a live host temp directory it would redirect out from under itself, or a
-/// legacy entry recorded under one before that redirection existed.
-#[cfg(target_os = "macos")]
+/// a live host temp directory it would hide behind the workspace's own, or a
+/// legacy entry recorded under one before workspaces had a private /tmp.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn exec_workdir(world: &World) -> Result<PathBuf> {
     if stale_workdir(&world.workdir) {
         bail!(
-            "workspace {}'s workdir {} is under /tmp or /var/tmp, which world exec redirects inside the workspace; re-point it with `world workspace create {} --workdir <dir outside /tmp>`",
+            "workspace {}'s workdir {} is under /tmp or /var/tmp, which world exec replaces inside the workspace; re-point it with `world workspace create {} --workdir <dir outside /tmp>`",
             world.id,
             world.workdir.display(),
             world.id
@@ -1705,14 +1725,29 @@ fn resolve_executable_with_path(
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
+
+    /// A workdir outside the host temp dirs, which workspaces now refuse.
+    fn workdir() -> tempfile::TempDir {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-work");
+        std::fs::create_dir_all(&base).unwrap();
+        tempfile::tempdir_in(base).unwrap()
+    }
+
+    /// `create` under a throwaway HOME, so the temp root never lands in the
+    /// real one.
+    fn create_at(state: &Path, id: &str, work: &Path, home: &Path) -> Result<World> {
+        let home = home.canonicalize().unwrap();
+        create_in(state, id, work, || Ok(home))
+    }
+
     /// The library API must work from any executable, not only `world`:
     /// this test binary would not understand a re-exec with CLI arguments.
     #[cfg(target_os = "linux")]
     #[test]
     fn setup_works_from_an_embedding_executable() {
         let state = tempfile::tempdir().unwrap();
-        let work = tempfile::tempdir().unwrap();
-        let world = create(state.path(), "embedded", work.path()).unwrap();
+        let (work, home) = (workdir(), workdir());
+        let world = create_at(state.path(), "embedded", work.path(), home.path()).unwrap();
         setup(state.path(), &world).unwrap();
         let holder = holder(state.path(), "embedded").unwrap();
         assert!(
@@ -1737,8 +1772,8 @@ mod tests {
         // SAFETY: prctl with integer arguments on this test process.
         unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
         let state = tempfile::tempdir().unwrap();
-        let work = tempfile::tempdir().unwrap();
-        let world = create(state.path(), "adopted", work.path()).unwrap();
+        let (work, home) = (workdir(), workdir());
+        let world = create_at(state.path(), "adopted", work.path(), home.path()).unwrap();
         setup(state.path(), &world).unwrap();
         let pid = holder(state.path(), "adopted").unwrap().pid;
         let parent = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
@@ -1760,8 +1795,8 @@ mod tests {
         // SAFETY: prctl with integer arguments on this test process.
         unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
         let state = tempfile::tempdir().unwrap();
-        let work = tempfile::tempdir().unwrap();
-        let world = create(state.path(), "killed", work.path()).unwrap();
+        let (work, home) = (workdir(), workdir());
+        let world = create_at(state.path(), "killed", work.path(), home.path()).unwrap();
         setup(state.path(), &world).unwrap();
         let old = holder(state.path(), "killed").unwrap().pid;
         // SAFETY: kill with integer arguments.
@@ -1780,27 +1815,29 @@ mod tests {
     #[test]
     fn allocation_serializes_world_identity() {
         let state = tempfile::tempdir().unwrap();
-        let work = tempfile::tempdir().unwrap();
+        let (work, home) = (workdir(), workdir());
         let mut jobs = Vec::new();
         for _ in 0..8 {
             let s = state.path().to_path_buf();
-            let w = work.path().to_path_buf();
-            jobs.push(std::thread::spawn(move || create(&s, "A", &w).unwrap().ip));
+            let (w, h) = (work.path().to_path_buf(), home.path().to_path_buf());
+            jobs.push(std::thread::spawn(move || {
+                create_at(&s, "A", &w, &h).unwrap().ip
+            }));
         }
         let ips: Vec<_> = jobs.into_iter().map(|j| j.join().unwrap()).collect();
         assert!(ips.iter().all(|ip| ip == &ips[0]));
-        let other = create(state.path(), "B", work.path()).unwrap();
+        let other = create_at(state.path(), "B", work.path(), home.path()).unwrap();
         assert_ne!(other.ip, ips[0]);
-        let another = tempfile::tempdir().unwrap();
-        assert!(create(state.path(), "A", another.path()).is_err());
+        let another = workdir();
+        assert!(create_at(state.path(), "A", another.path(), home.path()).is_err());
     }
 
-    /// `stale_workdir` only excuses a workdir mismatch on macOS: Linux never
-    /// redirects `/tmp`, so a real directory under it is an ordinary workdir
-    /// and swapping it for another must still be rejected.
+    /// A workdir under `/tmp` recorded before Linux workspaces had a private
+    /// /tmp can no longer be executed against, so `create` re-points it,
+    /// keeping the address and filling in the temp root.
     #[cfg(target_os = "linux")]
     #[test]
-    fn create_in_rejects_workdir_swap_from_a_real_tmp_dir() {
+    fn create_in_repoints_a_legacy_tmp_workdir() {
         let state = tempfile::tempdir().unwrap();
         let stored = tempfile::Builder::new()
             .prefix("wt-")
@@ -1818,23 +1855,31 @@ mod tests {
             },
         );
         save(state.path(), &worlds).unwrap();
-        let other = tempfile::tempdir().unwrap();
-        let home = || -> Result<PathBuf> { panic!("home should not be needed on Linux") };
-        let err = create_in(state.path(), "A", other.path(), home).unwrap_err();
+        let (other, home) = (workdir(), workdir());
+        let home_path = home.path().canonicalize().unwrap();
+        let world = create_in(state.path(), "A", other.path(), || Ok(home_path.clone())).unwrap();
+        assert_eq!(world.workdir, other.path().canonicalize().unwrap());
+        assert_eq!(world.ip, Ipv4Addr::new(127, 77, 0, 9));
+        assert_eq!(world.temp_root, Some(root_for(&home_path, world.ip)));
+        // Re-pointed: a different workdir is again someone else's.
+        let third = workdir();
+        let err = create_in(state.path(), "A", third.path(), || unreachable!()).unwrap_err();
         assert!(
             err.to_string().contains("belongs to another workdir"),
             "{err}"
         );
     }
 
-    /// Linux never redirects `/tmp`, so a workdir under it (including the
-    /// `/private` form macOS's symlink resolution would produce) is usable
-    /// as-is.
+    /// Linux hides /tmp and /var/tmp behind the workspace's own, so a
+    /// workdir below them is refused; `/private/tmp` is not special there.
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_accepts_a_workdir_under_private_tmp() {
+    fn linux_rejects_a_workdir_under_tmp() {
+        for dir in ["/tmp/w", "/var/tmp/w"] {
+            let err = check_workdir(Path::new(dir)).unwrap_err();
+            assert!(err.to_string().contains("must not be under /tmp"), "{err}");
+        }
         check_workdir(Path::new("/private/tmp/w")).unwrap();
-        check_workdir(Path::new("/private/var/tmp/w")).unwrap();
     }
 
     /// macOS redirects host temp dirs, so a workdir under either raw form
@@ -1846,19 +1891,19 @@ mod tests {
         assert!(err.to_string().contains("must not be under /tmp"), "{err}");
     }
 
-    /// End to end: on Linux, creating a workspace with a workdir under
-    /// `/tmp` succeeds and never needs `home` (only macOS's temp-root
-    /// redirection depends on it).
+    /// End to end: a new workspace with a workdir under `/tmp` is refused
+    /// before anything is recorded.
     #[cfg(target_os = "linux")]
     #[test]
-    fn create_in_accepts_a_real_tmp_workdir_on_linux() {
+    fn create_in_rejects_a_tmp_workdir_on_linux() {
         let state = tempfile::tempdir().unwrap();
         let work = tempfile::Builder::new()
             .prefix("wt-")
             .tempdir_in("/tmp")
             .unwrap();
-        let home = || -> Result<PathBuf> { panic!("home should not be needed on Linux") };
-        create_in(state.path(), "A", work.path(), home).unwrap();
+        let err = create_in(state.path(), "A", work.path(), || unreachable!()).unwrap_err();
+        assert!(err.to_string().contains("must not be under /tmp"), "{err}");
+        assert!(registry(state.path()).unwrap().is_empty());
     }
 
     #[cfg(target_os = "macos")]

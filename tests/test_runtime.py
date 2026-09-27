@@ -1273,9 +1273,15 @@ class Silo(unittest.TestCase):
 class LinuxWorkspace(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.temp = tempfile.TemporaryDirectory(prefix="world-silo-test-")
+        # Workspaces refuse workdirs under /tmp, and record their private
+        # /tmp under HOME: keep both inside the build tree.
+        (ROOT / "target").mkdir(exist_ok=True)
+        cls.temp = tempfile.TemporaryDirectory(prefix="world-silo-test-", dir=ROOT / "target")
         cls.root = pathlib.Path(cls.temp.name)
         cls.state = cls.root / "state"
+        cls.home = os.environ.get("HOME")
+        os.environ["HOME"] = str(cls.root / "home")
+        (cls.root / "home").mkdir()
         for name in ["A", "B"]:
             work = cls.root / name
             work.mkdir()
@@ -1289,7 +1295,68 @@ class LinuxWorkspace(unittest.TestCase):
     def tearDownClass(cls):
         for name in ["A", "B"]:
             run(WORLD, "workspace", "--state-dir", cls.state, "teardown", name)
+        if cls.home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = cls.home
         cls.temp.cleanup()
+
+    def temp_root(self, world):
+        result = run(WORLD, "workspace", "--state-dir", self.state, "show", world)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return pathlib.Path(json.loads(result.stdout)["temp_root"])
+
+    def test_temp_is_private_per_workspace(self):
+        path = f"/tmp/wt-{uuid.uuid4().hex[:8]}/service"
+        with serving(self.command("A", "temp-hold", path)):
+            with serving(self.command("B", "temp-hold", path)):
+                for name in ["A", "B"]:
+                    sock = (self.temp_root(name) / path.removeprefix("/")).with_suffix(".sock")
+                    self.assertTrue(sock.exists(), name)
+            # The same workspace still shares its lock between executions.
+            result = run(*self.command("A", "temp-hold", path))
+            self.assertEqual(result.returncode, 78, result.stderr)
+        self.assertFalse(os.path.lexists(os.path.dirname(path)))
+
+    def test_host_temp_is_hidden_and_tmpdir_is_private(self):
+        with tempfile.NamedTemporaryFile(dir="/tmp") as host, \
+                tempfile.NamedTemporaryFile(dir="/var/tmp") as host_var:
+            command = self.command("A")[:-1] + [
+                "/bin/sh", "-c", 'test ! -e "$1" && test ! -e "$2" && echo "$TMPDIR" > /var/tmp/wt-var && echo "$TMPDIR"',
+                "sh", host.name, host_var.name]
+            result = run(*command, env=dict(os.environ, TMPDIR=str(self.root)))
+            self.assertEqual((result.returncode, result.stdout), (0, "/tmp\n"), result.stderr)
+        self.assertTrue((self.temp_root("A") / "var/tmp/wt-var").exists())
+        self.assertFalse(os.path.lexists("/var/tmp/wt-var"))
+
+    def test_workspace_rejects_tmp_workdir(self):
+        for workdir in ["/tmp", "/var/tmp"]:
+            result = run(WORLD, "workspace", "--state-dir", self.state, "create", "T", "--workdir", workdir)
+            self.assertEqual(result.returncode, 125)
+            self.assertIn("must not be under /tmp or /var/tmp", result.stderr)
+
+    def test_holder_without_private_temp_is_replaced_by_setup(self):
+        work = self.root / "G"
+        work.mkdir()
+        workspace = [WORLD, "workspace", "--state-dir", self.state]
+        self.assertEqual(run(*workspace, "create", "G", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *workspace, "teardown", "G")
+        self.assertEqual(run(*workspace, "setup", "G").returncode, 0)
+        self.assertEqual(run(*self.command("G")[:-1], "/bin/sh", "-c", "echo kept > /tmp/wt-kept").returncode, 0)
+        # A holder recorded by a build without the private /tmp.
+        holders = json.loads((self.state / "holders.json").read_text())
+        old = holders["G"]["pid"]
+        del holders["G"]["mnt_ns"]
+        (self.state / "holders.json").write_text(json.dumps(holders))
+        result = run(*self.command("G", "fd", "999"))
+        self.assertEqual(result.returncode, 125)
+        self.assertIn("world workspace setup G", result.stderr)
+        result = run(*workspace, "setup", "G")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("private /tmp", result.stderr)
+        self.assertNotEqual(json.loads((self.state / "holders.json").read_text())["G"]["pid"], old)
+        result = run(*self.command("G")[:-1], "/bin/cat", "/tmp/wt-kept")
+        self.assertEqual((result.returncode, result.stdout), (0, "kept\n"), result.stderr)
 
     def command(self, world, *args):
         return [WORLD, "exec", world, "--state-dir", self.state, "--timeout", "30s", "--", PROBE, *args]
