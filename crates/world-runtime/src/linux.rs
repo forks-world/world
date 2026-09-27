@@ -2213,11 +2213,11 @@ unsafe fn finish_monitor(monitor: libc::pid_t, life: RawFd) {
     }
 }
 
-/// Serializes tests that make this process a child subreaper: the flag is
-/// process-wide, and one test turning it off would let another's adopted
-/// processes go to init instead.
+/// Serializes tests that start holders: some make this process a child
+/// subreaper (a process-wide flag), which would let them adopt, or lose to
+/// init, the holders and pasta monitors of tests running alongside.
 #[cfg(test)]
-pub(crate) static SUBREAPER_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static HOLDER_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Holder status: started, but pasta could not connect the workspace.
 const NO_EGRESS: libc::pid_t = 1;
@@ -2705,6 +2705,9 @@ mod tests {
     /// process died) must exit rather than run unrecorded.
     #[test]
     fn uncommitted_holder_exits() {
+        let _serial = super::HOLDER_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("var/tmp")).unwrap();
         std::fs::create_dir(root.path().join("tmp")).unwrap();
@@ -2990,7 +2993,7 @@ mod tests {
         .unwrap();
         let temp = super::PrivateTemp::new(root.path()).unwrap();
         let egress = super::Egress::with_program(root.path(), hanging).unwrap();
-        let _serial = super::SUBREAPER_TESTS
+        let _serial = super::HOLDER_TESTS
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         // SAFETY: prctl with integer arguments on this test process.
@@ -3028,7 +3031,7 @@ mod tests {
         std::fs::create_dir(root.path().join("tmp")).unwrap();
         let temp = super::PrivateTemp::new(root.path()).unwrap();
         let egress = super::Egress::with_program(root.path(), pasta).unwrap();
-        let _serial = super::SUBREAPER_TESTS
+        let _serial = super::HOLDER_TESTS
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         // SAFETY: prctl with integer arguments on this test process.

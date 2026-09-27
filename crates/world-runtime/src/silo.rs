@@ -2083,6 +2083,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn setup_works_from_an_embedding_executable() {
+        let _serial = crate::linux::HOLDER_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let state = tempfile::tempdir().unwrap();
         let (work, home) = (workdir(), workdir());
         let world = create_at(state.path(), "embedded", work.path(), home.path()).unwrap();
@@ -2107,7 +2110,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn teardown_reaps_holder_adopted_by_subreaper() {
-        let _serial = crate::linux::SUBREAPER_TESTS
+        let _serial = crate::linux::HOLDER_TESTS
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         // SAFETY: prctl with integer arguments on this test process.
@@ -2142,7 +2145,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn setup_reaps_externally_killed_holder_of_subreaper() {
-        let _serial = crate::linux::SUBREAPER_TESTS
+        let _serial = crate::linux::HOLDER_TESTS
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         // SAFETY: prctl with integer arguments on this test process.
@@ -2406,6 +2409,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn setup_restarts_a_holder_whose_temp_root_changed() {
+        let _serial = crate::linux::HOLDER_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (state, work, home) = (tempfile::tempdir().unwrap(), workdir(), workdir());
         let world = create_at(state.path(), "T", work.path(), home.path()).unwrap();
         setup(state.path(), &world).unwrap();
