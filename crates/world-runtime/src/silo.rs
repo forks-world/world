@@ -676,8 +676,26 @@ fn root_for(home: &Path, ip: Ipv4Addr) -> PathBuf {
 /// already recorded is read back, so a root that was valid when written but
 /// would no longer pass (e.g. after this limit was tightened) is refused
 /// rather than silently trusted.
+///
+/// Linux bind-mounts the root at /tmp instead of rewriting paths, so only
+/// the shape rules apply there, not the shim's length cap.
 fn check_root(root: &Path) -> Result<()> {
     let b = root.as_os_str().as_bytes();
+    if cfg!(not(target_os = "macos")) {
+        let normalized = root.is_absolute()
+            && !root.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            });
+        ensure!(
+            normalized && !in_shared_temp(root),
+            "workspace temp root {} is not usable: it must be absolute, normalized and outside host temp directories",
+            root.display()
+        );
+        return Ok(());
+    }
     if b.len() > world_tmp_path::MAX_ROOT_LEN {
         bail!(
             "workspace temp root {} is {} bytes; it must be at most {} bytes (use a shorter HOME)",
@@ -1889,6 +1907,17 @@ mod tests {
     fn macos_rejects_a_workdir_under_private_tmp() {
         let err = check_workdir(Path::new("/private/tmp/w")).unwrap_err();
         assert!(err.to_string().contains("must not be under /tmp"), "{err}");
+    }
+
+    /// The 512-byte cap exists for the macOS shim; Linux bind-mounts the
+    /// root at /tmp, so a long HOME is fine.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_accepts_a_long_temp_root() {
+        let home = Path::new("/").join("h".repeat(600));
+        check_root(&root_for(&home, Ipv4Addr::new(127, 77, 0, 1))).unwrap();
+        let err = check_root(Path::new("/tmp/h/.world/tmp/127.77.0.1")).unwrap_err();
+        assert!(err.to_string().contains("not usable"), "{err}");
     }
 
     /// End to end: a new workspace with a workdir under `/tmp` is refused

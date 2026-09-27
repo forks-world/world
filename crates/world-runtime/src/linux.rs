@@ -370,6 +370,18 @@ pub(crate) unsafe fn join_namespaces(user: RawFd, mnt: RawFd, net: RawFd) -> IoR
 pub(crate) struct PrivateTemp {
     tmp: CString,
     var_tmp: CString,
+    /// Where the host /var/tmp really is, or `None` when it needs no mount
+    /// of its own (absent, or resolving into /tmp).
+    var_tmp_target: Option<CString>,
+}
+
+/// The directory to bind the private /var/tmp over: the host's /var/tmp
+/// with symlinks resolved (it may point at, say, a persistent volume),
+/// unless that lands inside /tmp, which is already replaced as a whole.
+fn var_tmp_target(var_tmp: &Path, tmp: &Path) -> Option<std::path::PathBuf> {
+    let target = var_tmp.canonicalize().ok().filter(|p| p.is_dir())?;
+    let tmp = tmp.canonicalize().unwrap_or_else(|_| tmp.to_path_buf());
+    (!target.starts_with(tmp)).then_some(target)
 }
 
 impl PrivateTemp {
@@ -382,6 +394,9 @@ impl PrivateTemp {
         Ok(Self {
             tmp: c(root.join("tmp"))?,
             var_tmp: c(root.join("var/tmp"))?,
+            var_tmp_target: var_tmp_target(Path::new("/var/tmp"), Path::new("/tmp"))
+                .map(c)
+                .transpose()?,
         })
     }
 }
@@ -389,8 +404,7 @@ impl PrivateTemp {
 /// Holder (inside its new user namespace): a mount namespace in which the
 /// host /tmp and /var/tmp are replaced by the workspace's own directories.
 /// Mounts stay slaves of the host's, so host mounts made later still appear
-/// while nothing mounted here reaches the host. A /var/tmp that is not a
-/// real directory (absent, or a symlink into /tmp) is left alone.
+/// while nothing mounted here reaches the host.
 unsafe fn enter_private_temp(temp: &PrivateTemp) -> IoResult<()> {
     unsafe {
         check(libc::unshare(libc::CLONE_NEWNS))?;
@@ -410,11 +424,8 @@ unsafe fn enter_private_temp(temp: &PrivateTemp) -> IoResult<()> {
                 std::ptr::null(),
             ))
         };
-        let mut stat = std::mem::zeroed::<libc::stat>();
-        if libc::lstat(c"/var/tmp".as_ptr(), &mut stat) == 0
-            && stat.st_mode & libc::S_IFMT == libc::S_IFDIR
-        {
-            bind(&temp.var_tmp, c"/var/tmp")?;
+        if let Some(target) = &temp.var_tmp_target {
+            bind(&temp.var_tmp, target)?;
         }
         bind(&temp.tmp, c"/tmp")?;
     }
@@ -2145,6 +2156,24 @@ mod tests {
             let errno = error.root_cause().downcast_ref::<std::io::Error>();
             assert_eq!(errno.and_then(|e| e.raw_os_error()), Some(libc::EACCES));
         });
+    }
+
+    /// A /var/tmp symlink is followed to its real directory, unless that is
+    /// inside /tmp (replaced anyway); a missing /var/tmp needs no mount.
+    #[test]
+    fn var_tmp_target_follows_symlinks_outside_tmp() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let (tmp, volume) = (root.join("tmp"), root.join("volume"));
+        std::fs::create_dir_all(tmp.join("inner")).unwrap();
+        std::fs::create_dir(&volume).unwrap();
+        let (outside, inside) = (root.join("var-outside"), root.join("var-inside"));
+        std::os::unix::fs::symlink(&volume, &outside).unwrap();
+        std::os::unix::fs::symlink(tmp.join("inner"), &inside).unwrap();
+        assert_eq!(super::var_tmp_target(&outside, &tmp), Some(volume.clone()));
+        assert_eq!(super::var_tmp_target(&volume, &tmp), Some(volume));
+        assert_eq!(super::var_tmp_target(&inside, &tmp), None);
+        assert_eq!(super::var_tmp_target(&root.join("missing"), &tmp), None);
     }
 
     #[test]
