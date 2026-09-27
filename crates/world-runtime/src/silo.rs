@@ -13,7 +13,7 @@ use std::{
     io::Write,
     net::{Ipv4Addr, SocketAddrV4, TcpListener},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    os::unix::ffi::OsStrExt,
+    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -498,7 +498,7 @@ fn create_in(
         // Never recompute a stored root from the current process's HOME:
         // only a legacy entry (predating this field) still has none.
         if world.temp_root.is_none() {
-            world.temp_root = Some(new_root(&home()?, world.ip)?);
+            fill_temp_root(&mut world, &worlds, &home()?, &root_owner(state, id)?)?;
             dirty = true;
         }
         if dirty {
@@ -507,20 +507,7 @@ fn create_in(
         }
         return Ok(world);
     }
-    let home = home()?;
-    let used: std::collections::HashSet<_> = worlds.values().map(|w| w.ip).collect();
-    let ip = (1..=65534u32)
-        .map(|n| Ipv4Addr::new(127, 77, (n >> 8) as u8, n as u8))
-        // On Linux the address only identifies the workspace; its namespace
-        // provides localhost, and all of 127/8 is always bindable.
-        .filter(|ip| !used.contains(ip) && (cfg!(target_os = "linux") || !alias_ready(*ip)))
-        // Temp roots are keyed by address under HOME, which other registries
-        // (another --state-dir) share: skip addresses whose root exists.
-        .find(|ip| root_for(&home, *ip).symlink_metadata().is_err())
-        .context("workspace address pool exhausted")?;
-    let temp_root = new_root(&home, ip)?;
-    // Claim the root now, so another registry under this HOME skips it.
-    temp_root_in(&home, ip)?;
+    let (ip, temp_root) = allocate(&worlds, &home()?, &root_owner(state, id)?)?;
     let world = World {
         id: id.into(),
         ip,
@@ -530,6 +517,94 @@ fn create_in(
     worlds.insert(id.into(), world.clone());
     save(state, &worlds)?;
     Ok(world)
+}
+
+/// Marker in a temp root naming the registry entry that owns it.
+const ROOT_OWNER: &str = "owner";
+
+/// Identity of a registry entry, as recorded in the temp root it owns.
+fn root_owner(state: &Path, id: &str) -> Result<Vec<u8>> {
+    let mut owner = state.canonicalize()?.into_os_string().into_encoded_bytes();
+    owner.push(b'\n');
+    owner.extend_from_slice(id.as_bytes());
+    owner.push(b'\n');
+    Ok(owner)
+}
+
+/// Claim `ip`'s temp root under `home` for `owner`. Temp roots are keyed by
+/// address under HOME, which registries with another `--state-dir` share,
+/// so the owner marker is created exclusively: of concurrent claimants
+/// only one wins. `None` when another owner holds the root, including one
+/// created before markers existed.
+fn claim_root(home: &Path, ip: Ipv4Addr, owner: &[u8]) -> Result<Option<PathBuf>> {
+    let root = new_root(home, ip)?;
+    let marker = root.join(ROOT_OWNER);
+    if root.symlink_metadata().is_ok() && marker.symlink_metadata().is_err() {
+        return Ok(None);
+    }
+    temp_root_in(home, ip)?;
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&marker)
+    {
+        Ok(mut file) => {
+            file.write_all(owner)?;
+            file.sync_all()?;
+            Ok(Some(root))
+        }
+        // A claimant still writing its marker reads as someone else's.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok((std::fs::read(&marker)? == owner).then_some(root))
+        }
+        Err(e) => Err(e).context("claim workspace temp root"),
+    }
+}
+
+/// A free address, with its temp root claimed for `owner`.
+fn allocate(
+    worlds: &BTreeMap<String, World>,
+    home: &Path,
+    owner: &[u8],
+) -> Result<(Ipv4Addr, PathBuf)> {
+    let used: std::collections::HashSet<_> = worlds.values().map(|w| w.ip).collect();
+    for n in 1..=65534u32 {
+        let ip = Ipv4Addr::new(127, 77, (n >> 8) as u8, n as u8);
+        // On Linux the address only identifies the workspace; its namespace
+        // provides localhost, and all of 127/8 is always bindable.
+        if used.contains(&ip) || (cfg!(not(target_os = "linux")) && alias_ready(ip)) {
+            continue;
+        }
+        if let Some(root) = claim_root(home, ip, owner)? {
+            return Ok((ip, root));
+        }
+    }
+    bail!("workspace address pool exhausted")
+}
+
+/// Give a legacy entry (predating `temp_root`) its temp root. Its address
+/// may already own a root claimed by another registry under this HOME
+/// (every registry starts at the same address); then it moves to a free
+/// one, as the address only identifies it on Linux.
+fn fill_temp_root(
+    world: &mut World,
+    worlds: &BTreeMap<String, World>,
+    home: &Path,
+    owner: &[u8],
+) -> Result<()> {
+    if let Some(root) = claim_root(home, world.ip, owner)? {
+        world.temp_root = Some(root);
+        return Ok(());
+    }
+    let (ip, root) = allocate(worlds, home, owner)?;
+    eprintln!(
+        "world: workspace {} moved from address {} to {}: another workspace under this HOME uses its temp directory; run world workspace setup {} again",
+        world.id, world.ip, ip, world.id
+    );
+    world.ip = ip;
+    world.temp_root = Some(root);
+    Ok(())
 }
 
 /// Take the exclusive registry lock, creating `state` first if needed. The
@@ -610,7 +685,7 @@ fn get_in(state: &Path, id: &str, home: impl FnOnce() -> Result<PathBuf>) -> Res
         .context("unknown workspace; run world workspace create first")?;
     valid(&stored, id)?;
     if stored.temp_root.is_none() {
-        stored.temp_root = Some(new_root(&home()?, stored.ip)?);
+        fill_temp_root(&mut stored, &worlds, &home()?, &root_owner(state, id)?)?;
         worlds.insert(id.into(), stored.clone());
         save(state, &worlds)?;
     }
@@ -1962,6 +2037,74 @@ mod tests {
         let b = create_at(second.path(), "A", work.path(), home.path()).unwrap();
         assert_ne!(a.temp_root, b.temp_root);
         assert!(a.temp_root.unwrap().is_dir());
+    }
+
+    /// Claims are exclusive: registries creating concurrently under one
+    /// HOME still end up with distinct temp roots.
+    #[test]
+    fn concurrent_registries_claim_distinct_temp_roots() {
+        let (work, home) = (workdir(), workdir());
+        let states: Vec<_> = (0..8).map(|_| tempfile::tempdir().unwrap()).collect();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(states.len()));
+        let jobs: Vec<_> = states
+            .iter()
+            .map(|state| {
+                let (s, w, h) = (
+                    state.path().to_owned(),
+                    work.path().to_owned(),
+                    home.path().to_owned(),
+                );
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    create_at(&s, "A", &w, &h).unwrap().temp_root.unwrap()
+                })
+            })
+            .collect();
+        let roots: std::collections::HashSet<_> =
+            jobs.into_iter().map(|job| job.join().unwrap()).collect();
+        assert_eq!(roots.len(), states.len());
+    }
+
+    /// Legacy entries of two registries under one HOME share the address
+    /// every registry starts at; filling in their temp roots must keep them
+    /// apart, moving the second to a free address.
+    #[test]
+    fn legacy_entries_sharing_an_address_get_distinct_temp_roots() {
+        let (work, home) = (workdir(), workdir());
+        let home_path = home.path().canonicalize().unwrap();
+        let states = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        for state in &states {
+            let mut worlds = BTreeMap::new();
+            let legacy = World {
+                id: "A".into(),
+                ip: Ipv4Addr::new(127, 77, 0, 1),
+                workdir: work.path().canonicalize().unwrap(),
+                temp_root: None,
+            };
+            worlds.insert("A".to_string(), legacy);
+            save(state.path(), &worlds).unwrap();
+        }
+        let first = get_in(states[0].path(), "A", || Ok(home_path.clone())).unwrap();
+        let second = get_in(states[1].path(), "A", || Ok(home_path.clone())).unwrap();
+        assert_eq!(first.ip, Ipv4Addr::new(127, 77, 0, 1));
+        assert_ne!(second.ip, first.ip);
+        assert_ne!(second.temp_root, first.temp_root);
+        // Recorded: a later lookup keeps the moved address.
+        assert_eq!(
+            get_in(states[1].path(), "A", || unreachable!()).unwrap().ip,
+            second.ip
+        );
+    }
+
+    /// A root that predates owner markers belongs to someone: skip it.
+    #[test]
+    fn allocation_skips_a_root_without_an_owner() {
+        let (state, work, home) = (tempfile::tempdir().unwrap(), workdir(), workdir());
+        let home_path = home.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root_for(&home_path, Ipv4Addr::new(127, 77, 0, 1))).unwrap();
+        let world = create_at(state.path(), "A", work.path(), home.path()).unwrap();
+        assert_eq!(world.ip, Ipv4Addr::new(127, 77, 0, 2));
     }
 
     /// End to end: a new workspace with a workdir under `/tmp` is refused
