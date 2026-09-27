@@ -2074,15 +2074,33 @@ pub(crate) struct Namespaces {
 
 /// The start time of `pid` if it is running: `None` once it has exited,
 /// even while it is still an unreaped zombie.
-fn live_start_time(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let zombie = stat
+/// Failing to read /proc (e.g. descriptor pressure) is an error, never
+/// mistaken for an exited process.
+fn live_start_time(pid: u32) -> Result<Option<u64>> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e).context("inspect the pasta monitor"),
+    };
+    // Fields after the parenthesized command name: state, then (field 22)
+    // the start time.
+    let rest = stat
         .rsplit_once(')')
-        .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'));
-    if zombie {
-        return None;
+        .map(|(_, rest)| rest.trim_start())
+        .context("parse process stat")?;
+    if rest.starts_with('Z') {
+        return Ok(None);
     }
-    start_time(pid).ok()
+    rest.split_whitespace()
+        .nth(19)
+        .and_then(|v| v.parse().ok())
+        .map(Some)
+        .context("parse process start time")
 }
 
 fn start_time(pid: u32) -> Result<u64> {
@@ -2130,9 +2148,11 @@ impl Holder {
     /// Whether pasta is still running: its monitor, recorded at setup,
     /// exits when pasta does (and the holder reaps it at once), so the
     /// monitor being alive with its recorded start time is the signal.
-    pub(crate) fn pasta_running(&self) -> bool {
-        self.monitor
-            .is_some_and(|(pid, started)| live_start_time(pid) == Some(started))
+    pub(crate) fn pasta_running(&self) -> Result<bool> {
+        let Some((pid, started)) = self.monitor else {
+            return Ok(false);
+        };
+        Ok(live_start_time(pid)? == Some(started))
     }
 
     /// Whether this holder predates the private /tmp: joining it would run
@@ -2472,15 +2492,20 @@ pub(crate) fn start_holder(temp: &PrivateTemp, egress: Option<&Egress>) -> Resul
         pidfd,
         commit: Some(ack_write),
     };
-    match Holder::observe(pid as u32) {
-        Ok(mut holder) => {
-            // A monitor that already exited (pasta died right after
-            // connecting) means no network: setup warns, and the next setup
-            // restarts the workspace.
-            holder.monitor = monitor.and_then(|m| live_start_time(m).map(|t| (m, t)));
-            holder.egress = holder.monitor.is_some();
-            Ok(started(holder))
-        }
+    let observed = Holder::observe(pid as u32).and_then(|mut holder| {
+        // A monitor that already exited (pasta died right after connecting)
+        // means no network: setup warns, and the next setup restarts the
+        // workspace. Failing to tell abandons the holder (below) rather
+        // than recording a live monitor as gone.
+        holder.monitor = match monitor {
+            Some(m) => live_start_time(m)?.map(|t| (m, t)),
+            None => None,
+        };
+        holder.egress = holder.monitor.is_some();
+        Ok(holder)
+    });
+    match observed {
+        Ok(holder) => Ok(started(holder)),
         Err(err) => {
             let unrecorded = started(Holder {
                 pid: pid as u32,
@@ -2975,10 +3000,13 @@ mod tests {
         }
         assert!(zombie);
         assert!(super::start_time(pid as u32).is_ok());
-        assert_eq!(super::live_start_time(pid as u32), None);
+        assert_eq!(super::live_start_time(pid as u32).unwrap(), None);
         // SAFETY: reaps our own child.
         unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
-        assert!(super::live_start_time(std::process::id()).is_some());
+        // Gone entirely: also not live, and not an error.
+        assert_eq!(super::live_start_time(pid as u32).unwrap(), None);
+        let own = super::live_start_time(std::process::id()).unwrap();
+        assert_eq!(own, Some(super::start_time(std::process::id()).unwrap()));
     }
 
     #[test]

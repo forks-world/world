@@ -1660,7 +1660,7 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
                         "world: restarting workspace {} without outbound network (WORLD_PASTA is empty); processes already running keep the old namespace",
                         world.id
                     );
-                } else if egress.is_some() && (!holder.egress || !holder.pasta_running()) {
+                } else if egress.is_some() && (!holder.egress || !holder.pasta_running()?) {
                     // Started without pasta (not installed then, or before
                     // workspaces had network), or pasta has died.
                     eprintln!(
