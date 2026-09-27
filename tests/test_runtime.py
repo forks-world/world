@@ -1398,6 +1398,27 @@ print(servers, answers > 0)
         self.assertEqual((result.returncode, result.stdout), (0, "['169.254.1.1'] True\n"), result.stderr)
 
     @unittest.skipUnless(PASTA, "pasta (passt) is not installed")
+    def test_pasta_gets_the_null_device_on_stdio(self):
+        # A WORLD_PASTA wrapper that insists on /dev/null stdio, as a
+        # wrapper reading stdin would otherwise block on the lifecycle pipe.
+        wrapper = self.root / "strict-pasta"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            "for fd in 0 1 2; do\n"
+            '  [ "$(readlink /proc/$$/fd/$fd)" = /dev/null ] || exit 1\n'
+            "done\n"
+            f'exec {shutil.which("pasta")} "$@"\n')
+        wrapper.chmod(0o755)
+        work = self.root / "P"
+        work.mkdir()
+        workspace = [WORLD, "workspace", "--state-dir", self.state]
+        self.assertEqual(run(*workspace, "create", "P", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *workspace, "teardown", "P")
+        result = run(*workspace, "setup", "P", env=dict(os.environ, WORLD_PASTA=str(wrapper)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("loopback only", result.stderr)
+
+    @unittest.skipUnless(PASTA, "pasta (passt) is not installed")
     def test_host_loopback_is_unreachable_through_the_gateway(self):
         script = """
 import socket, struct, sys

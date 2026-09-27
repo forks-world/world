@@ -701,12 +701,16 @@ unsafe fn pasta_monitor(egress: &Egress, life: RawFd, holder_end: RawFd) -> ! {
         libc::close(holder_end);
         // Only the null device on 0-2 and the life pipe on 3: nothing of
         // the holder's (its report pipe, acknowledgment socket) stays open.
+        // The pipe is moved out of the way first: it and the null device
+        // can land on any of 0-3, which the dup2s below overwrite.
+        let life = libc::fcntl(life, libc::F_DUPFD, 10);
         let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
-        if null < 0
-            || libc::dup2(life, 3) < 0
+        if life < 0
+            || null < 0
             || libc::dup2(null, 0) < 0
             || libc::dup2(null, 1) < 0
             || libc::dup2(null, 2) < 0
+            || libc::dup2(life, 3) < 0
             || close_from(4).is_err()
         {
             libc::_exit(127);
