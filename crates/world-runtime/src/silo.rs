@@ -1539,7 +1539,10 @@ async fn linux_exec(
                 return Err(std::io::Error::last_os_error());
             }
             crate::linux::close_extra_descriptors()?;
-            crate::linux::enter_pid_namespace()
+            crate::linux::enter_pid_namespace()?;
+            // Root keeps capabilities in the workspace user namespace; it
+            // must not unmount or replace mounts of the shared namespace.
+            crate::linux::drop_capabilities()
         }
     };
     if cancel.is_cancelled() || Instant::now() >= deadline {

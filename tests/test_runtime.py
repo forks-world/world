@@ -1329,6 +1329,29 @@ class LinuxWorkspace(unittest.TestCase):
         self.assertTrue((self.temp_root("A") / "var/tmp/wt-var").exists())
         self.assertFalse(os.path.lexists("/var/tmp/wt-var"))
 
+    def test_root_workload_cannot_unmount_the_private_temp(self):
+        # `unshare -r` makes the caller UID 0, as when root runs world: the
+        # workload must not keep capabilities in the shared namespaces, or it
+        # could unmount the private /tmp for every execution.
+        work = self.root / "R"
+        work.mkdir()
+        workspace = f'"$0" workspace --state-dir "$1"'
+        script = f"""
+{workspace} create R --workdir "$2" >/dev/null && {workspace} setup R || exit 125
+"$0" exec R --state-dir "$1" -- /bin/sh -c '
+  grep ^CapEff /proc/self/status | cut -f2
+  umount /tmp 2>/dev/null && echo unmounted
+  mount -t tmpfs none /tmp 2>/dev/null && echo mounted
+  test -e "$0" && echo host-visible
+  exit 0' "$3"
+status=$?
+{workspace} teardown R
+exit $status
+"""
+        with tempfile.NamedTemporaryFile(dir="/tmp") as host:
+            result = run("unshare", "-r", "/bin/sh", "-c", script, WORLD, self.state / "root-state", work, host.name)
+        self.assertEqual((result.returncode, result.stdout), (0, "0000000000000000\n"), result.stderr)
+
     def test_workspace_rejects_tmp_workdir(self):
         for workdir in ["/tmp", "/var/tmp"]:
             result = run(WORLD, "workspace", "--state-dir", self.state, "create", "T", "--workdir", workdir)

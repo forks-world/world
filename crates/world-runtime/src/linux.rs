@@ -370,18 +370,38 @@ pub(crate) unsafe fn join_namespaces(user: RawFd, mnt: RawFd, net: RawFd) -> IoR
 pub(crate) struct PrivateTemp {
     tmp: CString,
     var_tmp: CString,
-    /// Where the host /var/tmp really is, or `None` when it needs no mount
-    /// of its own (absent, or resolving into /tmp).
-    var_tmp_target: Option<CString>,
+    /// The host /var/tmp's real directory, when it lies outside /tmp.
+    var_tmp_outside: Option<CString>,
+    /// When the host /var/tmp resolves below /tmp: the directories to create
+    /// in the private /tmp, the last of which the private /var/tmp is bound
+    /// over, so the host symlink still reaches it.
+    var_tmp_inside: Vec<CString>,
 }
 
-/// The directory to bind the private /var/tmp over: the host's /var/tmp
-/// with symlinks resolved (it may point at, say, a persistent volume),
-/// unless that lands inside /tmp, which is already replaced as a whole.
-fn var_tmp_target(var_tmp: &Path, tmp: &Path) -> Option<std::path::PathBuf> {
-    let target = var_tmp.canonicalize().ok().filter(|p| p.is_dir())?;
+/// Where the host /var/tmp really is, symlinks resolved (it may point at,
+/// say, a persistent volume, or into /tmp).
+#[derive(Debug, PartialEq)]
+enum VarTmp {
+    /// Absent: nothing to replace.
+    Absent,
+    /// /tmp itself: the replaced /tmp serves both, as on the host.
+    SameAsTmp,
+    /// A directory outside /tmp, replaced in place.
+    Outside(std::path::PathBuf),
+    /// A directory below /tmp, relative to it: recreated in the private /tmp.
+    InsideTmp(std::path::PathBuf),
+}
+
+fn var_tmp_placement(var_tmp: &Path, tmp: &Path) -> VarTmp {
+    let Some(target) = var_tmp.canonicalize().ok().filter(|p| p.is_dir()) else {
+        return VarTmp::Absent;
+    };
     let tmp = tmp.canonicalize().unwrap_or_else(|_| tmp.to_path_buf());
-    (!target.starts_with(tmp)).then_some(target)
+    match target.strip_prefix(&tmp) {
+        Ok(rest) if rest.as_os_str().is_empty() => VarTmp::SameAsTmp,
+        Ok(rest) => VarTmp::InsideTmp(rest.to_path_buf()),
+        Err(_) => VarTmp::Outside(target),
+    }
 }
 
 impl PrivateTemp {
@@ -391,12 +411,23 @@ impl PrivateTemp {
         let c = |p: std::path::PathBuf| {
             CString::new(p.into_os_string().into_encoded_bytes()).context("path contains NUL")
         };
+        let (mut var_tmp_outside, mut var_tmp_inside) = (None, Vec::new());
+        match var_tmp_placement(Path::new("/var/tmp"), Path::new("/tmp")) {
+            VarTmp::Absent | VarTmp::SameAsTmp => {}
+            VarTmp::Outside(target) => var_tmp_outside = Some(c(target)?),
+            VarTmp::InsideTmp(rest) => {
+                let mut dir = std::path::PathBuf::from("/tmp");
+                for part in rest.components() {
+                    dir.push(part);
+                    var_tmp_inside.push(c(dir.clone())?);
+                }
+            }
+        }
         Ok(Self {
             tmp: c(root.join("tmp"))?,
             var_tmp: c(root.join("var/tmp"))?,
-            var_tmp_target: var_tmp_target(Path::new("/var/tmp"), Path::new("/tmp"))
-                .map(c)
-                .transpose()?,
+            var_tmp_outside,
+            var_tmp_inside,
         })
     }
 }
@@ -424,10 +455,18 @@ unsafe fn enter_private_temp(temp: &PrivateTemp) -> IoResult<()> {
                 std::ptr::null(),
             ))
         };
-        if let Some(target) = &temp.var_tmp_target {
+        if let Some(target) = &temp.var_tmp_outside {
             bind(&temp.var_tmp, target)?;
         }
         bind(&temp.tmp, c"/tmp")?;
+        for dir in &temp.var_tmp_inside {
+            if libc::mkdir(dir.as_ptr(), 0o755) < 0 && *libc::__errno_location() != libc::EEXIST {
+                return Err(Error::last_os_error());
+            }
+        }
+        if let Some(target) = temp.var_tmp_inside.last() {
+            bind(&temp.var_tmp, target)?;
+        }
     }
     Ok(())
 }
@@ -2158,10 +2197,11 @@ mod tests {
         });
     }
 
-    /// A /var/tmp symlink is followed to its real directory, unless that is
-    /// inside /tmp (replaced anyway); a missing /var/tmp needs no mount.
+    /// A /var/tmp symlink is followed to its real directory; one into /tmp
+    /// is kept relative to it, and exactly /tmp shares its replacement.
     #[test]
-    fn var_tmp_target_follows_symlinks_outside_tmp() {
+    fn var_tmp_placement_follows_symlinks() {
+        use super::VarTmp;
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
         let (tmp, volume) = (root.join("tmp"), root.join("volume"));
@@ -2170,10 +2210,14 @@ mod tests {
         let (outside, inside) = (root.join("var-outside"), root.join("var-inside"));
         std::os::unix::fs::symlink(&volume, &outside).unwrap();
         std::os::unix::fs::symlink(tmp.join("inner"), &inside).unwrap();
-        assert_eq!(super::var_tmp_target(&outside, &tmp), Some(volume.clone()));
-        assert_eq!(super::var_tmp_target(&volume, &tmp), Some(volume));
-        assert_eq!(super::var_tmp_target(&inside, &tmp), None);
-        assert_eq!(super::var_tmp_target(&root.join("missing"), &tmp), None);
+        let same = root.join("var-same");
+        std::os::unix::fs::symlink(&tmp, &same).unwrap();
+        let place = |p: &std::path::Path| super::var_tmp_placement(p, &tmp);
+        assert_eq!(place(&outside), VarTmp::Outside(volume.clone()));
+        assert_eq!(place(&volume), VarTmp::Outside(volume));
+        assert_eq!(place(&inside), VarTmp::InsideTmp("inner".into()));
+        assert_eq!(place(&same), VarTmp::SameAsTmp);
+        assert_eq!(place(&root.join("missing")), VarTmp::Absent);
     }
 
     #[test]
