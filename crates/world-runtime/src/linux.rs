@@ -2072,6 +2072,19 @@ pub(crate) struct Namespaces {
     pub mnt: Option<OwnedFd>,
 }
 
+/// The start time of `pid` if it is running: `None` once it has exited,
+/// even while it is still an unreaped zombie.
+fn live_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let zombie = stat
+        .rsplit_once(')')
+        .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'));
+    if zombie {
+        return None;
+    }
+    start_time(pid).ok()
+}
+
 fn start_time(pid: u32) -> Result<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
     // Fields after the parenthesized command name; start time is field 22.
@@ -2118,16 +2131,8 @@ impl Holder {
     /// exits when pasta does (and the holder reaps it at once), so the
     /// monitor being alive with its recorded start time is the signal.
     pub(crate) fn pasta_running(&self) -> bool {
-        let Some((pid, started)) = self.monitor else {
-            return false;
-        };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return false;
-        };
-        let zombie = stat
-            .rsplit_once(')')
-            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'));
-        !zombie && start_time(pid).ok() == Some(started)
+        self.monitor
+            .is_some_and(|(pid, started)| live_start_time(pid) == Some(started))
     }
 
     /// Whether this holder predates the private /tmp: joining it would run
@@ -2469,10 +2474,11 @@ pub(crate) fn start_holder(temp: &PrivateTemp, egress: Option<&Egress>) -> Resul
     };
     match Holder::observe(pid as u32) {
         Ok(mut holder) => {
-            holder.egress = monitor.is_some();
-            // If it already exited (pasta died at once), none is recorded:
-            // setup then sees pasta as not running and restarts it.
-            holder.monitor = monitor.and_then(|m| start_time(m).ok().map(|t| (m, t)));
+            // A monitor that already exited (pasta died right after
+            // connecting) means no network: setup warns, and the next setup
+            // restarts the workspace.
+            holder.monitor = monitor.and_then(|m| live_start_time(m).map(|t| (m, t)));
+            holder.egress = holder.monitor.is_some();
             Ok(started(holder))
         }
         Err(err) => {
@@ -2938,6 +2944,41 @@ mod tests {
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.ends_with("nameserver 169.254.1.1\n"), "{written}");
         assert!(!written.contains("stale"));
+    }
+
+    /// A zombie still has a start time in /proc, but is not running.
+    #[test]
+    fn live_start_time_rejects_zombies() {
+        // SAFETY: the child exits at once without returning into the
+        // harness; the parent reaps it below.
+        let pid = unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                libc::_exit(0);
+            }
+            pid
+        };
+        let mut zombie = false;
+        for _ in 0..100 {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            if stat
+                .rsplit_once(')')
+                .unwrap()
+                .1
+                .trim_start()
+                .starts_with('Z')
+            {
+                zombie = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(zombie);
+        assert!(super::start_time(pid as u32).is_ok());
+        assert_eq!(super::live_start_time(pid as u32), None);
+        // SAFETY: reaps our own child.
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        assert!(super::live_start_time(std::process::id()).is_some());
     }
 
     #[test]
