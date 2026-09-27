@@ -348,7 +348,9 @@ async fn relay(
 pub(crate) async fn forward(id: String, ip: Ipv4Addr, connector: NsConnector) {
     let pid = connector.pid;
     let connector = Arc::new(connector);
-    let mut active: HashMap<u16, (SocketAddr, tokio::task::JoinHandle<()>)> = HashMap::new();
+    // Dropped with this future (on `Forwarding` drop): every per-port task
+    // stops with it, and with each its relays.
+    let mut active: HashMap<u16, (SocketAddr, AbortOnDrop)> = HashMap::new();
     let read =
         |name: &str| std::fs::read_to_string(format!("/proc/{pid}/net/{name}")).unwrap_or_default();
     // Announce only ports that open while this exec runs (its own server,
@@ -361,11 +363,7 @@ pub(crate) async fn forward(id: String, ip: Ipv4Addr, connector: NsConnector) {
         // Also restart a relay whose target changed (e.g. the IPv4 listener
         // closed and an IPv6 one on the same port remains).
         active.retain(|port, (target, task)| {
-            let keep = wanted.get(port) == Some(target) && !task.is_finished();
-            if !keep {
-                task.abort();
-            }
-            keep
+            wanted.get(port) == Some(target) && !task.0.is_finished()
         });
         for (&port, &target) in &wanted {
             if active.contains_key(&port) {
@@ -394,13 +392,25 @@ pub(crate) async fn forward(id: String, ip: Ipv4Addr, connector: NsConnector) {
             }
             let connector = connector.clone();
             let task = tokio::spawn(async move {
+                let mut relays = tokio::task::JoinSet::new();
                 while let Ok((inbound, _)) = listener.accept().await {
-                    tokio::spawn(relay(inbound, connector.clone(), target));
+                    relays.spawn(relay(inbound, connector.clone(), target));
+                    // Forget finished relays.
+                    while relays.try_join_next().is_some() {}
                 }
             });
-            active.insert(port, (target, task));
+            active.insert(port, (target, AbortOnDrop(task)));
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// A task aborted when its handle is dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -422,6 +432,75 @@ impl Drop for Forwarding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dropping `Forwarding` stops every per-port listener, not just the
+    /// scan: nothing stays exposed on the host after the workload.
+    #[test]
+    fn dropping_forwarding_closes_host_listeners() {
+        let _serial = crate::linux::HOLDER_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("var/tmp")).unwrap();
+        std::fs::create_dir(root.path().join("tmp")).unwrap();
+        let temp = crate::linux::PrivateTemp::new(root.path()).unwrap();
+        let started = crate::linux::start_holder(&temp, None).unwrap();
+        let namespaces = started.holder.open().unwrap();
+        let connector =
+            NsConnector::start(namespaces.user.as_raw_fd(), namespaces.net.as_raw_fd()).unwrap();
+        // A listener inside the workspace: a socket made there by the
+        // connector, bound and listening from here.
+        let inside = unsafe {
+            std::net::TcpListener::from_raw_fd(connector.socket(false).unwrap().into_raw_fd())
+        };
+        let socket = unsafe { OwnedFd::from_raw_fd(libc::dup(inside.as_raw_fd())) };
+        let address = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 0,
+            sin_addr: libc::in_addr {
+                s_addr: u32::from(Ipv4Addr::LOCALHOST).to_be(),
+            },
+            sin_zero: [0; 8],
+        };
+        // SAFETY: bind/listen on a socket we own.
+        unsafe {
+            check(libc::bind(
+                socket.as_raw_fd(),
+                (&address as *const libc::sockaddr_in).cast(),
+                std::mem::size_of_val(&address) as libc::socklen_t,
+            ))
+            .unwrap();
+            check(libc::listen(socket.as_raw_fd(), 8)).unwrap();
+        }
+        let port = inside.local_addr().unwrap().port();
+        let ip = Ipv4Addr::new(127, 77, 250, 1);
+        let host = SocketAddr::new(IpAddr::V4(ip), port);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let forwarding = Forwarding::start("test".into(), ip, connector);
+            let mut reached = false;
+            for _ in 0..50 {
+                if tokio::net::TcpStream::connect(host).await.is_ok() {
+                    reached = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(reached, "the workspace listener was not forwarded");
+            drop(forwarding);
+            let mut closed = false;
+            for _ in 0..50 {
+                if tokio::net::TcpStream::connect(host).await.is_err() {
+                    closed = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(closed, "a host listener outlived its Forwarding");
+        });
+        drop((inside, socket, namespaces));
+        started.kill().unwrap();
+    }
 
     #[test]
     fn listeners_parses_both_tables() {
