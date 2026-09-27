@@ -617,16 +617,27 @@ fn resolv_conf(host: &str) -> String {
     out
 }
 
+/// Written in place, never replaced: a running holder has this very inode
+/// bound over /etc/resolv.conf, so updated search domains reach it live.
 fn write_resolv(path: &Path) -> Result<()> {
+    use std::io::{Seek, Write};
+    use std::os::unix::fs::OpenOptionsExt;
     let host = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
-    let dir = path.parent().context("resolv.conf path")?;
-    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-    std::io::Write::write_all(&mut temp, resolv_conf(&host).as_bytes())?;
-    std::fs::set_permissions(
-        temp.path(),
-        std::os::unix::fs::PermissionsExt::from_mode(0o644),
-    )?;
-    temp.persist(path).context("write workspace resolv.conf")?;
+    let content = resolv_conf(&host);
+    if std::fs::read_to_string(path).is_ok_and(|current| current == content) {
+        return Ok(());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .context("write workspace resolv.conf")?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    file.write_all(content.as_bytes())?;
+    file.set_len(content.len() as u64)?;
     Ok(())
 }
 
@@ -2451,7 +2462,8 @@ pub(crate) fn start_holder(temp: &PrivateTemp, egress: Option<&Egress>) -> Resul
                 net_ns: 0,
                 mnt_ns: None,
                 egress: false,
-                monitor: None,
+                // Known from the handshake: reaped after the kill below.
+                monitor: monitor.and_then(|m| start_time(m).ok().map(|t| (m, t))),
             });
             match unrecorded.kill() {
                 Ok(()) => Err(err),
@@ -2880,6 +2892,21 @@ mod tests {
             "options edns0 trust-ad\nsearch example.com\nnameserver 169.254.1.1\n"
         );
         assert_eq!(super::resolv_conf(""), "nameserver 169.254.1.1\n");
+    }
+
+    /// The file is updated in place: a running holder's bind keeps seeing it.
+    #[test]
+    fn write_resolv_keeps_the_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "stale content that is longer than the new one\n").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        super::write_resolv(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.ends_with("nameserver 169.254.1.1\n"), "{written}");
+        assert!(!written.contains("stale"));
     }
 
     #[test]
