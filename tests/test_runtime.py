@@ -1352,6 +1352,26 @@ exit $status
             result = run("unshare", "-r", "/bin/sh", "-c", script, WORLD, self.state / "root-state", work, host.name)
         self.assertEqual((result.returncode, result.stdout), (0, "0000000000000000\n"), result.stderr)
 
+    def test_deleted_temp_root_needs_setup_again(self):
+        work = self.root / "H"
+        work.mkdir()
+        workspace = [WORLD, "workspace", "--state-dir", self.state]
+        self.assertEqual(run(*workspace, "create", "H", "--workdir", work).returncode, 0)
+        self.addCleanup(run, *workspace, "teardown", "H")
+        self.assertEqual(run(*workspace, "setup", "H").returncode, 0)
+        root = self.temp_root("H")
+        shutil.rmtree(root)
+        # The holder still has the deleted directory mounted: refuse it.
+        result = run(*self.command("H", "fd", "999"))
+        self.assertEqual(result.returncode, 125)
+        self.assertIn("world workspace setup H", result.stderr)
+        result = run(*workspace, "setup", "H")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("temp directory changed", result.stderr)
+        result = run(*self.command("H")[:-1], "/bin/sh", "-c", "echo back > /tmp/wt-back")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((root / "tmp/wt-back").read_text(), "back\n")
+
     def test_workspace_rejects_tmp_workdir(self):
         for workdir in ["/tmp", "/var/tmp"]:
             result = run(WORLD, "workspace", "--state-dir", self.state, "create", "T", "--workdir", workdir)

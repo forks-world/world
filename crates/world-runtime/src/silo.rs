@@ -1587,14 +1587,22 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
         if let Some(holder) = holders.get(&world.id) {
             // A transient verification error must not orphan a live holder.
             if holder.verify()?.is_some() {
-                if !holder.legacy() {
+                if holder.legacy() {
+                    // Started before workspaces had a private /tmp.
+                    eprintln!(
+                        "world: restarting workspace {} to give it a private /tmp; processes already running keep the old namespace",
+                        world.id
+                    );
+                } else if holder.temp_is(&root.join("tmp")) {
                     return Ok(());
+                } else {
+                    // Its temp root was deleted, or the workspace moved to
+                    // a new one (see `owned_temp_root`).
+                    eprintln!(
+                        "world: restarting workspace {} because its temp directory changed; processes already running keep the old namespace",
+                        world.id
+                    );
                 }
-                // Started before workspaces had a private /tmp: replace it.
-                eprintln!(
-                    "world: restarting workspace {} to give it a private /tmp; processes already running keep the old namespace",
-                    world.id
-                );
                 crate::linux::stop_holder(holder)?;
             } else {
                 crate::linux::reap_stale_holder(holder);
@@ -1711,6 +1719,18 @@ async fn linux_exec(
     if holder.legacy() {
         bail!(
             "workspace {} was set up before it had a private /tmp; run world workspace setup {} again",
+            world.id,
+            world.id
+        );
+    }
+    let tmp = world
+        .temp_root
+        .as_ref()
+        .context("workspace has no temp root")?
+        .join("tmp");
+    if !holder.temp_is(&tmp) {
+        bail!(
+            "workspace {}'s temp directory changed since setup; run world workspace setup {} again",
             world.id,
             world.id
         );
@@ -2266,6 +2286,25 @@ mod tests {
         let (kept, root) = owned_temp_root(state.path(), &a).unwrap();
         assert_eq!((kept.ip, &root), (a.ip, &recorded));
         assert!(root.join("tmp").is_dir() && root.join("var/tmp").is_dir());
+    }
+
+    /// A holder left on a deleted (or abandoned) temp root is replaced by
+    /// setup rather than kept as already running.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_restarts_a_holder_whose_temp_root_changed() {
+        let (state, work, home) = (tempfile::tempdir().unwrap(), workdir(), workdir());
+        let world = create_at(state.path(), "T", work.path(), home.path()).unwrap();
+        setup(state.path(), &world).unwrap();
+        let first = holder(state.path(), "T").unwrap();
+        let root = world.temp_root.clone().unwrap();
+        assert!(first.temp_is(&root.join("tmp")));
+        std::fs::remove_dir_all(&root).unwrap();
+        setup(state.path(), &world).unwrap();
+        let second = holder(state.path(), "T").unwrap();
+        assert_ne!(second.pid, first.pid);
+        assert!(second.temp_is(&root.join("tmp")));
+        teardown(state.path(), &world).unwrap();
     }
 
     /// A root that predates owner markers belongs to someone: skip it.

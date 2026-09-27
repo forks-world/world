@@ -1705,6 +1705,16 @@ impl Holder {
         self.mnt_ns.is_none()
     }
 
+    /// Whether the /tmp this holder has mounted is still `tmp`. Deleting a
+    /// temp root leaves the holder on the deleted directory, and a root the
+    /// workspace moved away from is no longer its own; either way the
+    /// holder must be replaced. Any failure to tell counts as a mismatch.
+    pub(crate) fn temp_is(&self, tmp: &Path) -> bool {
+        let id = |p: &Path| std::fs::metadata(p).map(|m| (m.dev(), m.ino()));
+        let mounted = id(Path::new(&format!("/proc/{}/root/tmp", self.pid)));
+        matches!((mounted, id(tmp)), (Ok(a), Ok(b)) if a == b)
+    }
+
     /// Open the held namespaces, verifying they still belong to this holder.
     pub(crate) fn open(&self) -> Result<Namespaces> {
         self.verify()?
