@@ -93,6 +93,22 @@ fn default_state_dir_in(home: &Path) -> Result<PathBuf> {
     // Re-check under both locks: another process may have raced us to the
     // migration, or created a fresh registry at `new`, since the check above.
     let (move_registry, move_holders) = pending(&old, &new);
+    // The registry's identity (see `registry_id`) must travel with it: left
+    // behind, the moved registry would get a new one while a fresh registry
+    // at `old` inherited the old one, and with it the moved one's temp roots.
+    // Moved first: interrupted before the registry follows, the next run
+    // still moves the registry (and no identity is left to pair wrongly);
+    // the other way round, a remnant id in `new` would stick to it.
+    if pending_id(&old, &new, move_registry) {
+        std::fs::rename(old.join("registry-id"), new.join("registry-id")).with_context(|| {
+            format!(
+                "moving workspace registry id from {} to {}",
+                old.display(),
+                new.display()
+            )
+        })?;
+        File::open(&new)?.sync_all()?;
+    }
     if move_registry {
         std::fs::rename(old.join("registry.json"), new.join("registry.json")).with_context(
             || {
@@ -109,19 +125,6 @@ fn default_state_dir_in(home: &Path) -> Result<PathBuf> {
             old.display(),
             new.display()
         );
-    }
-    // The registry's identity (see `registry_id`) must travel with it: left
-    // behind, the moved registry would get a new one while a fresh registry
-    // at `old` inherited the old one, and with it the moved one's temp roots.
-    if pending_id(&old, &new, move_registry) {
-        std::fs::rename(old.join("registry-id"), new.join("registry-id")).with_context(|| {
-            format!(
-                "moving workspace registry id from {} to {}",
-                old.display(),
-                new.display()
-            )
-        })?;
-        File::open(&new)?.sync_all()?;
     }
     // Linux also keeps live holder records (`holders.json`) alongside the
     // registry; move them too so upgrading doesn't orphan a running
@@ -283,6 +286,25 @@ mod state_dir_tests {
             b"\"old\"\n"
         );
         assert!(!old.join("registry-id").exists());
+    }
+
+    /// Interrupted after the id moved but before the registry did: the
+    /// next run moves the registry to its own identity.
+    #[test]
+    fn resumes_after_the_id_moved_ahead_of_the_registry() {
+        let (_h, home) = home();
+        let work = tempfile::tempdir().unwrap();
+        let old = write_old_registry(&home, work.path());
+        let new = new_dir(&home);
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("registry-id"), b"\"old\"\n").unwrap();
+        default_state_dir_in(&home).unwrap();
+        assert!(new.join("registry.json").exists());
+        assert!(!old.join("registry.json").exists());
+        assert_eq!(
+            std::fs::read(new.join("registry-id")).unwrap(),
+            b"\"old\"\n"
+        );
     }
 
     #[test]
