@@ -2099,41 +2099,20 @@ impl Holder {
         reap_if_child(Some(&pidfd));
     }
 
-    /// The holder's pasta monitor, found among its children.
-    fn find_monitor(pid: u32) -> Option<(u32, u64)> {
-        let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).ok()?;
-        children.split_whitespace().find_map(|child| {
-            let child: u32 = child.parse().ok()?;
-            let comm = std::fs::read_to_string(format!("/proc/{child}/comm")).ok()?;
-            (comm.trim() == "world-pasta")
-                .then(|| start_time(child).ok().map(|t| (child, t)))
-                .flatten()
-        })
-    }
-
-    /// Whether pasta (a child of the holder's pasta monitor) is still
-    /// running. Unknown (no `children` file: CONFIG_PROC_CHILDREN) counts as
-    /// running.
+    /// Whether pasta is still running: its monitor, recorded at setup,
+    /// exits when pasta does (and the holder reaps it at once), so the
+    /// monitor being alive with its recorded start time is the signal.
     pub(crate) fn pasta_running(&self) -> bool {
-        let children =
-            |pid: &str| std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"));
-        let comm = |pid: &str| std::fs::read_to_string(format!("/proc/{pid}/comm"));
-        let Ok(monitors) = children(&self.pid.to_string()) else {
-            return true;
+        let Some((pid, started)) = self.monitor else {
+            return false;
         };
-        monitors.split_whitespace().any(|monitor| {
-            comm(monitor).is_ok_and(|c| c.trim() == "world-pasta")
-                && children(monitor).is_ok_and(|pastas| {
-                    pastas.split_whitespace().any(|pasta| {
-                        // A dead pasta is a zombie until the holder exits.
-                        let stat = std::fs::read_to_string(format!("/proc/{pasta}/stat"));
-                        stat.is_ok_and(|s| {
-                            !s.rsplit_once(')')
-                                .is_some_and(|(_, r)| r.trim_start().starts_with('Z'))
-                        })
-                    })
-                })
-        })
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let zombie = stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'));
+        !zombie && start_time(pid).ok() == Some(started)
     }
 
     /// Whether this holder predates the private /tmp: joining it would run
@@ -2338,6 +2317,13 @@ unsafe fn holder_process(
         if !send(status) {
             libc::_exit(125);
         }
+        // With pasta running, its monitor's PID follows: the caller records
+        // it to tell whether pasta is alive and to reap an adopted monitor.
+        if let (Some((monitor, _)), Some(_)) = (pasta, connected)
+            && !send(monitor)
+        {
+            libc::_exit(125);
+        }
         // Recorded: a holder whose setup died before persisting its record
         // could never be found or torn down, so it exits instead.
         expect();
@@ -2438,6 +2424,11 @@ pub(crate) fn start_holder(temp: &PrivateTemp, egress: Option<&Egress>) -> Resul
         reap_if_child(pidfd.as_ref());
         return Err(Error::from_raw_os_error(-status)).context("start World namespace holder");
     }
+    let monitor = if egress.is_some() && status == 0 {
+        Some(next().inspect_err(|_| reap_if_child(pidfd.as_ref()))? as u32)
+    } else {
+        None
+    };
     let started = |holder| StartedHolder {
         holder,
         pid,
@@ -2446,10 +2437,10 @@ pub(crate) fn start_holder(temp: &PrivateTemp, egress: Option<&Egress>) -> Resul
     };
     match Holder::observe(pid as u32) {
         Ok(mut holder) => {
-            holder.egress = egress.is_some() && status == 0;
-            if holder.egress {
-                holder.monitor = Holder::find_monitor(holder.pid);
-            }
+            holder.egress = monitor.is_some();
+            // If it already exited (pasta died at once), none is recorded:
+            // setup then sees pasta as not running and restarts it.
+            holder.monitor = monitor.and_then(|m| start_time(m).ok().map(|t| (m, t)));
             Ok(started(holder))
         }
         Err(err) => {
