@@ -2269,19 +2269,22 @@ unsafe fn holder_process(
         if !send(libc::getpid()) {
             libc::_exit(125);
         }
-        // One byte from the caller, or exit on EOF: the caller went away.
+        // One byte from the caller; false on EOF: the caller went away (or
+        // gave up on the holder).
         let expect = || {
             let mut byte = 0u8;
             loop {
                 match libc::read(1, (&mut byte as *mut u8).cast(), 1) {
-                    1 => return,
+                    1 => return true,
                     n if n < 0 && *libc::__errno_location() == libc::EINTR => {}
-                    _ => libc::_exit(125),
+                    _ => return false,
                 }
             }
         };
         // Pinned: never run unpinned.
-        expect();
+        if !expect() {
+            libc::_exit(125);
+        }
         let fail = |error: Error| -> ! {
             send(-error.raw_os_error().unwrap_or(libc::EIO));
             libc::_exit(125)
@@ -2346,8 +2349,16 @@ unsafe fn holder_process(
             libc::_exit(125);
         }
         // Recorded: a holder whose setup died before persisting its record
-        // could never be found or torn down, so it exits instead.
-        expect();
+        // could never be found or torn down, so it exits instead, and so
+        // does one the caller gives up on (see `StartedHolder::kill`). Its
+        // monitor is ended and reaped here first, as no one else could: a
+        // subreaper caller would adopt it with no record to reap it by.
+        if !expect() {
+            if let (Some((monitor, _)), Some(life)) = (pasta, connected) {
+                finish_monitor(monitor, life);
+            }
+            libc::_exit(125);
+        }
         libc::close(1);
         hold(connected)
     }
@@ -2472,8 +2483,8 @@ pub(crate) fn start_holder(temp: &PrivateTemp, egress: Option<&Egress>) -> Resul
                 net_ns: 0,
                 mnt_ns: None,
                 egress: false,
-                // Known from the handshake: reaped after the kill below.
-                monitor: monitor.and_then(|m| start_time(m).ok().map(|t| (m, t))),
+                // Uncommitted: the holder ends its own monitor on kill.
+                monitor: None,
             });
             match unrecorded.kill() {
                 Ok(()) => Err(err),
@@ -2573,11 +2584,18 @@ impl StartedHolder {
         }
     }
 
-    /// Stop the holder if it cannot be recorded. Signalling the pinned
-    /// pidfd opens nothing and reads nothing from /proc, so descriptor
-    /// pressure cannot make this fail; without pidfd (before Linux 5.3)
-    /// the PID is still ours, as the holder only exits when signalled.
-    pub(crate) fn kill(&self) -> IoResult<()> {
+    /// Stop the holder if it cannot be recorded. Before commit it waits on
+    /// the commit channel: closing that makes it end and reap its pasta
+    /// monitor, then exit, and a subreaper caller reaps the holder through
+    /// the pinned pidfd. This opens nothing and reads nothing from /proc,
+    /// so descriptor pressure cannot make it fail. (After commit, it is
+    /// killed like `stop_holder` does.)
+    pub(crate) fn kill(mut self) -> IoResult<()> {
+        if let Some(commit) = self.commit.take() {
+            drop(commit);
+            reap_if_child(self.pidfd.as_ref());
+            return Ok(());
+        }
         // SAFETY: plain-integer signalling; the pidfd is open when present.
         let result = unsafe {
             match &self.pidfd {
@@ -2982,6 +3000,11 @@ mod tests {
         started.kill().unwrap();
         // SAFETY: as above.
         unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0) };
+        assert_eq!(adopted_monitors(), Vec::<std::path::PathBuf>::new());
+    }
+
+    /// pasta monitors this test process has adopted (as a subreaper).
+    fn adopted_monitors() -> Vec<std::path::PathBuf> {
         let ours = format!("PPid:\t{}\n", std::process::id());
         let monitors = std::fs::read_dir("/proc").unwrap().filter_map(|entry| {
             let dir = entry.ok()?.path();
@@ -2989,10 +3012,35 @@ mod tests {
             let status = std::fs::read_to_string(dir.join("status")).ok()?;
             (comm.trim() == "world-pasta" && status.contains(&ours)).then_some(dir)
         });
-        assert_eq!(
-            monitors.collect::<Vec<_>>(),
-            Vec::<std::path::PathBuf>::new()
-        );
+        monitors.collect()
+    }
+
+    /// A connected holder that is given up before commit (its record could
+    /// not be persisted) ends its monitor itself: a subreaper caller is left
+    /// with neither the holder nor the monitor.
+    #[test]
+    fn uncommitted_connected_holder_takes_its_monitor_along() {
+        let Ok(Some(pasta)) = super::find_pasta() else {
+            return; // pasta is not installed
+        };
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("var/tmp")).unwrap();
+        std::fs::create_dir(root.path().join("tmp")).unwrap();
+        let temp = super::PrivateTemp::new(root.path()).unwrap();
+        let egress = super::Egress::with_program(root.path(), pasta).unwrap();
+        let _serial = super::SUBREAPER_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: prctl with integer arguments on this test process.
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+        let started = super::start_holder(&temp, Some(&egress)).unwrap();
+        assert!(started.holder.egress);
+        let holder = started.holder.pid;
+        started.kill().unwrap();
+        // SAFETY: as above.
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0) };
+        assert!(!std::path::Path::new(&format!("/proc/{holder}")).exists());
+        assert_eq!(adopted_monitors(), Vec::<std::path::PathBuf>::new());
     }
 
     #[test]

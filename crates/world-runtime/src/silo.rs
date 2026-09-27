@@ -1685,8 +1685,8 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
         holders.insert(world.id.clone(), started.holder);
         if let Err(err) = persist(state, "holders.json", &holders) {
             // An unrecorded holder could never be torn down or reused.
+            let pid = started.holder.pid;
             if let Err(kill) = started.kill() {
-                let pid = started.holder.pid;
                 return Err(err.context(format!("could not stop unrecorded holder {pid}: {kill}")));
             }
             return Err(err);
