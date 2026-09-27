@@ -13,7 +13,7 @@ use crate::{
     proxy::Proxy,
     run::{self, RunOptions},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use rand::Rng;
 use std::{
     ffi::{CStr, CString},
@@ -382,7 +382,8 @@ pub(crate) struct PrivateTemp {
 /// say, a persistent volume, or into /tmp).
 #[derive(Debug, PartialEq)]
 enum VarTmp {
-    /// Absent: nothing to replace.
+    /// No /var/tmp entry at all (e.g. a minimal container): nothing to
+    /// replace. Creating one takes root, so this is a stable state.
     Absent,
     /// /tmp itself: the replaced /tmp serves both, as on the host.
     SameAsTmp,
@@ -392,16 +393,26 @@ enum VarTmp {
     InsideTmp(std::path::PathBuf),
 }
 
-fn var_tmp_placement(var_tmp: &Path, tmp: &Path) -> VarTmp {
-    let Some(target) = var_tmp.canonicalize().ok().filter(|p| p.is_dir()) else {
-        return VarTmp::Absent;
-    };
-    let tmp = tmp.canonicalize().unwrap_or_else(|_| tmp.to_path_buf());
-    match target.strip_prefix(&tmp) {
+/// Anything but a missing entry or a resolvable directory (a dangling
+/// symlink, a lookup error) fails: skipping the mount would let the host
+/// /var/tmp show through once it resolves.
+fn var_tmp_placement(var_tmp: &Path, tmp: &Path) -> Result<VarTmp> {
+    if let Err(error) = var_tmp.symlink_metadata() {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(VarTmp::Absent);
+        }
+        return Err(error).context("inspect host /var/tmp");
+    }
+    let target = var_tmp
+        .canonicalize()
+        .context("resolve host /var/tmp; fix it and run setup again")?;
+    ensure!(target.is_dir(), "host /var/tmp is not a directory");
+    let tmp = tmp.canonicalize().context("resolve host /tmp")?;
+    Ok(match target.strip_prefix(&tmp) {
         Ok(rest) if rest.as_os_str().is_empty() => VarTmp::SameAsTmp,
         Ok(rest) => VarTmp::InsideTmp(rest.to_path_buf()),
         Err(_) => VarTmp::Outside(target),
-    }
+    })
 }
 
 impl PrivateTemp {
@@ -412,7 +423,7 @@ impl PrivateTemp {
             CString::new(p.into_os_string().into_encoded_bytes()).context("path contains NUL")
         };
         let (mut var_tmp_outside, mut var_tmp_inside) = (None, Vec::new());
-        match var_tmp_placement(Path::new("/var/tmp"), Path::new("/tmp")) {
+        match var_tmp_placement(Path::new("/var/tmp"), Path::new("/tmp"))? {
             VarTmp::Absent | VarTmp::SameAsTmp => {}
             VarTmp::Outside(target) => var_tmp_outside = Some(c(target)?),
             VarTmp::InsideTmp(rest) => {
@@ -2212,12 +2223,19 @@ mod tests {
         std::os::unix::fs::symlink(tmp.join("inner"), &inside).unwrap();
         let same = root.join("var-same");
         std::os::unix::fs::symlink(&tmp, &same).unwrap();
-        let place = |p: &std::path::Path| super::var_tmp_placement(p, &tmp);
+        let place = |p: &std::path::Path| super::var_tmp_placement(p, &tmp).unwrap();
         assert_eq!(place(&outside), VarTmp::Outside(volume.clone()));
         assert_eq!(place(&volume), VarTmp::Outside(volume));
         assert_eq!(place(&inside), VarTmp::InsideTmp("inner".into()));
         assert_eq!(place(&same), VarTmp::SameAsTmp);
         assert_eq!(place(&root.join("missing")), VarTmp::Absent);
+        // A dangling symlink may resolve later: refuse rather than skip.
+        let dangling = root.join("var-dangling");
+        std::os::unix::fs::symlink(root.join("not-yet"), &dangling).unwrap();
+        assert!(super::var_tmp_placement(&dangling, &tmp).is_err());
+        let file = root.join("file");
+        std::fs::write(&file, "").unwrap();
+        assert!(super::var_tmp_placement(&file, &tmp).is_err());
     }
 
     #[test]
