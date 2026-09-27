@@ -612,6 +612,13 @@ fn claim_root(home: &Path, ip: Ipv4Addr, owner: &[u8]) -> Result<Option<PathBuf>
         return Ok(None);
     }
     temp_root_in(home, ip)?;
+    Ok(mark_root(&root, owner)?.then_some(root))
+}
+
+/// Create `root`'s owner marker exclusively, or check the existing one:
+/// whether `owner` holds the root.
+fn mark_root(root: &Path, owner: &[u8]) -> Result<bool> {
+    let marker = root.join(ROOT_OWNER);
     match OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -621,14 +628,51 @@ fn claim_root(home: &Path, ip: Ipv4Addr, owner: &[u8]) -> Result<Option<PathBuf>
         Ok(mut file) => {
             file.write_all(owner)?;
             file.sync_all()?;
-            Ok(Some(root))
+            Ok(true)
         }
         // A claimant still writing its marker reads as someone else's.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok((std::fs::read(&marker)? == owner).then_some(root))
+            Ok(std::fs::read(&marker)? == owner)
         }
         Err(e) => Err(e).context("claim workspace temp root"),
     }
+}
+
+/// The recorded temp root of `world`, checked to still belong to it, with
+/// the entry as currently recorded. A root can be deleted and then claimed
+/// by another registry under the same HOME; reusing it would share /tmp
+/// with that workspace, so the workspace moves to a fresh address and root
+/// instead. A root without a marker (rebuilt after deletion, or created
+/// before markers existed) is claimed on the spot.
+pub fn owned_temp_root(state: &Path, world: &World) -> Result<(World, PathBuf)> {
+    let _lock = lock(state)?;
+    let mut worlds = registry(state)?;
+    let mut stored = worlds
+        .get(&world.id)
+        .cloned()
+        .context("unknown workspace; run world workspace create first")?;
+    valid(&stored, &world.id)?;
+    let root = temp_root(&stored)?;
+    let owner = root_owner(state, &stored.id)?;
+    if mark_root(&root, &owner)? {
+        return Ok((stored, root));
+    }
+    let home = root
+        .ancestors()
+        .nth(3)
+        .context("workspace temp root is too shallow")?
+        .to_path_buf();
+    let (ip, _) = allocate(&worlds, &home, &owner)?;
+    eprintln!(
+        "world: workspace {} moved from address {} to {}: its temp directory now belongs to another workspace; run world workspace setup {} again",
+        stored.id, stored.ip, ip, stored.id
+    );
+    stored.ip = ip;
+    stored.temp_root = Some(root_for(&home, ip));
+    worlds.insert(stored.id.clone(), stored.clone());
+    save(state, &worlds)?;
+    let root = temp_root(&stored)?;
+    Ok((stored, root))
 }
 
 /// A free address, with its temp root claimed for `owner`.
@@ -1533,9 +1577,11 @@ fn holder(state: &Path, id: &str) -> Result<crate::linux::Holder> {
 /// holding the workspace network namespace; no privilege is required.
 pub fn setup(state: &Path, world: &World) -> Result<()> {
     supported()?;
+    let (world, root) = owned_temp_root(state, world)?;
+    let world = &world;
     #[cfg(target_os = "linux")]
     {
-        let temp = crate::linux::PrivateTemp::new(&temp_root(world)?)?;
+        let temp = crate::linux::PrivateTemp::new(&root)?;
         let _lock = lock(state)?;
         let mut holders = read_map::<crate::linux::Holder>(state, "holders.json")?;
         if let Some(holder) = holders.get(&world.id) {
@@ -1571,7 +1617,7 @@ pub fn setup(state: &Path, world: &World) -> Result<()> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = state;
+        let _ = (state, root);
         if alias_ready(world.ip) {
             return Ok(());
         }
@@ -1636,8 +1682,7 @@ pub async fn exec(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = state;
-        macos_exec(world, command, duration, cancel).await
+        macos_exec(state, world, command, duration, cancel).await
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -1740,11 +1785,15 @@ fn exec_workdir(world: &World) -> Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 async fn macos_exec(
+    state: &Path,
     world: World,
     command: Vec<OsString>,
     duration: Duration,
     cancel: CancellationToken,
 ) -> Result<i32> {
+    // May move the workspace to a new address if its root was taken over;
+    // the alias check below then asks for setup again.
+    let (world, temp) = owned_temp_root(state, &world)?;
     if !alias_ready(world.ip) {
         bail!(
             "workspace loopback alias is not configured; run world workspace setup {}",
@@ -1752,7 +1801,6 @@ async fn macos_exec(
         );
     }
     let dir = exec_workdir(&world)?;
-    let temp = temp_root(&world)?;
     let executable = resolve_executable(&command[0], &dir, &temp)?;
     let library = std::env::current_exe()?
         .parent()
@@ -2177,6 +2225,47 @@ mod tests {
         let second = create_at(&old, "A", work.path(), home.path()).unwrap();
         assert_ne!(second.temp_root, first.temp_root);
         assert_eq!(get(&moved, "A").unwrap().temp_root, first.temp_root);
+    }
+
+    /// A recorded root that was deleted and then claimed by another
+    /// registry under the same HOME is not reused: the workspace moves to a
+    /// fresh address and root, recorded in its registry.
+    #[test]
+    fn owned_temp_root_moves_off_a_root_taken_by_another_registry() {
+        let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (work, home) = (workdir(), workdir());
+        let a = create_at(first.path(), "A", work.path(), home.path()).unwrap();
+        let taken = a.temp_root.clone().unwrap();
+        std::fs::remove_dir_all(&taken).unwrap();
+        let b = create_at(second.path(), "B", work.path(), home.path()).unwrap();
+        assert_eq!(b.temp_root.as_ref(), Some(&taken));
+        let (moved, root) = owned_temp_root(first.path(), &a).unwrap();
+        assert_ne!(moved.ip, a.ip);
+        assert_ne!(root, taken);
+        assert_eq!(moved.temp_root.as_ref(), Some(&root));
+        assert_eq!(get(first.path(), "A").unwrap().ip, moved.ip);
+        // The other registry's claim is untouched.
+        let owner = std::fs::read(taken.join(ROOT_OWNER)).unwrap();
+        assert_eq!(owner, root_owner(second.path(), "B").unwrap());
+    }
+
+    /// A recorded root without a marker (rebuilt, or from before markers)
+    /// is claimed in place; a deleted one nobody took is rebuilt in place.
+    #[test]
+    fn owned_temp_root_keeps_an_unclaimed_root() {
+        let (state, work, home) = (tempfile::tempdir().unwrap(), workdir(), workdir());
+        let a = create_at(state.path(), "A", work.path(), home.path()).unwrap();
+        let recorded = a.temp_root.clone().unwrap();
+        std::fs::remove_file(recorded.join(ROOT_OWNER)).unwrap();
+        let (kept, root) = owned_temp_root(state.path(), &a).unwrap();
+        assert_eq!((kept.ip, &root), (a.ip, &recorded));
+        let owner = std::fs::read(recorded.join(ROOT_OWNER)).unwrap();
+        assert_eq!(owner, root_owner(state.path(), "A").unwrap());
+
+        std::fs::remove_dir_all(&recorded).unwrap();
+        let (kept, root) = owned_temp_root(state.path(), &a).unwrap();
+        assert_eq!((kept.ip, &root), (a.ip, &recorded));
+        assert!(root.join("tmp").is_dir() && root.join("var/tmp").is_dir());
     }
 
     /// A root that predates owner markers belongs to someone: skip it.
