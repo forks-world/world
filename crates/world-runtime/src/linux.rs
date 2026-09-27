@@ -517,6 +517,10 @@ impl Egress {
         let Some(program) = find_pasta()? else {
             return Ok(None);
         };
+        Self::with_program(root, program).map(Some)
+    }
+
+    fn with_program(root: &Path, program: std::path::PathBuf) -> Result<Self> {
         let resolv = root.join("resolv.conf");
         write_resolv(&resolv)?;
         let c = |s: &str| CString::new(s).expect("static argument");
@@ -558,13 +562,13 @@ impl Egress {
             paths[1].as_ptr().cast(),
             std::ptr::null(),
         ]);
-        Ok(Some(Self {
+        Ok(Self {
             program: CString::new(program.into_os_string().into_encoded_bytes())?,
             _args: args,
             paths,
             argv,
             resolv: CString::new(resolv.into_os_string().into_encoded_bytes())?,
-        }))
+        })
     }
 }
 
@@ -2220,6 +2224,18 @@ impl Holder {
     }
 }
 
+/// Holder: close the monitor's life pipe, which makes it kill pasta and
+/// exit, and reap it. It may already be reaped (it exited while pasta was
+/// starting).
+unsafe fn finish_monitor(monitor: libc::pid_t, life: RawFd) {
+    unsafe {
+        libc::close(life);
+        while libc::waitpid(monitor, std::ptr::null_mut(), 0) < 0
+            && *libc::__errno_location() == libc::EINTR
+        {}
+    }
+}
+
 /// Holder status: started, but pasta could not connect the workspace.
 const NO_EGRESS: libc::pid_t = 1;
 
@@ -2300,25 +2316,34 @@ unsafe fn holder_process(
             },
             None => None,
         };
+        // Before reporting a failure or the loopback fallback, end the
+        // monitor and reap it here: a subreaper caller would otherwise
+        // adopt it, with no record to reap it by.
+        let fail_started = |error: Error| -> ! {
+            if let Some((monitor, life)) = pasta {
+                finish_monitor(monitor, life);
+            }
+            fail(error)
+        };
         let enter = || enter_new_namespaces(maps).and_then(|()| enter_private_temp(temp));
         if let Err(error) = enter() {
-            fail(error);
+            fail_started(error);
         }
         // Without a working pasta (an offline host, a broken binary) the
         // workspace still works with loopback only, as before it had
-        // network: closing the life pipe ends the monitor and pasta.
+        // network.
         let mut connected = None;
-        if let (Some(egress), Some((child, life))) = (egress, pasta) {
-            if start_pasta(child, life).is_ok() {
+        if let (Some(egress), Some((monitor, life))) = (egress, pasta) {
+            if start_pasta(monitor, life).is_ok() {
                 // A host without /etc/resolv.conf has nothing to replace.
                 if let Err(error) = bind_resolv(&egress.resolv)
                     && error.raw_os_error() != Some(libc::ENOENT)
                 {
-                    fail(error);
+                    fail_started(error);
                 }
                 connected = Some(life);
             } else {
-                libc::close(life);
+                finish_monitor(monitor, life);
             }
         }
         libc::prctl(libc::PR_SET_NAME, c"world-holder".as_ptr());
@@ -2915,6 +2940,43 @@ mod tests {
     fn fd_path_names_the_descriptor() {
         assert_eq!(super::fd_path(0).as_c_str(), c"/proc/self/fd/0");
         assert_eq!(super::fd_path(1234).as_c_str(), c"/proc/self/fd/1234");
+    }
+
+    /// A pasta that never connects makes the holder fall back to loopback;
+    /// it reaps the monitor itself first, so a subreaper caller that stops
+    /// the holder right away is not left with a zombie monitor.
+    #[test]
+    fn loopback_fallback_leaves_no_monitor_behind() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("var/tmp")).unwrap();
+        std::fs::create_dir(root.path().join("tmp")).unwrap();
+        let hanging = root.path().join("hanging-pasta");
+        std::fs::write(&hanging, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(
+            &hanging,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let temp = super::PrivateTemp::new(root.path()).unwrap();
+        let egress = super::Egress::with_program(root.path(), hanging).unwrap();
+        // SAFETY: prctl with integer arguments on this test process.
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+        let started = super::start_holder(&temp, Some(&egress)).unwrap();
+        assert!(!started.holder.egress);
+        started.kill().unwrap();
+        // SAFETY: as above.
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0) };
+        let ours = format!("PPid:\t{}\n", std::process::id());
+        let monitors = std::fs::read_dir("/proc").unwrap().filter_map(|entry| {
+            let dir = entry.ok()?.path();
+            let comm = std::fs::read_to_string(dir.join("comm")).ok()?;
+            let status = std::fs::read_to_string(dir.join("status")).ok()?;
+            (comm.trim() == "world-pasta" && status.contains(&ours)).then_some(dir)
+        });
+        assert_eq!(
+            monitors.collect::<Vec<_>>(),
+            Vec::<std::path::PathBuf>::new()
+        );
     }
 
     #[test]
