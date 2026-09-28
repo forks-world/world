@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/world-cli",
+    "crates/world-fsmodel",
     "crates/world-runtime",
     "crates/world-tmp-path",
     "vendor/silo-bind",

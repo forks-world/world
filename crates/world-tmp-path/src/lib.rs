@@ -727,6 +727,9 @@ pub fn map_under(
 }
 
 #[cfg(test)]
+mod model_props;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

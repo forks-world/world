@@ -922,6 +922,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "world-fsmodel"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "world-runtime"
 version = "0.1.0"
 dependencies = [
@@ -959,6 +966,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "proptest",
+ "world-fsmodel",
 ]
 
 [[package]]
