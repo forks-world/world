@@ -1316,9 +1316,9 @@ class NetworkSoak(unittest.TestCase):
     def test_network_soak(self):
         duration = 60 * SCALE
         names = list(self.worlds)
-        stop_at = time.time() + duration
         stop = threading.Event()
         errors = []
+        requests = {name: 0 for name in names}
         lock = threading.Lock()
         servers = {}
         logs = []
@@ -1355,6 +1355,9 @@ class NetworkSoak(unittest.TestCase):
                 self.assertTrue(line.startswith("READY"), (name, line))
                 servers[name] = (proc, int(line.split()[1]))
 
+            # Readiness waits must not use up the soak time.
+            stop_at = time.time() + duration
+
             def client_loop(name):
                 while time.time() < stop_at and not stop.is_set():
                     for other, (_, port) in servers.items():
@@ -1364,6 +1367,8 @@ class NetworkSoak(unittest.TestCase):
                         result = run_timeout(
                             self.command(name, "get", f"127.0.0.1:{port}"), timeout=15, env=self.env
                         )
+                        with lock:
+                            requests[name] += 1
                         ok = result.returncode == 0 and result.stdout == other
                         expected_ok = other == name
                         if ok != expected_ok:
@@ -1387,6 +1392,8 @@ class NetworkSoak(unittest.TestCase):
         self.assertEqual(alive, [], f"soak clients still running: {alive}")
         self.assertEqual(worker_errors, [], worker_errors[:20])
         self.assertEqual(errors, [], errors[:20])
+        idle = [n for n, c in requests.items() if c == 0]
+        self.assertEqual(idle, [], f"soak clients made no request: {requests}")
 
 
 if __name__ == "__main__":
