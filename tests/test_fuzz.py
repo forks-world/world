@@ -246,7 +246,7 @@ def env_prefix(env):
     return " ".join(f"{k}={env[k]}" for k in keys if env.get(k))
 
 
-def report_failure(env, profile, seed, run_id, ops_file, result, phase, replay_prefix=None):
+def report_failure(env, profile, seed, run_id, ops_file, result, phase, replay_prefix=None, note=None):
     """Save ops file, a minimized version, stdout/stderr under
     WORLD_FUZZ_ARTIFACTS; return a message with a copy-pasteable replay."""
     out = artifacts_dir()
@@ -276,6 +276,7 @@ def report_failure(env, profile, seed, run_id, ops_file, result, phase, replay_p
         f"{phase}: seed={seed} profile={profile} run_id={run_id} rc={result.returncode}\n"
         f"stdout={result.stdout!r}\nstderr={result.stderr!r}\n"
         f"artifacts: {saved}{' ' + str(minimized) if ok_min else ''}\nreplay: {replay}"
+        + (f"\nnote: {note}" if note else "")
     )
 
 
@@ -619,7 +620,17 @@ class ExecFuzzMixin(HostTempGuard):
                 try:
                     if result.returncode != 0:
                         prefix = " ".join(str(x) for x in self.command())
-                        self.fail(report_failure({}, self.profile, seed, run_id, ops_file, result, phase, replay_prefix=prefix))
+                        # The child ran with this class's HOME (workspaces record
+                        # their private /tmp under it): replay needs the same one.
+                        home = (self.child_env or os.environ).get("HOME")
+                        if home:
+                            prefix = f"HOME={home} {prefix}"
+                        note = (
+                            f"the workspace (--state-dir {self.state}) is removed at teardown; recreate it "
+                            f"before replaying: {WORLD} workspace --state-dir {self.state} create {self.world_name} "
+                            f"--workdir <dir> (and `setup {self.world_name}` on Linux)"
+                        )
+                        self.fail(report_failure({}, self.profile, seed, run_id, ops_file, result, phase, replay_prefix=prefix, note=note))
                     data = json.loads(result.stdout)
                     self.assertEqual(data["result"], "pass")
                     check_trees(troot, run_id, data)

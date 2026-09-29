@@ -84,14 +84,25 @@ WORLD_STRESS=1 WORLD_STRESS_SCALE=4 python3 -m unittest tests.test_stress -v
    WORLD_FUZZ_SEED=<seed> python3 -m unittest tests.test_fuzz -v
    ```
 
-   或者直接驱动 `fuzz_driver` 二进制做单步调试：
+   失败输出里的 `replay:` 那一行就是精确的复现命令，直接原样使用即可。它有两种形式，可作为模板：
 
-   ```sh
-   cargo run -p world-cli --example fuzz_driver -- replay <artifact-file>
-   cargo run -p world-cli --example fuzz_driver -- minimize <artifact-file>
-   ```
+   - macOS（shim，`ShimFuzz`）：在环境变量前缀下运行**已构建好的**二进制，而不是 `cargo run`（否则注入会落到 cargo 自己身上）：
 
-   `replay` 精确重放一次失败的操作序列；`minimize` 在保持失败的前提下缩短操作序列，便于定位。
+     ```sh
+     DYLD_INSERT_LIBRARIES=<dylib> SILO_IP=<ip> WORLD_SILO_ACTIVE=1 WORLD_SILO_ACK=<ack> WORLD_TMP=<root> \
+       target/debug/examples/fuzz_driver replay <artifact-file>
+     ```
+
+     `minimize` 同样要带这套环境前缀（把 `replay` 换成 `minimize`）。测试在 macOS 上失败时已自动做过一次最小化，产物在 `target/fuzz-artifacts`。
+   - Linux（`world exec`，`LinuxFuzz` / `PrivilegedExecFuzz`）：
+
+     ```sh
+     [HOME=<home>] world exec F --state-dir <state> --timeout 60s -- target/debug/examples/fuzz_driver replay <artifact-file>
+     ```
+
+     `world exec` 形式的失败产物不会被自动最小化。它依赖测试用的 workspace（`--state-dir`）仍然存在，而测试类在收尾时会删除它，所以复现前要先重建：`world workspace --state-dir <dir> create F --workdir <dir>`，Linux 上再执行 `setup F`；`PrivilegedExecFuzz` 还需要 loopback 别名和专用的 `HOME`。
+
+   直接运行 `fuzz_driver replay <artifact-file>`（不带上述环境或 `world exec`）是原生执行、没有任何重定向，只适合调试 harness 本身或守卫逻辑，不能复现 shim 或 namespace 里的分歧。
 3. Layer 1 的 proptest 失败会在 `crates/world-tmp-path/proptest-regressions/` 生成回归文件，直接提交进仓库即可保证之后不再回归。
 4. 长期有价值的 Layer 2 失败序列可以整理进 `tests/fuzz-corpus/`，作为固定回归语料，每次运行都会重放，不依赖随机种子命中。
 
