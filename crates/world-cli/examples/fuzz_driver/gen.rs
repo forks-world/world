@@ -853,7 +853,7 @@ impl Generator {
         // A garbage `dirfd` just exercises `EBADF` (`record` no-ops on any
         // nonzero errno); a real one gives us a fresh open file fd to reuse
         // for later `Write`/`Read`/`CloseFd` -- the target directory itself
-        // is deliberately not tracked as a node (see `dir_for_open_fd`).
+        // is not tracked as a node.
         plain(
             Op::OpenAt {
                 dirfd,
@@ -878,18 +878,39 @@ impl Generator {
     fn gen_unlinkat(&mut self) -> GenStep {
         let dirfd = self.pick_dirfd();
         let rmdir = self.rng.chance(1, 2);
-        let name = if let Some(dir) = self.dir_for_open_fd(dirfd) {
-            let kind = if rmdir { Kind::Dir } else { Kind::File };
-            self.pick(&self.direct_children_of(&dir, kind))
+        let dir = self.dir_for_open_fd(dirfd);
+        let name = if let Some(dir) = &dir {
+            let mut cands = if rmdir {
+                // Never the cwd or a directory a tracked fd still has open:
+                // the same model gap `gen_rmdir` avoids.
+                let mut c = self.direct_children_of(dir, Kind::Dir);
+                c.retain(|p| p != &self.cwd && !self.open_dir_paths.values().any(|o| o == p));
+                c
+            } else {
+                let mut c = self.direct_children_of(dir, Kind::File);
+                c.extend(self.direct_children_of(dir, Kind::Symlink));
+                c
+            };
+            cands.sort();
+            self.pick(&cands)
                 .map(|p| basename(&p))
                 .unwrap_or_else(|| self.fresh_name())
         } else {
             self.fresh_name()
         };
-        let effect = if let Some(dir) = self.dir_for_open_fd(dirfd) {
-            Effect::Remove(join(&dir, &name))
-        } else {
-            Effect::None
+        let effect = match &dir {
+            Some(dir) => {
+                let target = join(dir, &name);
+                // A fresh-name fallback can still collide with the cwd or an
+                // open directory; never rmdir those.
+                if rmdir
+                    && (target == self.cwd || self.open_dir_paths.values().any(|o| o == &target))
+                {
+                    return plain(Op::Getcwd, Effect::None);
+                }
+                Effect::Remove(target)
+            }
+            None => Effect::None,
         };
         plain(
             Op::UnlinkAt {
@@ -904,17 +925,8 @@ impl Generator {
     /// The canonical directory this *model* fd number is tracked as, if we
     /// know it: we only remember this for fds opened via `OpenDir`
     /// (`gen_opendir`), keyed by the directory chosen at that time.
-    fn dir_for_open_fd(&self, _fd: u32) -> Option<Vec<u8>> {
-        // Bookkeeping simplification: `OpenAt`/`MkdirAt`/`UnlinkAt` targets
-        // are only tracked when generated against `self.cwd` itself (the
-        // common case, since `open_dirs` usually holds a recent `OpenDir`
-        // of some tracked directory); anything else is still safe (the
-        // dirfd is always either a real, currently-open tracked resource or
-        // a deliberately-unused number) but simply isn't followed into the
-        // node table. Kept conservative on purpose: a missed bookkeeping
-        // entry only means slightly less coverage of later ops referencing
-        // that node, never an incorrect comparison.
-        None
+    fn dir_for_open_fd(&self, fd: u32) -> Option<Vec<u8>> {
+        self.open_dir_paths.get(&fd).cloned()
     }
 
     /// A name definitely not already a child of `dir` (checked against both
@@ -999,7 +1011,11 @@ impl Generator {
                 });
                 self.open_files.push(ret as u32);
             }
-            Effect::Remove(path) => self.nodes.retain(|n| &n.path != path),
+            Effect::Remove(path) => {
+                self.nodes.retain(|n| &n.path != path);
+                self.sockets.retain(|s| s != path);
+                self.escaping_links.retain(|l| l != path);
+            }
             Effect::Rename(from, to) => {
                 // A rename moves `from`'s whole subtree (and, if `to`
                 // already existed as an empty dir, replaces it): every
@@ -1046,5 +1062,114 @@ impl Generator {
                 self.open_dir_paths.remove(fd);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure generator-state tests: nothing here touches the filesystem.
+    use super::*;
+
+    const FD: u32 = 5;
+
+    fn generator() -> Generator {
+        let mut g = Generator::new(1, "fz-00000000", false, false);
+        let root = g.tmp_root.clone();
+        g.record(&Effect::RegisterDirFd(root), FD as i64, 0);
+        g
+    }
+
+    fn has_node(g: &Generator, path: &[u8]) -> bool {
+        g.nodes.iter().any(|n| n.path == path)
+    }
+
+    /// Generates `mkdirat` steps until one targets `FD`, records it, and
+    /// returns the created name.
+    fn make_child(g: &mut Generator) -> Vec<u8> {
+        for _ in 0..200 {
+            let step = g.gen_mkdirat();
+            if let (Op::MkdirAt { dirfd, path }, Effect::AddNode(p, Kind::Dir)) =
+                (&step.op, &step.on_success)
+            {
+                assert_eq!(*dirfd, FD);
+                assert_eq!(p, &join(&g.tmp_root, path));
+                let name = path.clone();
+                g.record(&step.on_success, 0, 0);
+                return name;
+            }
+        }
+        panic!("gen_mkdirat never targeted the tracked dirfd");
+    }
+
+    #[test]
+    fn mkdirat_through_tracked_dirfd_records_child() {
+        let mut g = generator();
+        let name = make_child(&mut g);
+        assert!(has_node(&g, &join(&g.tmp_root, &name)));
+    }
+
+    #[test]
+    fn unlinkat_selects_existing_child() {
+        let mut g = generator();
+        let name = make_child(&mut g);
+        let want = join(&g.tmp_root, &name);
+        for _ in 0..500 {
+            let step = g.gen_unlinkat();
+            if let (
+                Op::UnlinkAt {
+                    dirfd: FD,
+                    rmdir: true,
+                    path,
+                },
+                Effect::Remove(p),
+            ) = (&step.op, &step.on_success)
+                && path == &name
+            {
+                assert_eq!(p, &want);
+                return;
+            }
+        }
+        panic!("gen_unlinkat never selected the existing child");
+    }
+
+    #[test]
+    fn unlinkat_never_rmdirs_cwd_or_open_dir() {
+        for use_cwd in [false, true] {
+            let mut g = generator();
+            let a = join(&g.tmp_root, b"a");
+            g.record(&Effect::AddNode(a.clone(), Kind::Dir), 0, 0);
+            if use_cwd {
+                g.record(&Effect::Chdir(a.clone()), 0, 0);
+            } else {
+                g.record(&Effect::RegisterDirFd(a.clone()), 6, 0);
+            }
+            for _ in 0..2000 {
+                let step = g.gen_unlinkat();
+                if let (
+                    Op::UnlinkAt {
+                        dirfd: FD,
+                        rmdir: true,
+                        ..
+                    },
+                    Effect::Remove(p),
+                ) = (&step.op, &step.on_success)
+                {
+                    assert_ne!(p, &a, "rmdir of a protected directory");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remove_retires_socket_and_escaping_link() {
+        let mut g = generator();
+        let s = join(&g.tmp_root, b"sock");
+        let l = join(&g.tmp_root, b"lnk");
+        g.sockets.push(s.clone());
+        g.escaping_links.push(l.clone());
+        g.record(&Effect::Remove(s), 0, 0);
+        g.record(&Effect::Remove(l), 0, 0);
+        assert!(g.sockets.is_empty());
+        assert!(g.escaping_links.is_empty());
     }
 }
