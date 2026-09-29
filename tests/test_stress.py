@@ -902,6 +902,93 @@ class StressProbeRefusesUnredirected(unittest.TestCase):
         self.assertFalse(os.path.lexists(self.target))
 
 
+@unittest.skipUnless(MACOS, "native silo shim requires macOS")
+class StressProbeRefusesSymlinkedDir(unittest.TestCase):
+    """A symlink already planted below the redirected /tmp (R -> victim, or
+    R/0 -> victim) must make every stress_probe mode refuse with rc 2 and
+    leave the victim (outside the private tree) untouched: `open_validated`
+    walks --dir fd-relative with O_NOFOLLOW."""
+
+    def setUp(self):
+        self.short = short_dir(".wt-stress-symdir-")
+        self.addCleanup(self.short.cleanup)
+        self.base = pathlib.Path(self.short.name)
+        self.world_tmp = self.base / "w"
+        (self.world_tmp / "tmp").mkdir(parents=True)
+        (self.world_tmp / "var/tmp").mkdir(parents=True)
+        self.ack = self.base / "ack"
+        self.ack.touch()
+        self.victim_holder = short_dir(".wt-stress-victim-")
+        self.addCleanup(self.victim_holder.cleanup)
+        self.victim = pathlib.Path(self.victim_holder.name) / "victim"
+        self.victim.mkdir()
+        (self.victim / "sentinel").write_text("keep me")
+        self.planted = []
+        self.addCleanup(self.remove_planted)
+        self.host_target = f"/private/tmp/sp-{uuid.uuid4().hex}"
+
+    def remove_planted(self):
+        # Only ever unlink the exact symlinks (never follow them).
+        for link in reversed(self.planted):
+            if os.path.islink(link):
+                owned_remove(link, self.world_tmp)
+        self.planted.clear()
+        r = self.world_tmp / "tmp/R"
+        if r.is_dir() and not r.is_symlink():
+            assert_owned(r, self.world_tmp)
+            shutil.rmtree(r, ignore_errors=True)
+
+    def plant(self, link, target):
+        assert_owned(link, self.world_tmp)
+        os.symlink(str(target), str(link))
+        self.planted.append(link)
+
+    def snapshot(self):
+        return {
+            name: (self.victim / name).read_bytes() if (self.victim / name).is_file() else None
+            for name in sorted(os.listdir(self.victim))
+        }
+
+    def modes(self):
+        return {
+            "storm": ["storm", "--threads", "1", "--iters", "1", "--dir", "/tmp/R"],
+            "spawn-storm": ["spawn-storm", "--threads", "2", "--iters", "1", "--dir", "/tmp/R"],
+            "fork-exec-storm": ["fork-exec-storm", "--threads", "1", "--iters", "1", "--dir", "/tmp/R"],
+            "touch": ["touch", "/tmp/R/0/x", "m"],
+        }
+
+    def check_refused(self, label):
+        before = self.snapshot()
+        env = shim_env(self.world_tmp, self.ack)
+        for mode, args in self.modes().items():
+            with self.subTest(case=label, mode=mode):
+                result = run_timeout([STRESS_PROBE, *args], timeout=60, env=env)
+                self.assertEqual(result.returncode, 2, f"{result.stdout} {result.stderr}")
+                self.assertIn("not a real directory inside the private tree", result.stderr)
+                self.assertEqual(self.snapshot(), before)
+                self.assertEqual((self.victim / "sentinel").read_text(), "keep me")
+                self.assertFalse(os.path.lexists(self.host_target))
+                self.assertFalse(os.path.lexists("/tmp/R"))
+
+    def test_symlinked_dir_is_refused(self):
+        phys_r = self.world_tmp / "tmp/R"
+        self.plant(phys_r, self.victim)
+        self.check_refused("R -> victim")
+        self.remove_planted()
+
+    def test_symlinked_thread_dir_is_refused(self):
+        phys_r = self.world_tmp / "tmp/R"
+        phys_r.mkdir()
+        self.plant(phys_r / "0", self.victim)
+        self.check_refused("R/0 -> victim")
+        self.remove_planted()
+
+    def test_symlink_to_host_tmp_is_refused(self):
+        self.plant(self.world_tmp / "tmp/R", self.host_target)
+        self.check_refused("R -> /private/tmp/<uuid>")
+        self.remove_planted()
+
+
 # ---------------------------------------------------------------------------
 # 5a'. unit tests for this file's own bounded-concurrency helpers (no
 # privileges, no world binary).

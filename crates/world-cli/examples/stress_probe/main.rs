@@ -16,12 +16,15 @@
 //! `/tmp` (see `check_dir_allowed`), so a bug here can never reach outside
 //! whatever `/tmp`/`/private/tmp` is redirected to (the macOS shim's
 //! WORLD_TMP tree, or a Linux bind mount) -- never the real host filesystem.
-//! The lexical check is backed by `verify_redirected`, which proves (without
+//! The lexical check is backed by `verify_redirected` and `open_validated`
+//! (no symlinked component below /tmp); `verify_redirected` proves (without
 //! writing anything) that `/tmp` really is the redirected tree, and fails
 //! closed otherwise.
 use std::collections::BTreeMap;
 use std::ffi::CString;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -132,6 +135,14 @@ fn flag_u64(flags: &BTreeMap<String, String>, name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Where a validated `--dir` is anchored.
+enum Root {
+    /// The lexical `/tmp` or `/private/tmp` prefix (must be proven redirected).
+    Tmp(&'static str),
+    /// `$STRESS_PROBE_EXTRA_ROOT`: a genuinely separate scratch root.
+    Extra(PathBuf),
+}
+
 /// Refuse to operate outside a redirected /tmp: `--dir` must start with
 /// "/tmp/" or "/private/tmp/" so that under the macOS shim, or a Linux bind
 /// mount, every path this binary touches can only ever land inside the
@@ -142,10 +153,10 @@ fn flag_u64(flags: &BTreeMap<String, String>, name: &str, default: u64) -> u64 {
 /// `STRESS_PROBE_EXTRA_ROOT`; a stray/unexpected invocation can never set
 /// that for itself.
 ///
-/// `Ok(true)` means the `/tmp` prefix matched, so the caller must also pass
-/// `verify_redirected`; `Ok(false)` means the `STRESS_PROBE_EXTRA_ROOT`
-/// branch matched (a genuinely separate scratch root, no redirection).
-fn check_dir_allowed(dir: &Path) -> Result<bool, String> {
+/// `Root::Tmp` means the `/tmp` prefix matched, so the caller must also
+/// pass `verify_redirected`; `Root::Extra` means the
+/// `STRESS_PROBE_EXTRA_ROOT` branch matched (no redirection to prove).
+fn check_dir_allowed(dir: &Path) -> Result<Root, String> {
     // A `..` component could climb out of the allowed prefix textually.
     if dir
         .components()
@@ -154,14 +165,16 @@ fn check_dir_allowed(dir: &Path) -> Result<bool, String> {
         return Err(format!("--dir {} must not contain `..`", dir.display()));
     }
     let s = dir.to_string_lossy();
-    if s.starts_with("/tmp/") || s.starts_with("/private/tmp/") {
-        return Ok(true);
+    for prefix in ["/tmp", "/private/tmp"] {
+        if s.starts_with(prefix) && s[prefix.len()..].starts_with('/') {
+            return Ok(Root::Tmp(prefix));
+        }
     }
     if let Ok(extra) = std::env::var("STRESS_PROBE_EXTRA_ROOT")
         && !extra.is_empty()
         && dir.starts_with(&extra)
     {
-        return Ok(false);
+        return Ok(Root::Extra(PathBuf::from(extra)));
     }
     Err(format!(
         "--dir {} is not under /tmp or /private/tmp (and not under $STRESS_PROBE_EXTRA_ROOT); refusing to run",
@@ -184,10 +197,17 @@ const HOST_TEMP_ROOTS: [&str; 4] = ["/tmp", "/private/tmp", "/var/tmp", "/privat
 /// because `<phys>` is outside every temp root. Unshimmed, `/tmp` is the host
 /// temp dir and the identities differ. Every failure -- including any I/O
 /// error -- refuses (fail closed).
-fn verify_redirected() -> Result<(), String> {
+///
+/// The proof is made on an fd: `prefix` (the lexical "/tmp" or
+/// "/private/tmp" the caller's `--dir` starts with) is opened with
+/// `O_DIRECTORY|O_CLOEXEC`, and that fd is `fstat`ed and compared against
+/// `lstat("<phys>/tmp")`. The returned fd is the anchor `open_validated`
+/// walks from, so there is no window between "verified" and "used", and a
+/// `/private/tmp` dir is never accepted on the strength of `/tmp` alone.
+fn verify_redirected(prefix: &str) -> Result<OwnedFd, String> {
     use std::os::unix::fs::MetadataExt;
     let fail =
-        |why: String| -> Result<(), String> { Err(format!("not running redirected: {why}")) };
+        |why: String| -> Result<OwnedFd, String> { Err(format!("not running redirected: {why}")) };
 
     let phys = std::env::var_os("STRESS_PROBE_PHYSICAL_ROOT")
         .filter(|v| !v.is_empty())
@@ -223,31 +243,135 @@ fn verify_redirected() -> Result<(), String> {
             real.display()
         ));
     }
-    let redirected = match std::fs::metadata("/tmp") {
-        Ok(m) => m,
-        Err(e) => return fail(format!("stat /tmp: {e}")),
+    let root_fd = match open_dir_fd(libc::AT_FDCWD, &cstr(Path::new(prefix)), false) {
+        Ok(fd) => fd,
+        Err(e) => return fail(format!("open {prefix}: {e}")),
+    };
+    let redirected = match fstat_fd(&root_fd) {
+        Ok(st) => st,
+        Err(e) => return fail(format!("fstat {prefix}: {e}")),
     };
     let private_tmp = real.join("tmp");
     let private = match std::fs::symlink_metadata(&private_tmp) {
         Ok(m) => m,
         Err(e) => return fail(format!("lstat {}: {e}", private_tmp.display())),
     };
-    if !private.is_dir() || (redirected.dev(), redirected.ino()) != (private.dev(), private.ino()) {
+    if !private.is_dir()
+        || (redirected.st_dev as u64, redirected.st_ino as u64) != (private.dev(), private.ino())
+    {
         return fail(format!(
-            "/tmp is not {} (a shared host temp dir would be touched)",
+            "{prefix} is not {} (a shared host temp dir would be touched)",
             private_tmp.display()
         ));
     }
-    Ok(())
+    Ok(root_fd)
 }
 
-/// Lexical `check_dir_allowed`, plus `verify_redirected` whenever the
-/// `/tmp` prefix (not the explicit extra root) is what allowed `dir`.
-fn guard_dir(dir: &Path) -> Result<(), String> {
-    if check_dir_allowed(dir)? {
-        verify_redirected()?;
+/// `openat(dirfd, path, O_RDONLY|O_DIRECTORY[|O_NOFOLLOW]|O_CLOEXEC)`.
+fn open_dir_fd(dirfd: libc::c_int, path: &CString, nofollow: bool) -> std::io::Result<OwnedFd> {
+    let mut flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    if nofollow {
+        flags |= libc::O_NOFOLLOW;
     }
-    Ok(())
+    // SAFETY: `path` is a valid NUL-terminated string for the whole call.
+    let fd = unsafe { libc::openat(dirfd, path.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by openat and is owned by nobody else.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn fstat_fd(fd: &OwnedFd) -> std::io::Result<libc::stat> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `st` is a valid out-pointer; `fd` is an open descriptor.
+    if unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fstat succeeded, so `st` is initialized.
+    Ok(unsafe { st.assume_init() })
+}
+
+const NOT_PRIVATE: &str = "not a real directory inside the private tree";
+
+/// Resolve `dir` to an fd, proving every component is a real directory
+/// inside the private tree. The anchor is `verify_redirected`'s fd for a
+/// `/tmp` dir (or an fd opened on `$STRESS_PROBE_EXTRA_ROOT`); the remaining
+/// components are walked fd-relative: `.`/`..`/empty components are refused,
+/// each is `mkdirat`ed first when `create` (EEXIST ignored), then
+/// `openat`ed with `O_DIRECTORY|O_NOFOLLOW` (a symlink yields ELOOP/ENOTDIR
+/// and is refused), and must stay on the root's device (no crossing
+/// mounts). A pre-existing symlink below `/tmp` can therefore never redirect
+/// a later absolute-path operation on `dir`, because the caller only goes on
+/// once this returns.
+///
+/// Remaining race: the storm operations themselves use absolute paths (they
+/// exist to exercise the shim's absolute-path interposition), so another
+/// writer that already has access to the private tree could swap a validated
+/// component for a symlink between this walk and the operation. The private
+/// tree is owned by the harness, so that is outside the threat model; only
+/// the final component of each storm operation is `O_NOFOLLOW`.
+fn open_validated(dir: &Path, create: bool) -> Result<OwnedFd, String> {
+    let (root_fd, rest) = match check_dir_allowed(dir)? {
+        Root::Tmp(prefix) => {
+            let fd = verify_redirected(prefix)?;
+            let rest = dir.as_os_str().as_bytes()[prefix.len()..].to_vec();
+            (fd, rest)
+        }
+        Root::Extra(extra) => {
+            let fd = open_dir_fd(libc::AT_FDCWD, &cstr(&extra), false)
+                .map_err(|e| format!("open {}: {e}", extra.display()))?;
+            let rest = dir.strip_prefix(&extra).map_err(|e| e.to_string())?;
+            let mut rest_bytes = b"/".to_vec();
+            rest_bytes.extend_from_slice(rest.as_os_str().as_bytes());
+            (fd, rest_bytes)
+        }
+    };
+    let root_dev = fstat_fd(&root_fd)
+        .map_err(|e| format!("fstat root: {e}"))?
+        .st_dev;
+    let mut cur = root_fd;
+    // `rest` is "" (the root itself) or "/a/b/c".
+    if rest.is_empty() || rest == b"/" {
+        return Ok(cur);
+    }
+    for comp in rest[1..].split(|&b| b == b'/') {
+        if comp.is_empty() || comp == b"." || comp == b".." {
+            return Err(format!("{}: {NOT_PRIVATE} (bad component)", dir.display()));
+        }
+        let name = CString::new(comp).map_err(|_| "path contains NUL".to_string())?;
+        if create {
+            // SAFETY: `cur` is an open directory fd; `name` is NUL-terminated.
+            let r = unsafe { libc::mkdirat(cur.as_raw_fd(), name.as_ptr(), 0o755) };
+            if r != 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(format!("mkdir {}: {e}", dir.display()));
+                }
+            }
+        }
+        let next = match open_dir_fd(cur.as_raw_fd(), &name, true) {
+            Ok(fd) => fd,
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::ELOOP) | Some(libc::ENOTDIR) | Some(libc::EMLINK)
+                ) =>
+            {
+                return Err(format!("{}: {NOT_PRIVATE}", dir.display()));
+            }
+            Err(e) => return Err(format!("open {}: {e}", dir.display())),
+        };
+        let st = fstat_fd(&next).map_err(|e| format!("fstat {}: {e}", dir.display()))?;
+        if st.st_dev != root_dev {
+            return Err(format!(
+                "{}: {NOT_PRIVATE} (crosses a mount)",
+                dir.display()
+            ));
+        }
+        cur = next;
+    }
+    Ok(cur)
 }
 
 fn flag_dir(flags: &BTreeMap<String, String>) -> PathBuf {
@@ -256,11 +380,36 @@ fn flag_dir(flags: &BTreeMap<String, String>) -> PathBuf {
             .get("dir")
             .unwrap_or_else(|| panic!("--dir is required")),
     );
-    if let Err(msg) = guard_dir(&dir) {
-        eprintln!("stress_probe: {msg}");
-        std::process::exit(2);
-    }
+    exit_on_err(open_validated(&dir, true));
     dir
+}
+
+/// Validate (creating) `<dir>/<t>`; exits 2 if it is not a real directory
+/// inside the private tree.
+fn thread_dir(dir: &Path, t: usize) {
+    exit_on_err(open_validated(&dir.join(t.to_string()), true));
+}
+
+fn exit_on_err(r: Result<OwnedFd, String>) -> OwnedFd {
+    match r {
+        Ok(fd) => fd,
+        Err(msg) => {
+            eprintln!("stress_probe: {msg}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Read a file without following a symlink in the final component.
+fn read_nofollow(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut s = String::new();
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?
+        .read_to_string(&mut s)?;
+    Ok(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -277,9 +426,8 @@ fn cmd_storm(flags: &BTreeMap<String, String>) {
     let seed = flag_u64(flags, "seed", 1);
     let dir = flag_dir(flags);
 
-    std::fs::create_dir_all(&dir).expect("create --dir");
     for t in 0..threads {
-        std::fs::create_dir_all(dir.join(t.to_string())).expect("create thread dir");
+        thread_dir(&dir, t);
     }
 
     let report = Arc::new(Report::default());
@@ -328,7 +476,14 @@ fn storm_worker(t: usize, iters: usize, dir: &Path, report: &Report, rng: &mut S
         let renamed = tdir.join(format!("file_{i}.ren"));
 
         report.op();
-        if let Err(e) = std::fs::write(&file, b"stress") {
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&file)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, b"stress"));
+        if let Err(e) = written {
             report.error("open");
             report.violation(format!("write {}: {e}", file.display()));
             continue;
@@ -475,9 +630,8 @@ fn cmd_spawn_storm(flags: &BTreeMap<String, String>) {
     let iters = flag_u64(flags, "iters", 10).max(1) as usize;
     let dir = flag_dir(flags);
 
-    std::fs::create_dir_all(&dir).expect("create --dir");
     for t in 0..threads {
-        std::fs::create_dir_all(dir.join(t.to_string())).expect("create thread dir");
+        thread_dir(&dir, t);
     }
 
     let report = Arc::new(Report::default());
@@ -537,7 +691,7 @@ fn spawn_worker(t: usize, iters: usize, dir: &Path, exe: &Path, report: &Report)
                 continue;
             }
         }
-        match std::fs::read_to_string(&out) {
+        match read_nofollow(&out) {
             Ok(content) if content.trim() == marker => {}
             Ok(content) => {
                 report.error("content_mismatch");
@@ -596,7 +750,7 @@ fn spawn_report(
             &mut actions,
             1,
             out_c.as_ptr(),
-            libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+            libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_NOFOLLOW,
             0o644,
         );
         if r != 0 {
@@ -721,9 +875,8 @@ fn cmd_fork_exec_storm(flags: &BTreeMap<String, String>) {
     let iters = flag_u64(flags, "iters", 10).max(1) as usize;
     let dir = flag_dir(flags);
 
-    std::fs::create_dir_all(&dir).expect("create --dir");
     for t in 0..threads {
-        std::fs::create_dir_all(dir.join(t.to_string())).expect("create thread dir");
+        thread_dir(&dir, t);
     }
 
     let report = Arc::new(Report::default());
@@ -832,7 +985,7 @@ fn fork_exec_worker(
                 }
                 let fd = libc::open(
                     path_c.as_ptr(),
-                    libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+                    libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_NOFOLLOW,
                     0o644,
                 );
                 if fd >= 0 {
@@ -883,7 +1036,7 @@ fn fork_exec_worker(
                 report.error("child_exit");
                 report.violation(format!("child for {} exited {code}", path.display()));
             } else {
-                match std::fs::read_to_string(&path) {
+                match read_nofollow(&path) {
                     Ok(content) if content == marker => {}
                     Ok(content) => {
                         report.error("content_mismatch");
@@ -922,32 +1075,48 @@ fn cmd_report(args: &[String]) {
 }
 
 /// `touch <path> <marker>`: child target for fork-exec-storm. Refuses (exit
-/// 2) unless the path's parent passes `guard_dir` (lexical `/tmp` check plus
-/// `verify_redirected`, so this also proves interposition survived exec),
-/// then creates/truncates `path` and writes `marker` to it.
+/// 2) unless the path's parent passes `open_validated` (lexical `/tmp` check,
+/// `verify_redirected`, and a no-follow walk, so this also proves
+/// interposition survived exec), then `openat`s the name in that parent with
+/// `O_NOFOLLOW`, creating/truncating it, and writes `marker` to it.
 fn cmd_touch(args: &[String]) {
     use std::io::Write;
     let (Some(path), Some(marker)) = (args.get(2), args.get(3)) else {
         eprintln!("usage: stress_probe touch <path> <marker>");
         std::process::exit(2);
     };
-    let path = PathBuf::from(path);
-    let Some(parent) = path.parent() else {
-        eprintln!("stress_probe: {} has no parent", path.display());
+    let raw = path.as_bytes();
+    let Some(slash) = raw.iter().rposition(|&b| b == b'/') else {
+        eprintln!("stress_probe: {path} has no parent");
         std::process::exit(2);
     };
-    if let Err(msg) = guard_dir(parent) {
-        eprintln!("stress_probe: {msg}");
+    let (parent, name) = (&path[..slash], &path[slash + 1..]);
+    if name.is_empty() || name == "." || name == ".." || parent.is_empty() {
+        eprintln!("stress_probe: {path} does not name a file");
         std::process::exit(2);
     }
-    let result = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&path)
-        .and_then(|mut f| f.write_all(marker.as_bytes()));
-    if let Err(e) = result {
-        eprintln!("stress_probe: touch {}: {e}", path.display());
+    let pfd = exit_on_err(open_validated(Path::new(parent), false));
+    let name_c = CString::new(name).expect("name contains NUL");
+    // SAFETY: `pfd` is an open directory fd and `name_c` is NUL-terminated.
+    let fd = unsafe {
+        libc::openat(
+            pfd.as_raw_fd(),
+            name_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o644 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        eprintln!(
+            "stress_probe: touch {path}: {}",
+            std::io::Error::last_os_error()
+        );
+        std::process::exit(1);
+    }
+    // SAFETY: `fd` was just returned by openat and is owned by nobody else.
+    let mut f = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    if let Err(e) = f.write_all(marker.as_bytes()) {
+        eprintln!("stress_probe: touch {path}: {e}");
         std::process::exit(1);
     }
 }
