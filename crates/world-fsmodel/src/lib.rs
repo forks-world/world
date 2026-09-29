@@ -1070,6 +1070,14 @@ impl Model {
             if existing_id == from_id {
                 return okout(0);
             }
+            // Linux rejects a target that is an ancestor of the source
+            // (lock_rename's trap) before any type check; macOS reports the
+            // type mismatch instead.
+            if matches!(self.profile, Profile::LinuxMount { .. })
+                && self.is_descendant(existing_id, from_id)
+            {
+                return errout(libc::ENOTEMPTY);
+            }
             let from_is_dir = matches!(self.nodes[from_id].kind, NodeKind::Dir | NodeKind::Opaque);
             let to_is_dir = matches!(
                 self.nodes[existing_id].kind,
@@ -1744,6 +1752,37 @@ mod tests {
             to: b"/tmp/b".to_vec(),
         });
         assert_eq!(within.errno, 0);
+    }
+
+    #[test]
+    fn rename_onto_an_ancestor_matches_each_kernel() {
+        for (profile, expected) in [
+            (Profile::LinuxMount { root: linux_root() }, libc::ENOTEMPTY),
+            (Profile::MacShim { root: mac_root() }, libc::EISDIR),
+        ] {
+            let mut m = Model::new(profile);
+            for op in [
+                Op::Mkdir {
+                    path: b"/tmp/vk".to_vec(),
+                    mode: 0o755,
+                },
+                Op::Open {
+                    path: b"/tmp/vk/u9".to_vec(),
+                    flags: OpenFlags {
+                        create: true,
+                        write: true,
+                        ..OpenFlags::default()
+                    },
+                },
+            ] {
+                assert_eq!(m.apply(&op).errno, 0);
+            }
+            let out = m.apply(&Op::Rename {
+                from: b"/tmp/vk/u9".to_vec(),
+                to: b"/tmp/vk".to_vec(),
+            });
+            assert_eq!(out.errno, expected);
+        }
     }
 
     #[test]
