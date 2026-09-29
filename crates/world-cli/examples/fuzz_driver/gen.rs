@@ -965,12 +965,11 @@ impl Generator {
     }
 
     fn gen_connect(&mut self) -> GenStep {
-        // Only ever connect to a path this run has itself successfully
-        // bound: connecting to a missing path or a non-socket node is a
-        // pre-existing `world_fsmodel::Model::do_connect` simplification
-        // (it maps every non-success case to `ECONNREFUSED`, not the real
-        // kernel's `ENOENT`/`ENOTSOCK`) that is out of scope here -- see the
-        // fuzz_driver report for details.
+        // Only connect to a path this run has itself successfully bound, so
+        // the common case succeeds. `Model::do_connect` does model the
+        // failure errnos (ENOENT, ENOTDIR, ELOOP, ENOTSOCK/ECONNREFUSED,
+        // ENAMETOOLONG); they are covered by the seed corpus rather than
+        // generated here.
         let Some(path) = self.pick(&self.sockets.clone()) else {
             return plain(Op::Getcwd, Effect::None);
         };
@@ -1022,13 +1021,8 @@ impl Generator {
                 // tracked node/socket path under `from` -- not just an
                 // exact match -- must move with it, or later ops built from
                 // stale bookkeeping would target a path that no longer
-                // exists on the real side while a `Connect`'s model-side
-                // fallback (`Model::do_connect` maps *any* resolve failure
-                // to `ECONNREFUSED`) would quietly disagree with the real
-                // kernel's `ENOENT` -- see the fuzz_driver report for this
-                // exact failure mode, caught and fixed here rather than
-                // reported as a finding, since it was this bookkeeping bug,
-                // not a shim or model bug.
+                // exists (a `Connect` there would legitimately be `ENOENT`
+                // on both sides, but the generator wants it to succeed).
                 let mut to_prefix = to.clone();
                 to_prefix.push(b'/');
                 self.nodes

@@ -2140,6 +2140,44 @@ mod trailing_slash_guard_tests {
     }
 
     #[test]
+    fn connect_resolution_errnos_match_kernel() {
+        let mut f = fixture();
+        std::fs::write(f.sandbox.join("file"), b"x").unwrap();
+        std::fs::create_dir(f.sandbox.join("dir")).unwrap();
+        std::os::unix::fs::symlink("nowhere", f.sandbox.join("dang")).unwrap();
+        std::os::unix::fs::symlink("loop", f.sandbox.join("loop")).unwrap();
+        let s = abs(&f, "s");
+        assert_eq!(errno_of(bind_like(&mut f.state, &s)), 0);
+        let non_socket = if cfg!(target_os = "macos") {
+            libc::ENOTSOCK
+        } else {
+            libc::ECONNREFUSED
+        };
+        let sun = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+            .sun_path
+            .len();
+        let long = |n: usize| "x".repeat(n);
+        let rows: Vec<(String, i32)> = vec![
+            ("missing".into(), libc::ENOENT),
+            ("nope/x".into(), libc::ENOENT),
+            ("file/x".into(), libc::ENOTDIR),
+            ("file".into(), non_socket),
+            ("dir".into(), non_socket),
+            ("dang".into(), libc::ENOENT),
+            ("loop".into(), libc::ELOOP),
+            ("s/".into(), libc::ENOTDIR),
+            (long(sun), libc::ENAMETOOLONG),
+            (long(sun - 1), libc::ENOENT),
+            (format!("{}/", long(sun - 1)), libc::ENAMETOOLONG),
+        ];
+        for (rel, want) in rows {
+            let p = abs(&f, &rel);
+            assert_eq!(errno_of(connect_like(&mut f.state, &p)), want, "{rel}");
+        }
+        victim_untouched(&f);
+    }
+
+    #[test]
     fn bind_through_dangling_link_to_outside_is_refused() {
         let mut f = fixture();
         let target = f.victim.join("newsock");

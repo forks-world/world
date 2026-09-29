@@ -1513,8 +1513,7 @@ impl Model {
                     ));
                 }
                 // The literal name must fit the sockaddr_un path.
-                let sun_path = if self.is_mac() { 104 } else { 108 };
-                if name.len() >= sun_path {
+                if name.len() >= self.sun_path_cap() {
                     return errout(libc::ENAMETOOLONG);
                 }
                 if self.nodes[parent].children.contains_key(&key) {
@@ -1528,13 +1527,47 @@ impl Model {
         }
     }
 
+    /// `sizeof(sockaddr_un.sun_path)`: a literal socket name of this many
+    /// bytes (or more) does not fit.
+    fn sun_path_cap(&self) -> usize {
+        if self.is_mac() { 104 } else { 108 }
+    }
+
+    /// Mirrors the executor's `connect_like` order: PATH_MAX, split, parent
+    /// lookup (following links) and kind, sockaddr_un length of the literal
+    /// name plus a trailing `/`, then the full lookup. A non-socket target is
+    /// `ENOTSOCK` on macOS and `ECONNREFUSED` on Linux. Like the executor
+    /// (and unlike the real kernel) `""` is `ENOENT` and `"/"` is `EINVAL`.
     fn do_connect(&mut self, path: &[u8]) -> Outcome {
+        if path.len() >= self.path_max() {
+            return errout(libc::ENAMETOOLONG);
+        }
+        let (dir, name, trailing) = match parent_and_name(path) {
+            Ok(t) => t,
+            Err(e) => return errout(e),
+        };
+        let parent = if dir == b"." {
+            self.cwd
+        } else {
+            match self.resolve(View::Virtual, Start::Cwd, dir, true) {
+                Ok(n) => n,
+                Err(e) => return errout(e),
+            }
+        };
+        match &self.nodes[parent].kind {
+            NodeKind::Dir | NodeKind::Opaque => {}
+            _ => return errout(libc::ENOTDIR),
+        }
+        if name.len() + trailing as usize >= self.sun_path_cap() {
+            return errout(libc::ENAMETOOLONG);
+        }
         match self.resolve(View::Virtual, Start::Cwd, path, true) {
             Ok(node) => match &self.nodes[node].kind {
                 NodeKind::Socket => okout(0),
+                _ if self.is_mac() => errout(libc::ENOTSOCK),
                 _ => errout(libc::ECONNREFUSED),
             },
-            Err(_) => errout(libc::ECONNREFUSED),
+            Err(e) => errout(e),
         }
     }
 
@@ -2942,7 +2975,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_twice_is_eaddrinuse_connect_to_non_socket_is_econnrefused() {
+    fn bind_twice_is_eaddrinuse_connect_to_non_socket_is_enotsock_on_mac() {
         let mut m = Model::new(Profile::MacShim { root: mac_root() });
         let out = m.apply(&Op::Bind {
             path: b"/tmp/s".to_vec(),
@@ -2960,7 +2993,84 @@ mod tests {
         let out = m.apply(&Op::Connect {
             path: b"/tmp/notasocket".to_vec(),
         });
-        assert_eq!(out.errno, libc::ECONNREFUSED);
+        assert_eq!(out.errno, libc::ENOTSOCK);
+    }
+
+    #[test]
+    fn connect_resolution_errnos_per_profile() {
+        for mac in [true, false] {
+            let profile = if mac {
+                Profile::MacShim { root: mac_root() }
+            } else {
+                Profile::LinuxMount { root: linux_root() }
+            };
+            let ns = if mac {
+                libc::ENOTSOCK
+            } else {
+                libc::ECONNREFUSED
+            };
+            let mut m = Model::new(profile);
+            m.add_fixture_dir(View::Virtual, b"/tmp/d");
+            m.add_fixture_file(View::Virtual, b"/tmp/f", b"x".to_vec());
+            assert_eq!(
+                m.apply(&Op::Bind {
+                    path: b"/tmp/s".to_vec()
+                })
+                .errno,
+                0
+            );
+            m.add_fixture_symlink(View::Virtual, b"/tmp/ls", b"s".to_vec());
+            m.add_fixture_symlink(View::Virtual, b"/tmp/lf", b"f".to_vec());
+            m.add_fixture_symlink(View::Virtual, b"/tmp/dl", b"nowhere".to_vec());
+            m.add_fixture_symlink(View::Virtual, b"/tmp/lp", b"lp".to_vec());
+            let rows: [(&[u8], i32); 16] = [
+                (b"/tmp/s", 0),
+                (b"/tmp/ls", 0),
+                (b"/tmp/missing", libc::ENOENT),
+                (b"/tmp/nodir/x", libc::ENOENT),
+                (b"/tmp/f/x", libc::ENOTDIR),
+                (b"/tmp/f", ns),
+                (b"/tmp/d", ns),
+                (b"/tmp/d/", ns),
+                (b"/tmp/lf", ns),
+                (b"/tmp/dl", libc::ENOENT),
+                (b"/tmp/dl/", libc::ENOENT),
+                (b"/tmp/lp", libc::ELOOP),
+                (b"/tmp/s/", libc::ENOTDIR),
+                (b"", libc::ENOENT),
+                (b"/", libc::EINVAL),
+                (b"//", libc::EINVAL),
+            ];
+            for (path, want) in rows {
+                let got = m
+                    .apply(&Op::Connect {
+                        path: path.to_vec(),
+                    })
+                    .errno;
+                assert_eq!(got, want, "mac={mac} {:?}", String::from_utf8_lossy(path));
+            }
+        }
+    }
+
+    #[test]
+    fn connect_name_must_fit_sun_path() {
+        for (mac, cap) in [(true, 104usize), (false, 108)] {
+            let profile = if mac {
+                Profile::MacShim { root: mac_root() }
+            } else {
+                Profile::LinuxMount { root: linux_root() }
+            };
+            let mut m = Model::new(profile);
+            let mut c = |p: Vec<u8>| m.apply(&Op::Connect { path: p }).errno;
+            let name = |n: usize| join(b"/tmp", &vec![b'x'; n]);
+            assert_eq!(c(name(cap)), libc::ENAMETOOLONG);
+            assert_eq!(c(name(cap - 1)), libc::ENOENT);
+            let mut slash = name(cap - 1);
+            slash.push(b'/');
+            assert_eq!(c(slash), libc::ENAMETOOLONG);
+            let under_missing = join(b"/tmp/nodir", &vec![b'x'; cap]);
+            assert_eq!(c(under_missing), libc::ENOENT);
+        }
     }
 
     #[test]
