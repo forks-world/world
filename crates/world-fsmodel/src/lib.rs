@@ -939,7 +939,7 @@ impl Model {
         match self.resolve(View::Virtual, start, path, lookup_follow) {
             Ok(node) => match &self.nodes[node].kind {
                 NodeKind::Dir | NodeKind::Opaque => {
-                    if flags.write {
+                    if flags.write || flags.trunc {
                         return errout(libc::EISDIR);
                     }
                     let fd = self.alloc_fd(FdEntry::Dir { node });
@@ -956,8 +956,9 @@ impl Model {
                     if flags.directory {
                         return errout(libc::ENOTDIR);
                     }
+                    // Both kernels truncate on O_TRUNC even when the open is
+                    // read-only.
                     if flags.trunc
-                        && flags.write
                         && let NodeKind::File(data) = &mut self.nodes[node].kind
                     {
                         data.clear();
@@ -2803,6 +2804,63 @@ mod tests {
             assert_eq!(m.apply(&Op::Bind { path: over }).errno, libc::ENAMETOOLONG);
             assert_eq!(m.apply(&Op::Bind { path: fits.clone() }).errno, 0);
             assert_eq!(m.apply(&Op::Bind { path: fits }).errno, libc::EADDRINUSE);
+        }
+    }
+
+    #[test]
+    fn read_only_trunc_open_truncates_files_and_rejects_dirs() {
+        for profile in [
+            Profile::MacShim { root: mac_root() },
+            Profile::LinuxMount { root: linux_root() },
+        ] {
+            let profile2 = profile.clone();
+            let mut m = Model::new(profile);
+            m.add_fixture_file(View::Virtual, b"/tmp/f", b"hello".to_vec());
+            m.add_fixture_dir(View::Virtual, b"/tmp/d");
+            let ro_trunc = OpenFlags {
+                trunc: true,
+                ..Default::default()
+            };
+            let open = |path: &[u8], flags| Op::Open {
+                path: path.to_vec(),
+                flags,
+            };
+            let out = m.apply(&open(b"/tmp/f", ro_trunc));
+            assert_eq!(out.errno, 0);
+            let fd = out.ret as u32;
+            let len = |m: &mut Model| {
+                m.tree(View::Virtual, b"/tmp")
+                    .into_iter()
+                    .find_map(|e| match (e.path.as_slice(), e.kind) {
+                        (b"f", EntryKind::File { len }) => Some(len),
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            assert_eq!(len(&mut m), 0);
+            let w = m.apply(&Op::Write {
+                fd,
+                data: b"x".to_vec(),
+            });
+            assert_eq!(w.errno, libc::EBADF);
+            assert_eq!(m.apply(&open(b"/tmp/d", ro_trunc)).errno, libc::EISDIR);
+            // A regular file with O_DIRECTORY is ENOTDIR and is not truncated.
+            let mut m2 = Model::new(profile2.clone());
+            m2.add_fixture_file(View::Virtual, b"/tmp/f", b"hello".to_vec());
+            let dir_trunc = OpenFlags {
+                trunc: true,
+                directory: true,
+                ..Default::default()
+            };
+            assert_eq!(m2.apply(&open(b"/tmp/f", dir_trunc)).errno, libc::ENOTDIR);
+            assert_eq!(len(&mut m2), 5);
+            // create + trunc on a new file succeeds.
+            let new = OpenFlags {
+                create: true,
+                trunc: true,
+                ..Default::default()
+            };
+            assert_eq!(m2.apply(&open(b"/tmp/new", new)).errno, 0);
         }
     }
 
