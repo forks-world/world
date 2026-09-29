@@ -208,17 +208,32 @@ fn dirfd_realpath(dirfd: RawFd) -> io::Result<PathBuf> {
     }
     #[cfg(not(target_os = "macos"))]
     {
+        // A removed directory reads back as "<path> (deleted)"; that is
+        // deliberately left as-is (the guard then refuses, which is safe).
         std::fs::read_link(format!("/proc/self/fd/{dirfd}"))
     }
 }
 
-fn sandbox_roots(run_id: &str, phys: Option<&[u8]>) -> Vec<String> {
-    let mut roots = vec![
-        format!("/tmp/{run_id}"),
-        format!("/private/tmp/{run_id}"),
-        format!("/var/tmp/{run_id}"),
-        format!("/private/var/tmp/{run_id}"),
-    ];
+/// The host temp bases a sandbox root may live under. The `/private/...`
+/// spellings exist only on macOS (where `/tmp` and `/var` are symlinks into
+/// `/private`); on Linux they are ordinary, unrelated host paths, so they
+/// are refused lexically (whether or not they exist). Keyed on the HOST OS,
+/// not on `--profile`: what matters is which paths the kernel redirects.
+fn tmp_bases(mac: bool) -> &'static [&'static str] {
+    if mac {
+        &["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"]
+    } else {
+        &["/tmp", "/var/tmp"]
+    }
+}
+
+const HOST_MAC: bool = cfg!(target_os = "macos");
+
+fn sandbox_roots_for(mac: bool, run_id: &str, phys: Option<&[u8]>) -> Vec<String> {
+    let mut roots: Vec<String> = tmp_bases(mac)
+        .iter()
+        .map(|b| format!("{b}/{run_id}"))
+        .collect();
     // Under the macOS shim `F_GETPATH` is a documented gap: it reports the
     // *physical* location (WORLD_TMP/tmp/<run-id>), not the virtual one.
     if let Some(p) = phys.and_then(|p| std::str::from_utf8(p).ok()) {
@@ -229,17 +244,22 @@ fn sandbox_roots(run_id: &str, phys: Option<&[u8]>) -> Vec<String> {
     roots
 }
 
-fn bare_tmp_roots(phys: Option<&[u8]>) -> Vec<String> {
-    let mut roots: Vec<String> = ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+fn bare_tmp_roots_for(mac: bool, phys: Option<&[u8]>) -> Vec<String> {
+    let mut roots: Vec<String> = tmp_bases(mac).iter().map(|s| s.to_string()).collect();
     if let Some(p) = phys.and_then(|p| std::str::from_utf8(p).ok()) {
         let p = p.trim_end_matches('/');
         roots.push(format!("{p}/tmp"));
         roots.push(format!("{p}/var/tmp"));
     }
     roots
+}
+
+fn sandbox_roots(run_id: &str, phys: Option<&[u8]>) -> Vec<String> {
+    sandbox_roots_for(HOST_MAC, run_id, phys)
+}
+
+fn bare_tmp_roots(phys: Option<&[u8]>) -> Vec<String> {
+    bare_tmp_roots_for(HOST_MAC, phys)
 }
 
 /// Whether a directory whose own canonical path is `parent` may have `name`
@@ -971,8 +991,8 @@ fn open_mutating(
 }
 
 /// Whether directory `p` is a bare ancestor of one of the run's sandbox
-/// roots (`/`, `/tmp`, `/private`, `/var/tmp`, the shim's physical `tmp`,
-/// ...): opening it read-only is harmless and the model allows it.
+/// roots (`/`, `/tmp`, `/var/tmp`, plus `/private` on macOS only, the shim's
+/// physical `tmp`, ...): opening it read-only is harmless and the model allows it.
 fn ancestor_of_root(p: &Path, run_id: &str, phys: Option<&[u8]>) -> bool {
     let p = p.to_string_lossy();
     let p = p.trim_end_matches('/');
@@ -1808,12 +1828,10 @@ mod tests {
             run,
             None
         ));
-        assert!(parent_allowed(
-            Path::new("/private/var/tmp/fz-0123456789"),
-            b"x",
-            run,
-            None
-        ));
+        assert_eq!(
+            parent_allowed(Path::new("/private/var/tmp/fz-0123456789"), b"x", run, None),
+            cfg!(target_os = "macos")
+        );
         // A sibling run and the bare tmp root are not allowed...
         assert!(!parent_allowed(
             Path::new("/tmp/fz-0123456789x"),
@@ -1851,19 +1869,65 @@ mod tests {
     #[test]
     fn ancestors_of_a_sandbox_root() {
         let run = "fz-0123456789";
-        for ok in [
-            "/",
-            "/tmp",
-            "/private",
-            "/private/tmp",
-            "/var/tmp",
-            "/tmp/fz-0123456789",
-        ] {
+        let mac = cfg!(target_os = "macos");
+        for ok in ["/", "/tmp", "/var/tmp", "/tmp/fz-0123456789"] {
             assert!(ancestor_of_root(Path::new(ok), run, None), "{ok}");
+        }
+        for maybe in ["/private", "/private/tmp"] {
+            assert_eq!(
+                ancestor_of_root(Path::new(maybe), run, None),
+                mac,
+                "{maybe}"
+            );
         }
         for bad in ["/etc", "/tmp/other", "/Users", "/private/etc"] {
             assert!(!ancestor_of_root(Path::new(bad), run, None), "{bad}");
         }
+    }
+
+    #[test]
+    fn private_spellings_only_on_mac() {
+        let run = "fz-0123456789";
+        let allowed = |mac: bool, parent: &str, name: &[u8]| {
+            let ps = parent.to_string();
+            sandbox_roots_for(mac, run, None)
+                .iter()
+                .any(|b| ps == *b || ps.starts_with(&format!("{b}/")))
+                || (name == run.as_bytes() && bare_tmp_roots_for(mac, None).contains(&ps))
+        };
+        for mac in [false, true] {
+            assert!(allowed(mac, "/tmp/fz-0123456789/x", b"y"));
+            assert!(allowed(mac, "/tmp", run.as_bytes()));
+        }
+        assert!(!allowed(false, "/private/tmp/fz-0123456789/x", b"y"));
+        assert!(!allowed(false, "/private/var/tmp/fz-0123456789", b"y"));
+        assert!(!allowed(false, "/private/tmp", run.as_bytes()));
+        assert!(allowed(true, "/private/tmp/fz-0123456789/x", b"y"));
+        assert!(allowed(true, "/private/var/tmp/fz-0123456789", b"y"));
+        assert!(allowed(true, "/private/tmp", run.as_bytes()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_refuses_private_through_the_real_guards() {
+        let run = "fz-0123456789";
+        assert!(!parent_allowed(
+            Path::new("/private/tmp/fz-0123456789/x"),
+            b"y",
+            run,
+            None
+        ));
+        assert!(!parent_allowed(
+            Path::new("/private/tmp"),
+            run.as_bytes(),
+            run,
+            None
+        ));
+        assert!(!target_allowed(
+            Path::new("/private/tmp/fz-0123456789/x"),
+            run,
+            None
+        ));
     }
 
     #[test]

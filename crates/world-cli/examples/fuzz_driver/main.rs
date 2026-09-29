@@ -634,7 +634,7 @@ fn execute(
         .map(|d| operand_snapshot(&d.op_line))
         .unwrap_or(serde_json::Value::Null);
     let tree_mismatch = if first_divergence.is_none() {
-        check_final_tree(&model, run_id)
+        check_final_tree(&model, run_id, profile.is_mac())
     } else {
         None
     };
@@ -667,10 +667,11 @@ fn execute(
 
 /// Lexical canonical form of an absolute path for comparing *spellings* of
 /// the same host temp location: collapses `.`/`..`/empty components and
-/// drops a leading `private` component (`/private/tmp` == `/tmp`,
-/// `/private/var/tmp` == `/var/tmp`), which the shim reports for absolute
-/// symlink targets (its documented "readlink reports the host name" rule).
-fn canon_abs(path: &[u8]) -> Vec<u8> {
+/// (on the mac profile only) drops a leading `private` component
+/// (`/private/tmp` == `/tmp`, `/private/var/tmp` == `/var/tmp`), which the
+/// shim reports for absolute symlink targets (its documented "readlink
+/// reports the host name" rule). On Linux `/private` is an ordinary name.
+fn canon_abs(path: &[u8], mac: bool) -> Vec<u8> {
     let mut comps: Vec<&[u8]> = Vec::new();
     for c in path.split(|&b| b == b'/') {
         match c {
@@ -681,7 +682,8 @@ fn canon_abs(path: &[u8]) -> Vec<u8> {
             other => comps.push(other),
         }
     }
-    if comps.first() == Some(&&b"private"[..])
+    if mac
+        && comps.first() == Some(&&b"private"[..])
         && matches!(comps.get(1), Some(&c) if c == b"tmp" || c == b"var")
     {
         comps.remove(0);
@@ -696,7 +698,7 @@ fn canon_abs(path: &[u8]) -> Vec<u8> {
 
 /// Two entries agree if identical, or if both are symlinks with *absolute*
 /// targets that are merely different spellings of the same location.
-fn entries_agree(model: &Model, a: &Entry, b: &Entry) -> bool {
+fn entries_agree(model: &Model, mac: bool, a: &Entry, b: &Entry) -> bool {
     if a == b {
         return true;
     }
@@ -706,7 +708,7 @@ fn entries_agree(model: &Model, a: &Entry, b: &Entry) -> bool {
         && ta.first() == Some(&b'/')
         && tb.first() == Some(&b'/')
     {
-        if canon_abs(ta) == canon_abs(tb) {
+        if canon_abs(ta, mac) == canon_abs(tb, mac) {
             return true;
         }
         let ra = model.resolve(View::Virtual, Start::Root, ta, true);
@@ -718,10 +720,10 @@ fn entries_agree(model: &Model, a: &Entry, b: &Entry) -> bool {
 
 /// Compare the model's tree against the real one under *both* sandbox roots
 /// (`/tmp/<run-id>` and `/var/tmp/<run-id>`), joining the mismatch messages.
-fn check_final_tree(model: &Model, run_id: &str) -> Option<String> {
+fn check_final_tree(model: &Model, run_id: &str, mac: bool) -> Option<String> {
     let msgs: Vec<String> = [format!("/tmp/{run_id}"), format!("/var/tmp/{run_id}")]
         .into_iter()
-        .filter_map(|root| check_tree_at(model, root.into_bytes()))
+        .filter_map(|root| check_tree_at(model, mac, root.into_bytes()))
         .collect();
     if msgs.is_empty() {
         None
@@ -730,7 +732,7 @@ fn check_final_tree(model: &Model, run_id: &str) -> Option<String> {
     }
 }
 
-fn check_tree_at(model: &Model, tmp_root: Vec<u8>) -> Option<String> {
+fn check_tree_at(model: &Model, mac: bool, tmp_root: Vec<u8>) -> Option<String> {
     let model_entries = model.tree(View::Virtual, &tmp_root);
     let real_entries: Vec<Entry> = match exec::real_tree(&tmp_root) {
         Ok(e) => e,
@@ -750,7 +752,7 @@ fn check_tree_at(model: &Model, tmp_root: Vec<u8>) -> Option<String> {
         && model_entries
             .iter()
             .zip(&real_entries)
-            .all(|(a, b)| entries_agree(model, a, b));
+            .all(|(a, b)| entries_agree(model, mac, a, b));
     if same {
         None
     } else {
@@ -819,7 +821,7 @@ fn compare(
                 // resolver.
                 let real_node = model.resolve(View::Virtual, Start::Root, &real_out.data, true);
                 let model_node = model.resolve(View::Virtual, Start::Root, &model_out.data, true);
-                if canon_abs(&real_out.data) != canon_abs(&model_out.data)
+                if canon_abs(&real_out.data, !linux) != canon_abs(&model_out.data, !linux)
                     && !matches!((real_node, model_node), (Ok(a), Ok(b)) if a == b)
                 {
                     return Some(format!(

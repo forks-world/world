@@ -147,32 +147,34 @@ def physical_tree(root):
     return entries
 
 
-def canon_target(target, roots):
+def canon_target(target, roots, mac=False):
     """Spelling-insensitive form of an absolute symlink target: physical
     workspace roots map back to /tmp and /var/tmp, `..` is collapsed, and
-    /private/{tmp,var} is folded (the shim reports host names, and the model
-    keeps whatever text was written)."""
+    /private/{tmp,var} is folded on the mac profile only (the shim reports
+    host names, and the model keeps whatever text was written)."""
     for physical, virtual in roots:
         if target == physical or target.startswith(physical + "/"):
             target = virtual + target[len(physical):]
     target = os.path.normpath(target)
+    if not mac:
+        return target
     for private in ("/private/tmp", "/private/var/tmp"):
         if target == private or target.startswith(private + "/"):
             target = target[len("/private"):]
     return target
 
 
-def normalize_tree(entries, roots):
+def normalize_tree(entries, roots, mac=False):
     out = []
     for e in entries:
         kind = e["kind"]
         if isinstance(kind, dict) and "symlink" in kind and kind["symlink"]["target"].startswith("/"):
-            kind = {"symlink": {"target": canon_target(kind["symlink"]["target"], roots)}}
+            kind = {"symlink": {"target": canon_target(kind["symlink"]["target"], roots, mac)}}
         out.append({"path": e["path"], "kind": kind})
     return out
 
 
-def check_trees(phys_root, run_id, data):
+def check_trees(phys_root, run_id, data, mac=False):
     """Compare the physical `/tmp/<run>` and `/var/tmp/<run>` trees under a
     workspace's physical root with the model's trees from the driver's JSON
     (`model_tree`, and `model_var_tree` when present). Raises
@@ -183,8 +185,8 @@ def check_trees(phys_root, run_id, data):
     if "model_var_tree" in data:
         pairs.append(("var/tmp", "model_var_tree"))
     for sub, key in pairs:
-        real = normalize_tree(physical_tree(phys_root / sub / run_id), roots)
-        model = normalize_tree(data[key], roots)
+        real = normalize_tree(physical_tree(phys_root / sub / run_id), roots, mac)
+        model = normalize_tree(data[key], roots, mac)
         if real != model:
             raise AssertionError(f"/{sub}/{run_id} tree differs: physical={real!r} model={model!r}")
 
@@ -595,7 +597,7 @@ class ShimFuzz(HostTempGuard, unittest.TestCase):
         owned_rmtree(self.root / "var/tmp" / run_id, self.root)
 
     def check_tree(self, run_id, data):
-        check_trees(self.root, run_id, data)
+        check_trees(self.root, run_id, data, True)
 
     def test_var_tmp_mismatch_is_detected(self):
         """A stray physical file under /var/tmp/<run> must fail the tree
@@ -724,7 +726,7 @@ class ExecFuzzMixin(HostTempGuard):
                         self.fail(report_failure({}, self.profile, seed, run_id, ops_file, result, phase, replay_prefix=prefix, note=note))
                     data = json.loads(result.stdout)
                     self.assertEqual(data["result"], "pass")
-                    check_trees(troot, run_id, data)
+                    check_trees(troot, run_id, data, self.profile == "mac")
                 finally:
                     owned_rmtree(troot / "tmp" / run_id, troot)
                     owned_rmtree(troot / "var/tmp" / run_id, troot)
