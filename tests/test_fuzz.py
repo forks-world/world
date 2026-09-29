@@ -49,13 +49,16 @@ def ops_count():
 
 
 def seed_sequence():
-    """WORLD_FUZZ_SEED (if set) or the fixed default seeds first, then random
-    seeds for as long as the caller's deadline allows."""
-    if os.environ.get("WORLD_FUZZ_SEED"):
-        yield int(os.environ["WORLD_FUZZ_SEED"])
+    """WORLD_FUZZ_SEED (if set) or the fixed default seeds first, then more
+    seeds for as long as the caller's deadline allows. The follow-on stream
+    is derived from WORLD_FUZZ_SEED (nightly: the run id) or from a fixed
+    value, so PR runs are deterministic and every run is reproducible."""
+    base = os.environ.get("WORLD_FUZZ_SEED")
+    if base:
+        yield int(base)
     else:
         yield from DEFAULT_SEEDS
-    rng = random.Random()
+    rng = random.Random(int(base) if base else 0)
     while True:
         yield rng.randint(1, 2**31 - 1)
 
