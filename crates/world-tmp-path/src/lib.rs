@@ -52,42 +52,6 @@ fn component_rest<'a>(path: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     (rest.is_empty() || rest[0] == b'/').then_some(rest)
 }
 
-/// Lexically normalize an absolute path: drop empty and `.` components and
-/// resolve `..`. Returns None when the result does not fit. Test oracle only:
-/// production mapping must not resolve `..` lexically (see `map`), since a
-/// symlink earlier in the path can make that differ from kernel resolution.
-#[cfg(test)]
-fn normalize(path: &[u8], out: &mut [u8]) -> Option<usize> {
-    let mut len = 0;
-    for component in path.split(|&b| b == b'/') {
-        match component {
-            b"" | b"." => {}
-            b".." => {
-                while len > 0 {
-                    len -= 1;
-                    if out[len] == b'/' {
-                        break;
-                    }
-                }
-            }
-            _ => {
-                let end = len + 1 + component.len();
-                if end >= out.len() {
-                    return None;
-                }
-                out[len] = b'/';
-                out[len + 1..end].copy_from_slice(component);
-                len = end;
-            }
-        }
-    }
-    if len == 0 {
-        out[0] = b'/';
-        len = 1;
-    }
-    Some(len)
-}
-
 /// Where a leading path prefix currently stands, relative to the three
 /// aliased directories that lead into a host temp root.
 #[derive(Clone, Copy)]
@@ -753,46 +717,60 @@ mod tests {
         absent: &'a [&'a str],
     ) -> impl FnMut(&[u8], &mut [u8]) -> Result<usize, c_int> + 'a {
         const DEFAULT: [(&str, &str); 2] = [("/var", "/private/var"), ("/tmp", "/private/tmp")];
+        // Kernel-like: walk component by component and substitute a link
+        // whenever the walk reaches it (so `/./tmp/..` becomes `/private`),
+        // resolving `..` against the resolved path, not the text.
         move |path: &[u8], out: &mut [u8]| {
-            let mut current = path.split(|&b| b == 0).next().unwrap_or(path).to_vec();
-            for _ in 0..32 {
-                let Some((link, target)) = links
-                    .iter()
-                    .chain(DEFAULT.iter())
-                    .find(|(link, _)| component_rest(&current, link.as_bytes()).is_some())
-                else {
-                    break;
-                };
-                let rest = component_rest(&current, link.as_bytes()).unwrap().to_vec();
-                let mut next = if let Some(abs) = target.strip_prefix('/') {
-                    let mut v = vec![b'/'];
-                    v.extend_from_slice(abs.as_bytes());
-                    v
-                } else {
-                    let parent = textual_parent(link.as_bytes());
-                    let mut v = parent.to_vec();
-                    if parent != b"/" {
-                        v.push(b'/');
+            let text = path.split(|&b| b == 0).next().unwrap_or(path);
+            let components = |p: &[u8]| -> Vec<Vec<u8>> {
+                p.split(|&b| b == b'/').map(<[u8]>::to_vec).collect()
+            };
+            let mut queue: std::collections::VecDeque<Vec<u8>> = components(text).into();
+            let mut resolved: Vec<u8> = b"/".to_vec();
+            let mut hops = 0;
+            while let Some(c) = queue.pop_front() {
+                match c.as_slice() {
+                    b"" | b"." => continue,
+                    b".." => resolved = textual_parent(&resolved).to_vec(),
+                    name => {
+                        if resolved != b"/" {
+                            resolved.push(b'/');
+                        }
+                        resolved.extend_from_slice(name);
+                        let Some((_, target)) = links
+                            .iter()
+                            .chain(DEFAULT.iter())
+                            .find(|(link, _)| link.as_bytes() == resolved.as_slice())
+                        else {
+                            continue;
+                        };
+                        hops += 1;
+                        if hops > 32 {
+                            return Err(libc::ELOOP);
+                        }
+                        let base = if target.starts_with('/') {
+                            b"/".to_vec()
+                        } else {
+                            textual_parent(&resolved).to_vec()
+                        };
+                        let mut rest: Vec<Vec<u8>> = components(target.as_bytes());
+                        rest.extend(queue.drain(..));
+                        queue = rest.into();
+                        resolved = base;
                     }
-                    v.extend_from_slice(target.as_bytes());
-                    v
-                };
-                next.extend_from_slice(&rest);
-                current = next;
+                }
             }
             if absent
                 .iter()
-                .any(|a| component_rest(&current, a.as_bytes()).is_some())
+                .any(|a| component_rest(&resolved, a.as_bytes()).is_some())
             {
                 return Err(libc::ENOENT);
             }
-            let mut buf = [0u8; PATH_MAX];
-            let len = normalize(&current, &mut buf).ok_or(libc::ENAMETOOLONG)?;
-            if len >= out.len() {
+            if resolved.len() >= out.len() {
                 return Err(libc::ENAMETOOLONG);
             }
-            out[..len].copy_from_slice(&buf[..len]);
-            Ok(len)
+            out[..resolved.len()].copy_from_slice(&resolved);
+            Ok(resolved.len())
         }
     }
 
