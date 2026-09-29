@@ -799,7 +799,8 @@ fn run_case(seed: u64) {
             harness_errors.push(format!("op {i} {cop:?}: guard rejected operand; skipped"));
             continue;
         };
-        let model_out = model.apply(&to_model_op(cop, &id_to_model_fd));
+        let mop = to_model_op(cop, &id_to_model_fd);
+        let model_out = model.apply(&mop);
 
         if let (COp::Create { id, .. }, 0) = (cop, model_out.errno) {
             id_to_model_fd.insert(*id, model_out.ret as u32);
@@ -807,7 +808,7 @@ fn run_case(seed: u64) {
 
         let linux = cfg!(target_os = "linux");
         assert!(
-            errno_equiv(linux, model_out.errno, real_out.errno),
+            errno_equiv(linux, &mop, model_out.errno, real_out.errno),
             "case {seed} op {i} {cop:?}: errno mismatch model={} real={}",
             model_out.errno,
             real_out.errno

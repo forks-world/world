@@ -28,11 +28,9 @@
 //!   reached through such a link; `base_virtual_path_strategy` has none.)
 use super::*;
 use proptest::prelude::*;
-use world_fsmodel::{Model, NodeId, Op, Profile, Start, View, errno_equiv};
+use world_fsmodel::{Model, NodeId, Op, Profile, Start, View};
 
 const ROOT: &[u8] = b"/Users/me/.local/share/world/workspaces/tmp/127.77.0.1";
-/// A macOS shim never runs against Linux errno tables.
-const LINUX: bool = false;
 
 fn cases() -> u32 {
     std::env::var("PROPTEST_CASES")
@@ -318,7 +316,7 @@ fn assert_matches_model(
                     Ok(())
                 }
                 (Err(pe), Err(ve)) => {
-                    if !errno_equiv(LINUX, pe, ve) {
+                    if pe != ve {
                         return report_or_fail(
                             format!(
                                 "errno mismatch for {:?}: physical={pe} virtual={ve}",
@@ -341,7 +339,7 @@ fn assert_matches_model(
         Err(e) => {
             let virt = model.resolve(View::Virtual, start_view_both_sides, path, true);
             match virt {
-                Err(ve) if errno_equiv(LINUX, e, ve) => Ok(()),
+                Err(ve) if e == ve => Ok(()),
                 other => report_or_fail(
                     format!(
                         "map_with failed ({e}) but virtual resolve gave {other:?} for {:?}",

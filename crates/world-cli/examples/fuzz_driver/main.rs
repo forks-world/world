@@ -784,7 +784,7 @@ fn compare(
     model_out: &Outcome,
     real_out: &Outcome,
 ) -> Option<String> {
-    if !errno_equiv(linux, model_out.errno, real_out.errno) {
+    if !errno_equiv(linux, op, model_out.errno, real_out.errno) {
         return Some(format!(
             "errno mismatch: model={} real={}",
             model_out.errno, real_out.errno

@@ -2002,21 +2002,27 @@ impl Rng {
 }
 
 /// Whether `a` and `b` are the same errno, or a documented platform quirk
-/// pair. Kept intentionally small: an unmatched divergence should usually be
-/// investigated, not silently swallowed here.
-pub fn errno_equiv(linux: bool, a: Errno, b: Errno) -> bool {
+/// pair *for this op*. Kept intentionally small and op-scoped: an unmatched
+/// divergence should usually be investigated, not silently swallowed here.
+pub fn errno_equiv(linux: bool, op: &Op, a: Errno, b: Errno) -> bool {
     if a == b {
         return true;
     }
-    // ENOTEMPTY vs EEXIST: some historical Unixes (and BSD-derived kernels
-    // in some paths) report EEXIST where Linux reports ENOTEMPTY for
-    // rename()/rmdir() onto or of a non-empty directory.
     let pair = |x: i32, y: i32| (a == x && b == y) || (a == y && b == x);
-    if pair(libc::ENOTEMPTY, libc::EEXIST) {
+    // ENOTEMPTY vs EEXIST: POSIX allows either for rmdir()/rename() of or
+    // onto a non-empty directory. Everywhere else EEXIST is exact.
+    let removes_dir = matches!(
+        op,
+        Op::Rmdir { .. } | Op::UnlinkAt { rmdir: true, .. } | Op::Rename { .. }
+    );
+    if removes_dir && pair(libc::ENOTEMPTY, libc::EEXIST) {
         return true;
     }
-    // macOS/BSD: unlink(2) on a directory reports EPERM, not the Linux EISDIR.
-    if !linux && pair(libc::EISDIR, libc::EPERM) {
+    // macOS/BSD: unlink(2) on a directory reports EPERM, not the Linux
+    // EISDIR. Not applied to e.g. a writable open() of a directory, where
+    // EISDIR vs EPERM is a real divergence.
+    let unlinks = matches!(op, Op::Unlink { .. } | Op::UnlinkAt { rmdir: false, .. });
+    if !linux && unlinks && pair(libc::EISDIR, libc::EPERM) {
         return true;
     }
     false
@@ -2666,12 +2672,68 @@ mod tests {
     }
 
     #[test]
-    fn errno_equiv_basic() {
-        assert!(errno_equiv(true, libc::ENOENT, libc::ENOENT));
-        assert!(!errno_equiv(true, libc::ENOENT, libc::EEXIST));
-        assert!(errno_equiv(true, libc::ENOTEMPTY, libc::EEXIST));
-        assert!(errno_equiv(false, libc::EISDIR, libc::EPERM));
-        assert!(!errno_equiv(true, libc::EISDIR, libc::EPERM));
+    fn errno_equiv_is_op_scoped() {
+        let p = || b"/tmp/x".to_vec();
+        let rmdir = Op::Rmdir { path: p() };
+        let rmdir_at = Op::UnlinkAt {
+            dirfd: 3,
+            path: p(),
+            rmdir: true,
+        };
+        let unlink_at = Op::UnlinkAt {
+            dirfd: 3,
+            path: p(),
+            rmdir: false,
+        };
+        let rename = Op::Rename { from: p(), to: p() };
+        let unlink = Op::Unlink { path: p() };
+        let mkdir = Op::Mkdir {
+            path: p(),
+            mode: 0o755,
+        };
+        let wopen = Op::Open {
+            path: p(),
+            flags: OpenFlags {
+                write: true,
+                ..Default::default()
+            },
+        };
+        let wopenat = Op::OpenAt {
+            dirfd: 3,
+            path: p(),
+            flags: OpenFlags {
+                write: true,
+                ..Default::default()
+            },
+        };
+        let symlink = Op::Symlink {
+            target: p(),
+            path: p(),
+        };
+        // Identical errnos are equivalent for any op.
+        for linux in [true, false] {
+            assert!(errno_equiv(linux, &mkdir, libc::ENOENT, libc::ENOENT));
+            assert!(!errno_equiv(linux, &mkdir, libc::ENOENT, libc::EEXIST));
+        }
+        // ENOTEMPTY/EEXIST only where POSIX allows either.
+        for linux in [true, false] {
+            for op in [&rmdir, &rmdir_at, &rename] {
+                assert!(errno_equiv(linux, op, libc::ENOTEMPTY, libc::EEXIST));
+            }
+            for op in [&mkdir, &wopen, &symlink, &unlink_at] {
+                assert!(!errno_equiv(linux, op, libc::ENOTEMPTY, libc::EEXIST));
+            }
+        }
+        // EISDIR/EPERM only for unlink of a directory, only on macOS.
+        for op in [&unlink, &unlink_at] {
+            assert!(errno_equiv(false, op, libc::EISDIR, libc::EPERM));
+            assert!(!errno_equiv(true, op, libc::EISDIR, libc::EPERM));
+        }
+        // A writable open of a directory must compare exactly.
+        for op in [&wopen, &wopenat, &rmdir, &rename] {
+            assert!(!errno_equiv(false, op, libc::EISDIR, libc::EPERM));
+            assert!(!errno_equiv(true, op, libc::EISDIR, libc::EPERM));
+        }
     }
 
     #[test]
