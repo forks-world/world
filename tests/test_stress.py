@@ -282,6 +282,19 @@ def read_ready_line(proc, timeout=30):
         raise AssertionError(f"no readiness line from pid {proc.pid} within {timeout}s") from None
 
 
+SOAK_READY_TIMEOUT = 30
+SOAK_REQUEST_TIMEOUT = 15
+SOAK_CLIENT_INNER_TIMEOUT = 10
+
+
+def soak_server_timeout(servers, ready_timeout, duration, request_timeout, margin=60):
+    """Seconds a soak server must outlive its own launch: `world exec
+    --timeout` counts from launch, so it covers every server's worst-case
+    readiness wait (they start one after another), the soak itself, one
+    in-flight client request, and slack."""
+    return servers * ready_timeout + duration + request_timeout + margin
+
+
 def old_dir(home):
     return home / ".local/share/world/silo"
 
@@ -758,6 +771,12 @@ class StormChecks:
     redirected under, i.e. `<physical_root>/tmp` is the probe's `/tmp`) and
     `run_probe(argv, name, timeout, **extra_env)`."""
 
+    @staticmethod
+    def budget(base):
+        """Per-probe time budget: the full tier scales its work with SCALE, so
+        the budget scales with it too."""
+        return base * (SCALE if STRESS else 1)
+
     def physical(self, virtual_path):
         return self.physical_root / pathlib.Path(virtual_path).relative_to("/")
 
@@ -797,7 +816,7 @@ class StormChecks:
         result = self.run_probe(
             ["storm", "--threads", threads, "--iters", iters, "--seed", "123", "--dir", vdir],
             "storm",
-            60,
+            self.budget(60),
         )
         self.assert_probe_ok(result, "storm", vdir)
 
@@ -807,17 +826,21 @@ class StormChecks:
         result = self.run_probe(
             ["spawn-storm", "--threads", threads, "--iters", iters, "--dir", vdir],
             "spawn-storm",
-            90,
+            self.budget(90),
         )
         self.assert_probe_ok(result, "spawn-storm", vdir)
 
     def test_fork_exec_storm(self):
         threads, iters = n(2, 6), n(3, 20)
         vdir = self.new_vdir()
+        budget = self.budget(90)
+        # The probe's own bounded wait (default 30s, unscaled) fires just
+        # under the inner/outer timeout so a hang reports pids, not a kill.
         result = self.run_probe(
-            ["fork-exec-storm", "--threads", threads, "--iters", iters, "--dir", vdir],
+            ["fork-exec-storm", "--threads", threads, "--iters", iters, "--dir", vdir,
+             "--deadline-ms", (budget - 10) * 1000],
             "fork-exec-storm",
-            90,
+            budget,
         )
         self.assert_probe_ok(result, "fork-exec-storm", vdir)
         self.assert_fork_exec_summary(result, threads, iters, vdir)
@@ -1179,6 +1202,12 @@ class StressProbeRefusesSymlinkedDir(unittest.TestCase):
 
 
 class WorkerHelpers(unittest.TestCase):
+    def test_soak_server_timeout_covers_startup_and_soak(self):
+        t = soak_server_timeout(8, 30, 240, 15)
+        self.assertGreaterEqual(t, 8 * 30 + 240 + 15)
+        self.assertGreater(soak_server_timeout(8, 30, 480, 15), t)
+        self.assertLessEqual(t, 86400)  # the CLI rejects timeouts over 24h
+
     def test_run_workers_records_exceptions(self):
         def timing_out():
             raise subprocess.TimeoutExpired(["x"], 15)
@@ -1522,8 +1551,8 @@ class NetworkSoak(unittest.TestCase):
             )
             cls.worlds[name] = info
 
-    def command(self, world, *args):
-        return [WORLD, "exec", world, "--state-dir", self.state, "--timeout", "90s", "--", PROBE, *args]
+    def command(self, world, *args, timeout=SOAK_REQUEST_TIMEOUT):
+        return [WORLD, "exec", world, "--state-dir", self.state, "--timeout", f"{timeout}s", "--", PROBE, *args]
 
     def test_network_soak(self):
         duration = 60 * SCALE
@@ -1534,6 +1563,9 @@ class NetworkSoak(unittest.TestCase):
         lock = threading.Lock()
         servers = {}
         logs = []
+        server_timeout = soak_server_timeout(
+            len(names), SOAK_READY_TIMEOUT, duration, SOAK_REQUEST_TIMEOUT
+        )
 
         def stop_servers():
             for proc, _ in servers.values():
@@ -1553,7 +1585,7 @@ class NetworkSoak(unittest.TestCase):
                 log = open(self.root / f"server-{name}.log", "wb")
                 logs.append(log)
                 proc = subprocess.Popen(
-                    [str(x) for x in self.command(name, "serve", "127.0.0.1:0", name)],
+                    [str(x) for x in self.command(name, "serve", "127.0.0.1:0", name, timeout=server_timeout)],
                     stdout=subprocess.PIPE,
                     stderr=log,
                     stdin=subprocess.DEVNULL,
@@ -1563,7 +1595,7 @@ class NetworkSoak(unittest.TestCase):
                 # Registered before the readiness read so a hang or failure
                 # there still gets this process killed by stop_servers.
                 servers[name] = (proc, None)
-                line = read_ready_line(proc, timeout=30)
+                line = read_ready_line(proc, timeout=SOAK_READY_TIMEOUT)
                 self.assertTrue(line.startswith("READY"), (name, line))
                 servers[name] = (proc, int(line.split()[1]))
 
@@ -1577,7 +1609,11 @@ class NetworkSoak(unittest.TestCase):
                         if time.time() >= stop_at or stop.is_set():
                             return
                         result = run_timeout(
-                            self.command(name, "get", f"127.0.0.1:{port}"), timeout=15, env=self.env
+                            self.command(
+                                name, "get", f"127.0.0.1:{port}", timeout=SOAK_CLIENT_INNER_TIMEOUT
+                            ),
+                            timeout=SOAK_REQUEST_TIMEOUT,
+                            env=self.env,
                         )
                         with lock:
                             requests[name] += 1
@@ -1593,7 +1629,7 @@ class NetworkSoak(unittest.TestCase):
             # otherwise silently end that worker and shrink the soak).
             worker_errors, alive = run_workers(
                 [(f"soak-{name}", lambda name=name: client_loop(name)) for name in names],
-                join_timeout=duration + 8 * 15 + 30,
+                join_timeout=duration + len(names) * SOAK_REQUEST_TIMEOUT + 30,
                 stop=stop,
             )
         finally:

@@ -36,8 +36,10 @@ fn run() -> std::io::Result<()> {
         "serve" => {
             let listener = TcpListener::bind(&args[2])?;
             println!("READY {}", listener.local_addr()?.port());
-            for stream in listener.incoming() {
-                stream?.write_all(args[3].as_bytes())?;
+            // `flatten` skips a failed accept: one must not end the server
+            // mid-soak.
+            for mut s in listener.incoming().flatten() {
+                let _ = s.write_all(args[3].as_bytes());
             }
         }
         "udp-serve" => {
