@@ -227,6 +227,11 @@ struct Node {
     /// The name this node is reported under when reached via
     /// `virtual_parent` (its mountpoint's own name).
     mount_name: Option<Vec<u8>>,
+    /// A directory that was removed (`rmdir`) or replaced by a rename while
+    /// something (a cwd, a dirfd) may still refer to it. The node keeps its
+    /// `parent` so `..` still works, but nothing can be created in it and
+    /// its path no longer exists (`getcwd` is ENOENT).
+    detached: bool,
 }
 
 enum FdEntry {
@@ -336,6 +341,7 @@ impl Model {
                 mounted_by: None,
                 virtual_parent: None,
                 mount_name: None,
+                detached: false,
             }],
             profile: profile.clone(),
             root_node: 0,
@@ -397,6 +403,7 @@ impl Model {
                 mounted_by: None,
                 virtual_parent: None,
                 mount_name: None,
+                detached: false,
             }],
             profile: Profile::LinuxMount {
                 root: anchor.to_vec(),
@@ -892,6 +899,9 @@ impl Model {
                 if self.nodes[parent].children.contains_key(&key) {
                     return errout(libc::EEXIST);
                 }
+                if let Err(e) = self.check_live(parent) {
+                    return errout(e);
+                }
                 let id = self.push_node(NodeKind::Dir, Some(parent));
                 self.nodes[parent].children.insert(key, id);
                 okout(0)
@@ -967,6 +977,9 @@ impl Model {
                     }
                     if flags.directory {
                         return errout(libc::ENOTDIR);
+                    }
+                    if let Err(e) = self.check_live(parent) {
+                        return errout(e);
                     }
                     let id = self.push_node(NodeKind::File(Vec::new()), Some(parent));
                     self.nodes[parent].children.insert(key, id);
@@ -1044,6 +1057,9 @@ impl Model {
                         let key = self.key(&name);
                         if self.nodes[parent].children.contains_key(&key) {
                             return errout(libc::EEXIST);
+                        }
+                        if let Err(e) = self.check_live(parent) {
+                            return errout(e);
                         }
                         let id = self.push_node(NodeKind::File(Vec::new()), Some(parent));
                         self.nodes[parent].children.insert(key, id);
@@ -1286,6 +1302,9 @@ impl Model {
                 if self.nodes[parent].children.contains_key(&key) {
                     return errout(libc::EEXIST);
                 }
+                if let Err(e) = self.check_live(parent) {
+                    return errout(e);
+                }
                 let id = self.push_node(NodeKind::Symlink(target.to_vec()), Some(parent));
                 self.nodes[parent].children.insert(key, id);
                 okout(0)
@@ -1412,6 +1431,9 @@ impl Model {
         if self.mount_of(from_parent) != self.mount_of(to_parent) {
             return errout(libc::EXDEV);
         }
+        if let Err(e) = self.check_live(to_parent) {
+            return errout(e);
+        }
         // Linux: a trailing slash on either side demands a directory source
         // (a symlink is never followed, so a link to a directory is not one).
         if !self.is_mac() && (from_trailing || to_trailing) && !from_is_dir {
@@ -1449,6 +1471,14 @@ impl Model {
             }
         }
         self.nodes[from_parent].children.remove(&from_key);
+        if let Some(existing_id) = existing
+            && matches!(
+                self.nodes[existing_id].kind,
+                NodeKind::Dir | NodeKind::Opaque
+            )
+        {
+            self.nodes[existing_id].detached = true;
+        }
         self.nodes[to_parent].children.insert(to_key, from_id);
         self.nodes[from_id].parent = Some(to_parent);
         okout(0)
@@ -1508,6 +1538,9 @@ impl Model {
                     return errout(libc::ENOTDIR);
                 }
                 self.nodes[parent].children.remove(&key);
+                if is_rmdir {
+                    self.nodes[id].detached = true;
+                }
                 okout(0)
             }
             Err(e) => errout(e),
@@ -1528,11 +1561,18 @@ impl Model {
     }
 
     fn do_getcwd(&self) -> Outcome {
+        if self.is_detached(self.cwd) {
+            return errout(libc::ENOENT);
+        }
         let p = self.full_path(View::Virtual, self.cwd);
         dataout(p.len() as i64, p)
     }
 
     fn do_realpath(&self, path: &[u8]) -> Outcome {
+        // libc `realpath` of a relative path starts from `getcwd`.
+        if !path.starts_with(b"/") && self.is_detached(self.cwd) {
+            return errout(libc::ENOENT);
+        }
         match self.resolve(View::Virtual, Start::Cwd, path, true) {
             Ok(node) => {
                 let p = self.full_path(View::Virtual, node);
@@ -1591,6 +1631,9 @@ impl Model {
                 }
                 if self.nodes[parent].children.contains_key(&key) {
                     return errout(libc::EADDRINUSE);
+                }
+                if let Err(e) = self.check_live(parent) {
+                    return errout(e);
                 }
                 let id = self.push_node(NodeKind::Socket, Some(parent));
                 self.nodes[parent].children.insert(key, id);
@@ -1673,6 +1716,9 @@ impl Model {
         let key = self.key(name);
         if self.nodes[self.cwd].children.contains_key(&key) {
             return errout(libc::EEXIST);
+        }
+        if let Err(e) = self.check_live(self.cwd) {
+            return errout(e);
         }
         let id = self.push_node(NodeKind::File(Vec::new()), Some(self.cwd));
         self.nodes[self.cwd].children.insert(key, id);
@@ -1810,8 +1856,32 @@ impl Model {
             mounted_by: None,
             virtual_parent: None,
             mount_name: None,
+            detached: false,
         });
         self.nodes.len() - 1
+    }
+
+    /// Whether `n` (or any ancestor) has been removed from the tree.
+    fn is_detached(&self, mut n: NodeId) -> bool {
+        loop {
+            if self.nodes[n].detached {
+                return true;
+            }
+            match self.nodes[n].parent {
+                Some(p) => n = p,
+                None => return false,
+            }
+        }
+    }
+
+    /// ENOENT when `parent` is a removed directory (creating in it fails on
+    /// both kernels: Linux `IS_DEADDIR`, macOS ENOENT).
+    fn check_live(&self, parent: NodeId) -> Result<(), i32> {
+        if self.is_detached(parent) {
+            Err(libc::ENOENT)
+        } else {
+            Ok(())
+        }
     }
 
     /// Create-or-get a child of `parent` named `name`; does not touch
@@ -2321,6 +2391,75 @@ mod tests {
         let node = resolve_ok(&m, View::Virtual, b"/tmp/..");
         let root = resolve_ok(&m, View::Virtual, b"/");
         assert_eq!(node, root);
+    }
+
+    /// A removed working directory / dirfd directory: `getcwd` and relative
+    /// `realpath` are ENOENT, nothing can be created in it, `..` still works.
+    #[test]
+    fn detached_directories_behave_like_dead_dirs() {
+        for (profile, mac) in [
+            (Profile::MacShim { root: mac_root() }, true),
+            (Profile::LinuxMount { root: linux_root() }, false),
+        ] {
+            let mut m = Model::new(profile.clone());
+            let go = |m: &mut Model, line: &str| {
+                m.apply(&Op::from_line(line).unwrap_or_else(|| panic!("bad op {line}")))
+            };
+            let no = libc::ENOENT;
+            for l in [
+                "mkdir /tmp/a 755",
+                "mkdir /tmp/e 755",
+                "open /tmp/f 100100",
+                "chdir /tmp/a",
+                "rmdir /tmp/a",
+            ] {
+                assert_eq!(go(&mut m, l).errno, 0, "{l}");
+            }
+            // (a) dead cwd.
+            assert_eq!(go(&mut m, "getcwd").errno, no);
+            assert_eq!(go(&mut m, "realpath .").errno, no);
+            assert_eq!(go(&mut m, "realpath ..").errno, no);
+            assert_eq!(go(&mut m, "realpath /tmp").errno, 0);
+            assert_eq!(go(&mut m, "stat .").errno, 0);
+            for l in [
+                "mkdir x 755",
+                "open x 100100",
+                "symlink t y",
+                "bind s",
+                "rename ../f g",
+            ] {
+                assert_eq!(go(&mut m, l).errno, no, "{l}");
+            }
+            assert_eq!(go(&mut m, "chdir ..").errno, 0);
+            let cwd = go(&mut m, "getcwd");
+            assert_eq!(cwd.errno, 0);
+            assert_eq!(
+                cwd.data,
+                if mac {
+                    &b"/private/tmp"[..]
+                } else {
+                    &b"/tmp"[..]
+                }
+            );
+            // (b) dead directory behind a dirfd.
+            let fd = go(&mut m, "opendir /tmp/e");
+            assert_eq!(fd.errno, 0);
+            let fd = fd.ret;
+            assert_eq!(go(&mut m, "rmdir /tmp/e").errno, 0);
+            assert_eq!(go(&mut m, &format!("mkdirat {fd} z")).errno, no);
+            assert_eq!(go(&mut m, &format!("openat {fd} w 100100")).errno, no);
+            // (c) rename-over of the cwd directory.
+            let mut m = Model::new(profile);
+            for l in [
+                "mkdir /tmp/a 755",
+                "mkdir /tmp/e 755",
+                "chdir /tmp/a",
+                "rename /tmp/e /tmp/a",
+            ] {
+                assert_eq!(go(&mut m, l).errno, 0, "{l}");
+            }
+            assert_eq!(go(&mut m, "getcwd").errno, no);
+        }
     }
 
     /// POSIX: an empty pathname is ENOENT for every path-taking call, on

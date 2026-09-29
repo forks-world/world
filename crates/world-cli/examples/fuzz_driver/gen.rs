@@ -74,11 +74,9 @@ pub struct Generator {
     open_dirs: Vec<u32>,
     /// Canonical path each currently-open directory fd refers to: consulted
     /// by `gen_rmdir` so it never targets a directory something still holds
-    /// open (real `rmdir`/further `*at` ops through that fd would then
-    /// disagree with the model, which does not invalidate an open fd when
-    /// its node is unlinked -- a real POSIX subtlety the model does not
-    /// track, avoided here by construction rather than chased as a model
-    /// bug in a file this driver does not own).
+    /// open. The model does track such detached directories (creates in
+    /// them are ENOENT, `getcwd` fails), but that behaviour is exercised
+    /// only by replaying the `seed-dead-cwd` corpus, not by generation.
     open_dir_paths: HashMap<u32, Vec<u8>>,
     open_files: Vec<u32>,
     sockets: Vec<Vec<u8>>,
@@ -733,9 +731,10 @@ impl Generator {
         let to = join(&to_dir, &to_name);
         // Replacing (via rename onto it) the cwd or a directory a tracked fd
         // still holds open unlinks it from under that handle: a real kernel
-        // then fails `getcwd`/further `*at` calls (ENOENT) while the model
-        // keeps the orphaned node usable -- the same pre-existing model
-        // simplification `gen_rmdir` avoids (see `open_dir_paths`).
+        // then fails `getcwd`/further `*at` creates (ENOENT). The model now
+        // tracks detached directories, but the generator still avoids the
+        // case by construction (dead-directory behaviour is replay-only,
+        // covered by the `seed-dead-cwd` corpus; see `open_dir_paths`).
         if to == self.cwd || self.open_dir_paths.values().any(|p| p == &to) {
             return plain(Op::Getcwd, Effect::None);
         }
@@ -772,10 +771,10 @@ impl Generator {
                     && self.direct_children_of(d, Kind::File).is_empty()
                     && self.direct_children_of(d, Kind::Symlink).is_empty()
                     // Never the cwd, and never a directory some tracked
-                    // fd still has open: a real kernel disagrees with the
-                    // model about further access through a dirfd whose
-                    // directory has since been unlinked (see
-                    // `open_dir_paths`'s doc comment).
+                    // fd still has open: dead-directory behaviour is
+                    // modelled (detached nodes) but kept replay-only, so
+                    // the generator avoids it (see `open_dir_paths`'s doc
+                    // comment).
                     && d != &self.cwd
                     && !self.open_dir_paths.values().any(|p| p == d)
                     // The two sandbox roots are permanent anchors that
@@ -882,7 +881,7 @@ impl Generator {
         let name = if let Some(dir) = &dir {
             let mut cands = if rmdir {
                 // Never the cwd or a directory a tracked fd still has open:
-                // the same model gap `gen_rmdir` avoids.
+                // the same replay-only case `gen_rmdir` avoids.
                 let mut c = self.direct_children_of(dir, Kind::Dir);
                 c.retain(|p| p != &self.cwd && !self.open_dir_paths.values().any(|o| o == p));
                 c
