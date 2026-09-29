@@ -291,6 +291,24 @@ impl Generator {
         self.spell_ex(canonical, false)
     }
 
+    /// `spell_for_mutation`, plus (probability 1/32, and `//` a quarter of
+    /// those) a trailing slash, for the operations whose behavior a trailing
+    /// slash changes: unlink, rmdir, rename, symlink, bind, open-create. The
+    /// model implements the per-profile rules and the driver hands the
+    /// original spelling to the real syscall. A name that is a link leaving
+    /// the sandbox never gets one: macOS follows such links for rename and
+    /// rmdir, which the driver would (correctly) refuse and abort the run.
+    fn spell_for_trailing(&mut self, canonical: &[u8]) -> Vec<u8> {
+        let mut out = self.spell_for_mutation(canonical);
+        if !self.escaping_links.contains(&canonical.to_vec()) && self.rng.chance(1, 32) {
+            out.push(b'/');
+            if self.rng.chance(1, 4) {
+                out.push(b'/');
+            }
+        }
+        out
+    }
+
     fn spell_ex(&mut self, canonical: &[u8], allow_dot: bool) -> Vec<u8> {
         if canonical == self.cwd.as_slice() {
             return if allow_dot && self.rng.chance(1, 2) {
@@ -543,7 +561,7 @@ impl Generator {
         let dir = self.any_dir();
         let name = self.biased_name();
         let canonical = join(&dir, &name);
-        let path = self.spell_for_mutation(&canonical);
+        let path = self.spell_for_trailing(&canonical);
         // `biased_name` may pick an existing sibling name: never let a
         // writable/creating open *follow* an escaping link (the real side
         // would refuse it as outside the sandbox, aborting the run).
@@ -627,7 +645,7 @@ impl Generator {
         let dir = self.any_dir();
         let name = self.biased_name();
         let canonical = join(&dir, &name);
-        let path = self.spell_for_mutation(&canonical);
+        let path = self.spell_for_trailing(&canonical);
         // Relative target (a bare or `../`-through-sibling spelling of an
         // existing node in the same directory) most of the time; an
         // absolute (possibly re-spelled) target otherwise.
@@ -685,8 +703,8 @@ impl Generator {
         if to == self.cwd || self.open_dir_paths.values().any(|p| p == &to) {
             return plain(Op::Getcwd, Effect::None);
         }
-        let from_spelled = self.spell_for_mutation(&from);
-        let to_spelled = self.spell_for_mutation(&to);
+        let from_spelled = self.spell_for_trailing(&from);
+        let to_spelled = self.spell_for_trailing(&to);
         plain(
             Op::Rename {
                 from: from_spelled,
@@ -705,7 +723,7 @@ impl Generator {
         let Some(path) = self.pick(&candidates) else {
             return plain(Op::Getcwd, Effect::None);
         };
-        let spelled = self.spell_for_mutation(&path);
+        let spelled = self.spell_for_trailing(&path);
         plain(Op::Unlink { path: spelled }, Effect::Remove(path))
     }
 
@@ -733,7 +751,7 @@ impl Generator {
         let Some(path) = self.pick(&dirs) else {
             return plain(Op::Getcwd, Effect::None);
         };
-        let spelled = self.spell_for_mutation(&path);
+        let spelled = self.spell_for_trailing(&path);
         plain(Op::Rmdir { path: spelled }, Effect::Remove(path))
     }
 
@@ -889,8 +907,12 @@ impl Generator {
         let dir = self.any_dir();
         let name = self.fresh_unused_name(&dir);
         let canonical = join(&dir, &name);
-        let path = self.spell_for_mutation(&canonical);
-        self.sockets.push(canonical);
+        let path = self.spell_for_trailing(&canonical);
+        // A trailing slash makes bind fail (nothing is created), and a
+        // later connect must only target a path that was really bound.
+        if !path.ends_with(b"/") {
+            self.sockets.push(canonical);
+        }
         plain(Op::Bind { path }, Effect::None)
     }
 

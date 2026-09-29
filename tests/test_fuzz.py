@@ -349,6 +349,50 @@ class GuardProbes(unittest.TestCase):
                     self.assertEqual((victim.read_bytes(), victim.stat().st_mtime_ns), before)
                     self.assertFalse(os.path.lexists(new))
 
+    def test_trailing_slash_use_of_an_escaping_symlink_is_refused(self):
+        """macOS follows `link/` for rename and rmdir (and creates at a
+        dangling link's target for mkdir/rename-onto), so a trailing slash on
+        a symlink leaving the sandbox must be refused before the syscall: the
+        victim directory is never renamed, removed or written into."""
+        with tempfile.TemporaryDirectory() as scratch:
+            victim = pathlib.Path(scratch) / "victim"
+            victim.mkdir()
+            (victim / "keep").write_text("precious")
+            gone = pathlib.Path(scratch) / "gone"
+            v = escape_op_path(victim)
+            g = escape_op_path(gone)
+
+            def snapshot():
+                return sorted(os.listdir(scratch)), sorted(os.listdir(victim)), (victim / "keep").read_text()
+
+            before = snapshot()
+            cases = {
+                "rename-source": lambda rid: [f"rename /tmp/{rid}/l/ /tmp/{rid}/y"],
+                "rename-source-double-slash": lambda rid: [f"rename /tmp/{rid}/l// /tmp/{rid}/y"],
+                "rmdir": lambda rid: [f"rmdir /tmp/{rid}/l/"],
+                "rename-onto": lambda rid: [f"mkdir /tmp/{rid}/d 755", f"rename /tmp/{rid}/d /tmp/{rid}/l/"],
+                "mkdir-dangling": lambda rid: [f"symlink {g} /tmp/{rid}/dl", f"mkdir /tmp/{rid}/dl/ 755"],
+            }
+            for name, make in cases.items():
+                with self.subTest(case=name):
+                    rid = fresh_run_id()
+                    text = (
+                        f"# profile mac\n# seed 1\n# run-id {rid}\n# allow-escaping-links 0\n"
+                        f"mkdir /tmp/{rid} 755\nmkdir /var/tmp/{rid} 755\nchdir /tmp/{rid}\n"
+                        f"symlink {v} /tmp/{rid}/l\n" + "".join(line + "\n" for line in make(rid))
+                    )
+                    ops = pathlib.Path(scratch) / f"{name}.ops"
+                    ops.write_text(text)
+                    try:
+                        r = run_timeout([FUZZ_DRIVER, "replay", ops, "--run-id", rid], 20)
+                    finally:
+                        self.remove_roots(rid)
+                        ops.unlink()
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertIn("outside the sandbox", r.stderr)
+                    self.assertEqual(snapshot(), before)
+                    self.assertFalse(os.path.lexists(gone))
+
     def test_op_with_parent_outside_the_sandbox_is_refused_before_any_syscall(self):
         rid = fresh_run_id()
         victim = f"should-never-exist-{rid}"

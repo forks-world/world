@@ -264,26 +264,46 @@ fn dataout(ret: i64, data: Vec<u8>) -> Outcome {
 }
 
 /// Split an absolute or relative path into (parent-directory-text, final
-/// component). The parent text is `"."` for a bare relative name and `"/"`
-/// for a top-level absolute one. `Err(ENOENT)` for `""` (POSIX: an empty
-/// pathname never names anything), `Err(EINVAL)` for `"/"` (nothing to name).
-fn parent_and_name(path: &[u8]) -> Result<(&[u8], &[u8]), Errno> {
+/// component, trailing). The parent text is `"."` for a bare relative name
+/// and `"/"` for a top-level absolute one. `trailing` is true when the path
+/// ended in one or more `/` (all of them are trimmed, so `"a//"` names `a`,
+/// never the empty string); each mutating operation decides what that means
+/// (see `Model::trail_mac` and the `do_*` functions). `Err(ENOENT)` for `""`
+/// (POSIX: an empty pathname never names anything), `Err(EINVAL)` for a path
+/// of only slashes (nothing to name).
+fn parent_and_name(path: &[u8]) -> Result<(&[u8], &[u8], bool), Errno> {
     if path.is_empty() {
         return Err(libc::ENOENT);
     }
-    let trimmed = if path.len() > 1 && path.ends_with(b"/") {
-        &path[..path.len() - 1]
-    } else {
-        path
-    };
-    if trimmed == b"/" {
+    let mut end = path.len();
+    while end > 0 && path[end - 1] == b'/' {
+        end -= 1;
+    }
+    if end == 0 {
         return Err(libc::EINVAL);
     }
+    let trailing = end < path.len();
+    let trimmed = &path[..end];
     match trimmed.iter().rposition(|&b| b == b'/') {
-        Some(0) => Ok((b"/", &trimmed[1..])),
-        Some(i) => Ok((&trimmed[..i], &trimmed[i + 1..])),
-        None => Ok((b".", trimmed)),
+        Some(0) => Ok((b"/", &trimmed[1..], trailing)),
+        Some(i) => Ok((&trimmed[..i], &trimmed[i + 1..], trailing)),
+        None => Ok((b".", trimmed, trailing)),
     }
+}
+
+/// What a trailing-slash final component resolves to on macOS, where the
+/// kernel looks the name up *following* a symlink and requiring a directory
+/// (measured: `rmdir ld/` and `rename ld/ y` act on the link's target).
+enum Trail {
+    /// The name does not exist.
+    Missing,
+    /// A dangling symlink chain; a create-type operation lands at the chain's
+    /// end (parent node, missing name).
+    Dangling(NodeId, Vec<u8>),
+    /// Exists (possibly through a link) but is not a directory.
+    NonDir,
+    /// Exists (possibly through a link) and is this directory.
+    Dir(NodeId),
 }
 
 impl Model {
@@ -383,7 +403,7 @@ impl Model {
     /// Like [`Model::add_fixture_dir`], but creates (or overwrites) a file
     /// with `contents`.
     pub fn add_fixture_file(&mut self, view: View, path: &[u8], contents: Vec<u8>) -> NodeId {
-        let (dir, name) = parent_and_name(path).expect("valid fixture path");
+        let (dir, name, _) = parent_and_name(path).expect("valid fixture path");
         let parent = self.mkdir_p(view, dir, NodeKind::Dir);
         self.set_child(parent, name, NodeKind::File(contents))
     }
@@ -391,7 +411,7 @@ impl Model {
     /// Like [`Model::add_fixture_dir`], but creates (or overwrites) a
     /// symlink with the given (unresolved, possibly dangling) target text.
     pub fn add_fixture_symlink(&mut self, view: View, path: &[u8], target: Vec<u8>) -> NodeId {
-        let (dir, name) = parent_and_name(path).expect("valid fixture path");
+        let (dir, name, _) = parent_and_name(path).expect("valid fixture path");
         let parent = self.mkdir_p(view, dir, NodeKind::Dir);
         self.set_child(parent, name, NodeKind::Symlink(target))
     }
@@ -399,7 +419,7 @@ impl Model {
     /// Like [`Model::add_fixture_dir`], but creates (or overwrites) a socket
     /// node (as `bind` would).
     pub fn add_fixture_socket(&mut self, view: View, path: &[u8]) -> NodeId {
-        let (dir, name) = parent_and_name(path).expect("valid fixture path");
+        let (dir, name, _) = parent_and_name(path).expect("valid fixture path");
         let parent = self.mkdir_p(view, dir, NodeKind::Dir);
         self.set_child(parent, name, NodeKind::Socket)
     }
@@ -409,7 +429,7 @@ impl Model {
     /// symlink target somewhere plausible to dangle towards without fully
     /// modelling it.
     pub fn add_opaque_ancestors(&mut self, path: &[u8]) {
-        if let Ok((dir, _name)) = parent_and_name(path) {
+        if let Ok((dir, _name, _)) = parent_and_name(path) {
             self.mkdir_p(View::Physical, dir, NodeKind::Opaque);
         }
     }
@@ -423,8 +443,12 @@ impl Model {
 
     /// Kernel-like path resolution: walk `path` component by component from
     /// `start`, in `view`. `follow_last` controls whether the final
-    /// component is dereferenced if it is a symlink (a trailing slash always
-    /// forces dereferencing, exactly as the kernel does).
+    /// component is dereferenced if it is a symlink. A trailing slash forces
+    /// dereferencing of a final symlink and requires a directory, as path
+    /// *lookups* do on both kernels; the mutating operations (unlink, rmdir,
+    /// rename, symlink, bind, mkdir, `open(O_CREAT)`) do not go through this
+    /// rule and instead decide per operation and per profile (see the
+    /// `do_*` functions).
     pub fn resolve(
         &self,
         view: View,
@@ -690,14 +714,112 @@ impl Model {
         }
     }
 
+    fn is_mac(&self) -> bool {
+        matches!(self.profile, Profile::MacShim { .. })
+    }
+
+    /// macOS trailing-slash lookup of `key` in `parent` (see [`Trail`]).
+    /// `path` is the original path text, used to find where a dangling
+    /// symlink chain would create its target.
+    fn trail_mac(
+        &self,
+        start: Start,
+        parent: NodeId,
+        key: &[u8],
+        path: &[u8],
+    ) -> Result<Trail, Errno> {
+        let Some(&id) = self.nodes[parent].children.get(key) else {
+            return Ok(Trail::Missing);
+        };
+        let target = if matches!(self.nodes[id].kind, NodeKind::Symlink(_)) {
+            let mut link_count = 0u32;
+            match self.follow_symlink(View::Virtual, parent, id, &mut link_count) {
+                Ok(t) => t,
+                Err(libc::ENOENT) => {
+                    let (p, n, _) = self.resolve_for_create(start, path)?;
+                    return Ok(Trail::Dangling(p, n));
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            id
+        };
+        Ok(match self.nodes[target].kind {
+            NodeKind::Dir | NodeKind::Opaque => Trail::Dir(target),
+            _ => Trail::NonDir,
+        })
+    }
+
+    /// The (parent, map key) that owns directory `t`, for operations that
+    /// act on a symlink's target. `EBUSY` for a mount point or an orphan.
+    fn owner_of(&self, t: NodeId) -> Result<(NodeId, Vec<u8>), Errno> {
+        if self.nodes[t].virtual_parent.is_some() || self.nodes[t].mounted_by.is_some() {
+            return Err(libc::EBUSY);
+        }
+        let p = self.nodes[t]
+            .parent
+            .filter(|&p| p != t)
+            .ok_or(libc::EBUSY)?;
+        self.nodes[p]
+            .children
+            .iter()
+            .find(|(_, c)| **c == t)
+            .map(|(k, _)| (p, k.clone()))
+            .ok_or(libc::EBUSY)
+    }
+
+    /// errno for a trailing-slash `symlink`/`bind` whose final component
+    /// `key` exists or not. Linux never follows the name: it is
+    /// `exists_errno` if present, else ENOENT (the slash demands a
+    /// directory that a create cannot make). macOS resolves it through
+    /// links first: missing or dangling is ENOENT, a non-directory is
+    /// ENOTDIR, a directory is `exists_errno`.
+    fn trailing_create_errno(
+        &self,
+        start: Start,
+        parent: NodeId,
+        key: &[u8],
+        path: &[u8],
+        exists_errno: Errno,
+    ) -> Errno {
+        if !self.is_mac() {
+            return if self.nodes[parent].children.contains_key(key) {
+                exists_errno
+            } else {
+                libc::ENOENT
+            };
+        }
+        match self.trail_mac(start, parent, key, path) {
+            Err(e) => e,
+            Ok(Trail::Missing | Trail::Dangling(..)) => libc::ENOENT,
+            Ok(Trail::NonDir) => libc::ENOTDIR,
+            Ok(Trail::Dir(_)) => exists_errno,
+        }
+    }
+
     fn do_mkdir(&mut self, start: Start, path: &[u8]) -> Outcome {
         match self.resolve_parent(start, path) {
-            Ok((parent, name)) => {
+            Ok((parent, name, trailing)) => {
                 match &self.nodes[parent].kind {
                     NodeKind::Dir | NodeKind::Opaque => {}
                     _ => return errout(libc::ENOTDIR),
                 }
                 let key = self.key(&name);
+                // Linux ignores a trailing slash for mkdir. macOS resolves
+                // the name through links: an existing directory is EEXIST,
+                // an existing non-directory ENOTDIR, and a dangling link
+                // creates its target.
+                let (parent, key) = if trailing && self.is_mac() {
+                    match self.trail_mac(start, parent, &key, path) {
+                        Err(e) => return errout(e),
+                        Ok(Trail::Missing) => (parent, key),
+                        Ok(Trail::Dangling(p, n)) => (p, self.key(&n)),
+                        Ok(Trail::Dir(_)) => return errout(libc::EEXIST),
+                        Ok(Trail::NonDir) => return errout(libc::ENOTDIR),
+                    }
+                } else {
+                    (parent, key)
+                };
                 if self.nodes[parent].children.contains_key(&key) {
                     return errout(libc::EEXIST);
                 }
@@ -710,13 +832,41 @@ impl Model {
     }
 
     fn do_open(&mut self, start: Start, path: &[u8], flags: &OpenFlags) -> Outcome {
+        if flags.create && path.len() > 1 && path.ends_with(b"/") {
+            // O_CREAT with a trailing slash never creates. Linux: EISDIR
+            // once the parent resolves. macOS looks the name up through
+            // links: missing/dangling ENOENT, non-directory ENOTDIR, a
+            // directory EISDIR (EEXIST with O_EXCL).
+            match self.resolve_parent(start, path) {
+                Ok((parent, name, _)) => {
+                    match &self.nodes[parent].kind {
+                        NodeKind::Dir | NodeKind::Opaque => {}
+                        _ => return errout(libc::ENOTDIR),
+                    }
+                    if !self.is_mac() {
+                        return errout(libc::EISDIR);
+                    }
+                    let key = self.key(&name);
+                    return errout(match self.trail_mac(start, parent, &key, path) {
+                        Err(e) => e,
+                        Ok(Trail::Missing | Trail::Dangling(..)) => libc::ENOENT,
+                        Ok(Trail::NonDir) => libc::ENOTDIR,
+                        Ok(Trail::Dir(_)) if flags.excl => libc::EEXIST,
+                        Ok(Trail::Dir(_)) => libc::EISDIR,
+                    });
+                }
+                // A path naming "." or ".." falls through to plain lookup.
+                Err(libc::EINVAL) => {}
+                Err(e) => return errout(e),
+            }
+        }
         if flags.create && flags.excl {
             // POSIX: with O_CREAT|O_EXCL, existence is judged on the literal
             // final component (as `lstat` would see it) -- a symlink there
             // is EEXIST regardless of whether it dangles or even loops, and
             // is never dereferenced.
             return match self.resolve_parent(start, path) {
-                Ok((parent, name)) => {
+                Ok((parent, name, _)) => {
                     match &self.nodes[parent].kind {
                         NodeKind::Dir | NodeKind::Opaque => {}
                         _ => return errout(libc::ENOTDIR),
@@ -751,7 +901,12 @@ impl Model {
                     okout(fd as i64)
                 }
                 NodeKind::Symlink(_) => errout(libc::ELOOP),
-                NodeKind::Socket => errout(libc::ENXIO),
+                // open(2) on a socket node: Linux ENXIO, macOS EOPNOTSUPP.
+                NodeKind::Socket => errout(if self.is_mac() {
+                    libc::EOPNOTSUPP
+                } else {
+                    libc::ENXIO
+                }),
                 NodeKind::File(_) => {
                     if flags.directory {
                         return errout(libc::ENOTDIR);
@@ -781,7 +936,7 @@ impl Model {
                 // handled above) follows such a link and creates the file at
                 // its target instead of at the link's own name.
                 match self.resolve_for_create(start, path) {
-                    Ok((parent, name)) => {
+                    Ok((parent, name, _)) => {
                         match &self.nodes[parent].kind {
                             NodeKind::Dir | NodeKind::Opaque => {}
                             _ => return errout(libc::ENOTDIR),
@@ -810,14 +965,20 @@ impl Model {
     /// symlinks at the final component instead of failing: `open(...,
     /// O_CREAT)` on a dangling symlink creates the file at the link's
     /// target, not at the link's own name.
-    fn resolve_for_create(&self, start: Start, path: &[u8]) -> Result<(NodeId, Vec<u8>), Errno> {
+    fn resolve_for_create(
+        &self,
+        start: Start,
+        path: &[u8],
+    ) -> Result<(NodeId, Vec<u8>, bool), Errno> {
+        let trailing = path.len() > 1 && path.ends_with(b"/");
         let mut link_count = 0u32;
         let start_node = match start {
             Start::Root => self.root_node,
             Start::Cwd => self.cwd,
             Start::Fd(fd) => self.fd_dir(fd)?,
         };
-        self.resolve_for_create_inner(start_node, path, &mut link_count)
+        let (parent, name) = self.resolve_for_create_inner(start_node, path, &mut link_count)?;
+        Ok((parent, name, trailing))
     }
 
     fn resolve_for_create_inner(
@@ -989,12 +1150,21 @@ impl Model {
 
     fn do_symlink(&mut self, target: &[u8], path: &[u8]) -> Outcome {
         match self.resolve_parent(Start::Cwd, path) {
-            Ok((parent, name)) => {
+            Ok((parent, name, trailing)) => {
                 match &self.nodes[parent].kind {
                     NodeKind::Dir | NodeKind::Opaque => {}
                     _ => return errout(libc::ENOTDIR),
                 }
                 let key = self.key(&name);
+                if trailing {
+                    return errout(self.trailing_create_errno(
+                        Start::Cwd,
+                        parent,
+                        &key,
+                        path,
+                        libc::EEXIST,
+                    ));
+                }
                 if self.nodes[parent].children.contains_key(&key) {
                     return errout(libc::EEXIST);
                 }
@@ -1044,15 +1214,36 @@ impl Model {
     }
 
     fn do_rename(&mut self, from: &[u8], to: &[u8]) -> Outcome {
-        let (from_parent, from_name) = match self.resolve_parent(Start::Cwd, from) {
+        let (from_parent, from_name, from_trailing) = match self.resolve_parent(Start::Cwd, from) {
             Ok(v) => v,
             Err(e) => return errout(e),
         };
-        let from_key = self.key(&from_name);
-        let Some(&from_id) = self.nodes[from_parent].children.get(&from_key) else {
+        let mut from_parent = from_parent;
+        let mut from_key = self.key(&from_name);
+        let Some(&child) = self.nodes[from_parent].children.get(&from_key) else {
             return errout(libc::ENOENT);
         };
-        let (to_parent, to_name) = match self.resolve_parent(Start::Cwd, to) {
+        let mut from_id = child;
+        if from_trailing && self.is_mac() {
+            // macOS follows a source symlink given with a trailing slash and
+            // renames its target directory.
+            match self.trail_mac(Start::Cwd, from_parent, &from_key, from) {
+                Err(e) => return errout(e),
+                Ok(Trail::Missing | Trail::Dangling(..)) => return errout(libc::ENOENT),
+                Ok(Trail::NonDir) => return errout(libc::ENOTDIR),
+                Ok(Trail::Dir(t)) => {
+                    if t != child {
+                        (from_parent, from_key) = match self.owner_of(t) {
+                            Ok(v) => v,
+                            Err(e) => return errout(e),
+                        };
+                        from_id = t;
+                    }
+                }
+            }
+        }
+        let from_is_dir = matches!(self.nodes[from_id].kind, NodeKind::Dir | NodeKind::Opaque);
+        let (mut to_parent, to_name, to_trailing) = match self.resolve_parent(Start::Cwd, to) {
             Ok(v) => v,
             Err(e) => return errout(e),
         };
@@ -1060,11 +1251,40 @@ impl Model {
             NodeKind::Dir | NodeKind::Opaque => {}
             _ => return errout(libc::ENOTDIR),
         }
+        let mut to_key = self.key(&to_name);
+        if to_trailing && self.is_mac() {
+            // macOS resolves the destination through links too: a missing
+            // (or dangling) name only accepts a directory source, a
+            // non-directory is ENOTDIR, an existing directory (or a link to
+            // one) is the replaced node itself.
+            match self.trail_mac(Start::Cwd, to_parent, &to_key, to) {
+                Err(e) => return errout(e),
+                Ok(Trail::Missing) if from_is_dir => {}
+                Ok(Trail::Dangling(p, n)) if from_is_dir => {
+                    to_parent = p;
+                    to_key = self.key(&n);
+                }
+                Ok(Trail::Missing | Trail::Dangling(..)) => return errout(libc::ENOENT),
+                Ok(Trail::NonDir) => return errout(libc::ENOTDIR),
+                Ok(Trail::Dir(t)) => {
+                    if self.nodes[to_parent].children.get(&to_key) != Some(&t) {
+                        (to_parent, to_key) = match self.owner_of(t) {
+                            Ok(v) => v,
+                            Err(e) => return errout(e),
+                        };
+                    }
+                }
+            }
+        }
         // Linux checks mount boundaries before the other rename rules.
         if self.mount_of(from_parent) != self.mount_of(to_parent) {
             return errout(libc::EXDEV);
         }
-        let to_key = self.key(&to_name);
+        // Linux: a trailing slash on either side demands a directory source
+        // (a symlink is never followed, so a link to a directory is not one).
+        if !self.is_mac() && (from_trailing || to_trailing) && !from_is_dir {
+            return errout(libc::ENOTDIR);
+        }
         if to_parent == from_id || self.is_descendant(from_id, to_parent) {
             return errout(libc::EINVAL);
         }
@@ -1081,7 +1301,6 @@ impl Model {
             {
                 return errout(libc::ENOTEMPTY);
             }
-            let from_is_dir = matches!(self.nodes[from_id].kind, NodeKind::Dir | NodeKind::Opaque);
             let to_is_dir = matches!(
                 self.nodes[existing_id].kind,
                 NodeKind::Dir | NodeKind::Opaque
@@ -1105,11 +1324,33 @@ impl Model {
 
     fn unlink_impl(&mut self, start: Start, path: &[u8], is_rmdir: bool) -> Outcome {
         match self.resolve_parent(start, path) {
-            Ok((parent, name)) => {
+            Ok((parent, name, trailing)) => {
                 let key = self.key(&name);
                 let Some(&id) = self.nodes[parent].children.get(&key) else {
                     return errout(libc::ENOENT);
                 };
+                let (mut parent, mut key, mut id) = (parent, key, id);
+                if trailing && self.is_mac() {
+                    // macOS resolves the name through links first: anything
+                    // but a directory is ENOTDIR (dangling: ENOENT); unlink
+                    // of a directory is EPERM; rmdir of a link to a
+                    // directory removes the target.
+                    match self.trail_mac(start, parent, &key, path) {
+                        Err(e) => return errout(e),
+                        Ok(Trail::Missing | Trail::Dangling(..)) => return errout(libc::ENOENT),
+                        Ok(Trail::NonDir) => return errout(libc::ENOTDIR),
+                        Ok(Trail::Dir(_)) if !is_rmdir => return errout(libc::EPERM),
+                        Ok(Trail::Dir(t)) => {
+                            if t != id {
+                                (parent, key) = match self.owner_of(t) {
+                                    Ok(v) => v,
+                                    Err(e) => return errout(e),
+                                };
+                                id = t;
+                            }
+                        }
+                    }
+                }
                 let is_dir = matches!(self.nodes[id].kind, NodeKind::Dir | NodeKind::Opaque);
                 if is_rmdir {
                     if !is_dir {
@@ -1120,6 +1361,11 @@ impl Model {
                     }
                 } else if is_dir {
                     return errout(libc::EISDIR);
+                } else if trailing {
+                    // Linux (fs/namei.c `slashes:`): a non-directory named
+                    // with a trailing slash is ENOTDIR; a symlink is never
+                    // followed. (macOS returned above.)
+                    return errout(libc::ENOTDIR);
                 }
                 self.nodes[parent].children.remove(&key);
                 okout(0)
@@ -1174,12 +1420,21 @@ impl Model {
 
     fn do_bind(&mut self, path: &[u8]) -> Outcome {
         match self.resolve_parent(Start::Cwd, path) {
-            Ok((parent, name)) => {
+            Ok((parent, name, trailing)) => {
                 match &self.nodes[parent].kind {
                     NodeKind::Dir | NodeKind::Opaque => {}
                     _ => return errout(libc::ENOTDIR),
                 }
                 let key = self.key(&name);
+                if trailing {
+                    return errout(self.trailing_create_errno(
+                        Start::Cwd,
+                        parent,
+                        &key,
+                        path,
+                        libc::EADDRINUSE,
+                    ));
+                }
                 if self.nodes[parent].children.contains_key(&key) {
                     return errout(libc::EADDRINUSE);
                 }
@@ -1259,8 +1514,8 @@ impl Model {
         }
     }
 
-    fn resolve_parent(&self, start: Start, path: &[u8]) -> Result<(NodeId, Vec<u8>), Errno> {
-        let (dir, name) = parent_and_name(path)?;
+    fn resolve_parent(&self, start: Start, path: &[u8]) -> Result<(NodeId, Vec<u8>, bool), Errno> {
+        let (dir, name, trailing) = parent_and_name(path)?;
         if name == b"." || name == b".." {
             return Err(libc::EINVAL);
         }
@@ -1273,7 +1528,7 @@ impl Model {
         } else {
             self.resolve(View::Virtual, start, dir, true)?
         };
-        Ok((parent, name.to_vec()))
+        Ok((parent, name.to_vec(), trailing))
     }
 
     fn fd_dir(&self, fd: u32) -> Result<NodeId, Errno> {
@@ -2306,5 +2561,302 @@ mod tests {
         let a = resolve_ok(&m, View::Virtual, b"/tmp/abc");
         let b = resolve_ok(&m, View::Virtual, b"/tmp/ABC");
         assert_eq!(a, b);
+    }
+
+    fn trailing_fixture(profile: Profile) -> Model {
+        let mut m = Model::new(profile);
+        m.add_fixture_file(View::Virtual, b"/tmp/f", vec![]);
+        m.add_fixture_dir(View::Virtual, b"/tmp/d");
+        m.add_fixture_dir(View::Virtual, b"/tmp/e");
+        m.add_fixture_file(View::Virtual, b"/tmp/t/in", vec![]);
+        m.add_fixture_symlink(View::Virtual, b"/tmp/ld", b"t".to_vec());
+        m.add_fixture_symlink(View::Virtual, b"/tmp/le", b"e".to_vec());
+        m.add_fixture_symlink(View::Virtual, b"/tmp/lf", b"f".to_vec());
+        m.add_fixture_symlink(View::Virtual, b"/tmp/dl", b"nowhere".to_vec());
+        m.add_fixture_socket(View::Virtual, b"/tmp/s");
+        m
+    }
+
+    /// One trailing-slash case: `kind` is the syscall, `args` its path(s).
+    fn trailing_op(kind: &str, args: &[&str]) -> Op {
+        let b = |i: usize| format!("/tmp/{}", args[i]).into_bytes();
+        let create = |excl: bool| OpenFlags {
+            create: true,
+            excl,
+            write: true,
+            ..OpenFlags::default()
+        };
+        match kind {
+            "unlink" => Op::Unlink { path: b(0) },
+            "rmdir" => Op::Rmdir { path: b(0) },
+            "rename" => Op::Rename {
+                from: b(0),
+                to: b(1),
+            },
+            "symlink" => Op::Symlink {
+                target: b"x".to_vec(),
+                path: b(0),
+            },
+            "bind" => Op::Bind { path: b(0) },
+            "mkdir" => Op::Mkdir {
+                path: b(0),
+                mode: 0o755,
+            },
+            "creat" => Op::Open {
+                path: b(0),
+                flags: create(false),
+            },
+            "creatx" => Op::Open {
+                path: b(0),
+                flags: create(true),
+            },
+            other => panic!("unknown kind {other}"),
+        }
+    }
+
+    fn assert_trailing_table(profile: Profile, table: &[(&str, &[&str], Errno)]) {
+        for (kind, args, expected) in table {
+            let mut m = trailing_fixture(profile.clone());
+            let out = m.apply(&trailing_op(kind, args));
+            assert_eq!(
+                out.errno, *expected,
+                "{:?} {kind} {args:?}: got {} want {}",
+                profile, out.errno, expected
+            );
+        }
+    }
+
+    fn exists(m: &mut Model, path: &str) -> bool {
+        m.apply(&Op::Lstat {
+            path: path.as_bytes().to_vec(),
+        })
+        .errno
+            == 0
+    }
+
+    #[test]
+    fn trailing_slash_semantics_per_profile() {
+        let ok = 0;
+        // Measured macOS (APFS): the final component is looked up through
+        // symlinks and must be a directory.
+        let mac: &[(&str, &[&str], Errno)] = &[
+            ("unlink", &["f/"], libc::ENOTDIR),
+            ("unlink", &["f//"], libc::ENOTDIR),
+            ("unlink", &["s/"], libc::ENOTDIR),
+            ("unlink", &["lf/"], libc::ENOTDIR),
+            ("unlink", &["d/"], libc::EPERM),
+            ("unlink", &["d//"], libc::EPERM),
+            ("unlink", &["ld/"], libc::EPERM),
+            ("unlink", &["missing/"], libc::ENOENT),
+            ("unlink", &["dl/"], libc::ENOENT),
+            ("rmdir", &["d/"], ok),
+            ("rmdir", &["d//"], ok),
+            ("rmdir", &["f/"], libc::ENOTDIR),
+            ("rmdir", &["lf/"], libc::ENOTDIR),
+            ("rmdir", &["s/"], libc::ENOTDIR),
+            ("rmdir", &["ld/"], libc::ENOTEMPTY),
+            ("rmdir", &["le/"], ok),
+            ("rmdir", &["dl/"], libc::ENOENT),
+            ("rmdir", &["missing/"], libc::ENOENT),
+            ("rename", &["f/", "x"], libc::ENOTDIR),
+            ("rename", &["f//", "x"], libc::ENOTDIR),
+            ("rename", &["f", "x/"], libc::ENOENT),
+            ("rename", &["f", "x//"], libc::ENOENT),
+            ("rename", &["d", "x/"], ok),
+            ("rename", &["d", "x//"], ok),
+            ("rename", &["d/", "x"], ok),
+            ("rename", &["d/", "d2/"], ok),
+            ("rename", &["ld/", "y"], ok),
+            ("rename", &["le/", "y"], ok),
+            ("rename", &["lf/", "y"], libc::ENOTDIR),
+            ("rename", &["dl/", "y"], libc::ENOENT),
+            ("rename", &["f", "d/"], libc::EISDIR),
+            ("rename", &["f", "ld/"], libc::EISDIR),
+            ("rename", &["s", "e/"], libc::EISDIR),
+            ("rename", &["s", "x/"], libc::ENOENT),
+            ("rename", &["lf", "x/"], libc::ENOENT),
+            ("rename", &["ld", "x/"], libc::ENOENT),
+            ("rename", &["f", "lf/"], libc::ENOTDIR),
+            ("rename", &["f", "f/"], libc::ENOTDIR),
+            ("rename", &["d", "f/"], libc::ENOTDIR),
+            ("rename", &["d", "lf/"], libc::ENOTDIR),
+            ("rename", &["d", "ld/"], libc::ENOTEMPTY),
+            ("rename", &["d", "le/"], ok),
+            ("rename", &["d", "dl/"], ok),
+            ("rename", &["d", "d/"], ok),
+            ("symlink", &["l/"], libc::ENOENT),
+            ("symlink", &["n//"], libc::ENOENT),
+            ("symlink", &["dl/"], libc::ENOENT),
+            ("symlink", &["f/"], libc::ENOTDIR),
+            ("symlink", &["lf/"], libc::ENOTDIR),
+            ("symlink", &["s/"], libc::ENOTDIR),
+            ("symlink", &["d/"], libc::EEXIST),
+            ("symlink", &["d//"], libc::EEXIST),
+            ("symlink", &["ld/"], libc::EEXIST),
+            ("creat", &["n2/"], libc::ENOENT),
+            ("creat", &["n2//"], libc::ENOENT),
+            ("creat", &["dl/"], libc::ENOENT),
+            ("creat", &["f/"], libc::ENOTDIR),
+            ("creat", &["lf/"], libc::ENOTDIR),
+            ("creat", &["s/"], libc::ENOTDIR),
+            ("creat", &["d/"], libc::EISDIR),
+            ("creat", &["d//"], libc::EISDIR),
+            ("creat", &["ld/"], libc::EISDIR),
+            ("creatx", &["n3/"], libc::ENOENT),
+            ("creatx", &["dl/"], libc::ENOENT),
+            ("creatx", &["f/"], libc::ENOTDIR),
+            ("creatx", &["lf/"], libc::ENOTDIR),
+            ("creatx", &["d/"], libc::EEXIST),
+            ("creatx", &["ld/"], libc::EEXIST),
+            ("bind", &["s2/"], libc::ENOENT),
+            ("bind", &["n//"], libc::ENOENT),
+            ("bind", &["dl/"], libc::ENOENT),
+            ("bind", &["s/"], libc::ENOTDIR),
+            ("bind", &["f/"], libc::ENOTDIR),
+            ("bind", &["lf/"], libc::ENOTDIR),
+            ("bind", &["d/"], libc::EADDRINUSE),
+            ("bind", &["ld/"], libc::EADDRINUSE),
+            ("mkdir", &["n/"], ok),
+            ("mkdir", &["n//"], ok),
+            ("mkdir", &["dl/"], ok),
+            ("mkdir", &["d/"], libc::EEXIST),
+            ("mkdir", &["d//"], libc::EEXIST),
+            ("mkdir", &["ld/"], libc::EEXIST),
+            ("mkdir", &["f/"], libc::ENOTDIR),
+            ("mkdir", &["f//"], libc::ENOTDIR),
+            ("mkdir", &["lf/"], libc::ENOTDIR),
+            ("mkdir", &["s/"], libc::ENOTDIR),
+        ];
+        assert_trailing_table(Profile::MacShim { root: mac_root() }, mac);
+
+        // Linux (fs/namei.c): the final component is never followed by
+        // unlink/rmdir/rename, and symlink/bind/O_CREAT never create.
+        let linux: &[(&str, &[&str], Errno)] = &[
+            ("unlink", &["missing/"], libc::ENOENT),
+            ("unlink", &["d/"], libc::EISDIR),
+            ("unlink", &["f/"], libc::ENOTDIR),
+            ("unlink", &["f//"], libc::ENOTDIR),
+            ("unlink", &["s/"], libc::ENOTDIR),
+            ("unlink", &["lf/"], libc::ENOTDIR),
+            ("unlink", &["ld/"], libc::ENOTDIR),
+            ("unlink", &["dl/"], libc::ENOTDIR),
+            ("rmdir", &["d/"], ok),
+            ("rmdir", &["d//"], ok),
+            ("rmdir", &["f/"], libc::ENOTDIR),
+            ("rmdir", &["ld/"], libc::ENOTDIR),
+            ("rmdir", &["missing/"], libc::ENOENT),
+            ("rename", &["f/", "x"], libc::ENOTDIR),
+            ("rename", &["f", "x/"], libc::ENOTDIR),
+            ("rename", &["f", "x//"], libc::ENOTDIR),
+            ("rename", &["f", "d/"], libc::ENOTDIR),
+            ("rename", &["s", "x/"], libc::ENOTDIR),
+            ("rename", &["lf", "x/"], libc::ENOTDIR),
+            ("rename", &["ld/", "y"], libc::ENOTDIR),
+            ("rename", &["ld", "y/"], libc::ENOTDIR),
+            ("rename", &["d", "x/"], ok),
+            ("rename", &["d", "x//"], ok),
+            ("rename", &["d/", "x"], ok),
+            ("rename", &["d/", "d2/"], ok),
+            ("rename", &["d", "f/"], libc::ENOTDIR),
+            ("rename", &["d", "ld/"], libc::ENOTDIR),
+            ("rename", &["d", "e/"], ok),
+            ("rename", &["f/", "../var/tmp/x"], libc::EXDEV),
+            ("symlink", &["l/"], libc::ENOENT),
+            ("symlink", &["n//"], libc::ENOENT),
+            ("symlink", &["f/"], libc::EEXIST),
+            ("symlink", &["d/"], libc::EEXIST),
+            ("symlink", &["ld/"], libc::EEXIST),
+            ("symlink", &["dl/"], libc::EEXIST),
+            ("creat", &["n/"], libc::EISDIR),
+            ("creat", &["d/"], libc::EISDIR),
+            ("creat", &["f/"], libc::EISDIR),
+            ("creat", &["d//"], libc::EISDIR),
+            ("creatx", &["n/"], libc::EISDIR),
+            ("creatx", &["d/"], libc::EISDIR),
+            ("bind", &["s2/"], libc::ENOENT),
+            ("bind", &["n//"], libc::ENOENT),
+            ("bind", &["s/"], libc::EADDRINUSE),
+            ("bind", &["d/"], libc::EADDRINUSE),
+            ("mkdir", &["n/"], ok),
+            ("mkdir", &["n//"], ok),
+            ("mkdir", &["d/"], libc::EEXIST),
+            ("mkdir", &["f/"], libc::EEXIST),
+        ];
+        assert_trailing_table(Profile::LinuxMount { root: linux_root() }, linux);
+    }
+
+    #[test]
+    fn mac_trailing_slash_follows_links_like_the_kernel() {
+        let mut m = trailing_fixture(Profile::MacShim { root: mac_root() });
+        // rename ld/ y renames the link's *target* directory.
+        assert_eq!(m.apply(&trailing_op("rename", &["ld/", "y"])).errno, 0);
+        assert!(!exists(&mut m, "/tmp/t"));
+        assert!(exists(&mut m, "/tmp/y/in"));
+        assert!(exists(&mut m, "/tmp/ld"), "the link itself stays");
+
+        // rmdir le/ removes the (empty) target, not the link.
+        let mut m = trailing_fixture(Profile::MacShim { root: mac_root() });
+        assert_eq!(m.apply(&trailing_op("rmdir", &["le/"])).errno, 0);
+        assert!(!exists(&mut m, "/tmp/e"));
+        assert!(exists(&mut m, "/tmp/le"));
+
+        // rmdir ld/ on a non-empty target leaves everything intact.
+        let mut m = trailing_fixture(Profile::MacShim { root: mac_root() });
+        assert_eq!(
+            m.apply(&trailing_op("rmdir", &["ld/"])).errno,
+            libc::ENOTEMPTY
+        );
+        assert!(exists(&mut m, "/tmp/t/in"));
+
+        // A dangling link with a trailing slash creates at its target.
+        for (kind, args) in [("mkdir", ["dl/"; 1].as_slice()), ("rename", &["d", "dl/"])] {
+            let mut m = trailing_fixture(Profile::MacShim { root: mac_root() });
+            assert_eq!(m.apply(&trailing_op(kind, args)).errno, 0);
+            assert!(exists(&mut m, "/tmp/nowhere"), "{kind}");
+            assert!(exists(&mut m, "/tmp/dl"), "{kind}");
+        }
+
+        // A trailing slash never turns a link removal into a link-target
+        // removal for unlink.
+        let mut m = trailing_fixture(Profile::MacShim { root: mac_root() });
+        m.apply(&trailing_op("unlink", &["ld/"]));
+        assert!(exists(&mut m, "/tmp/ld") && exists(&mut m, "/tmp/t/in"));
+    }
+
+    #[test]
+    fn trailing_slashes_are_all_trimmed_from_the_name() {
+        assert_eq!(
+            parent_and_name(b"/tmp/a//").unwrap(),
+            (&b"/tmp"[..], &b"a"[..], true)
+        );
+        assert_eq!(
+            parent_and_name(b"a//").unwrap(),
+            (&b"."[..], &b"a"[..], true)
+        );
+        assert_eq!(
+            parent_and_name(b"a").unwrap(),
+            (&b"."[..], &b"a"[..], false)
+        );
+        assert_eq!(parent_and_name(b"//"), Err(libc::EINVAL));
+        assert_eq!(parent_and_name(b""), Err(libc::ENOENT));
+    }
+
+    #[test]
+    fn open_of_a_socket_node_differs_per_profile() {
+        for (profile, want) in [
+            (Profile::MacShim { root: mac_root() }, libc::EOPNOTSUPP),
+            (Profile::LinuxMount { root: linux_root() }, libc::ENXIO),
+        ] {
+            let mut m = Model::new(profile);
+            m.add_fixture_socket(View::Virtual, b"/tmp/s");
+            let out = m.apply(&Op::Open {
+                path: b"/tmp/s".to_vec(),
+                flags: OpenFlags {
+                    write: true,
+                    ..OpenFlags::default()
+                },
+            });
+            assert_eq!(out.errno, want);
+        }
     }
 }
