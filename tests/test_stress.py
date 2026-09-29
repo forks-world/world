@@ -18,6 +18,7 @@ import pathlib
 import queue
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -815,6 +816,34 @@ class ShimStorms(unittest.TestCase):
                 )
                 self.assert_probe_ok(result, "fork-exec-storm-gmalloc")
                 self.assert_fork_exec_summary(result, 2, 3)
+
+    def test_fork_exec_storm_timeout_reaps_children(self):
+        """A hung child (test-only STRESS_PROBE_HANG: exec `pause <marker>`)
+        past the deadline makes the probe kill and reap every child before it
+        exits 3: nothing is left running under the marker."""
+        marker = f"stress-hang-{uuid.uuid4().hex}"
+        result = run_with_sample(
+            [STRESS_PROBE, "fork-exec-storm", "--threads", "2", "--iters", "2",
+             "--dir", "/tmp/R", "--deadline-ms", "500"],
+            timeout=60,
+            name="shim-fork-exec-storm-timeout",
+            env=self.env(STRESS_PROBE_HANG=marker),
+        )
+        ps = subprocess.run(["ps", "-axww", "-o", "pid=,command="], capture_output=True, text=True).stdout
+        strays = [line.split(None, 1) for line in ps.splitlines() if marker in line]
+        for pid, _ in strays:
+            # Only ever by exact pid, and only for a process that carries our
+            # unique marker.
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except OSError:
+                pass
+        self.assertEqual(result.returncode, 3, f"{result.stdout} {result.stderr}")
+        summary = json.loads(result.stdout)
+        self.assertTrue(summary["timeout"], summary)
+        self.assertEqual(summary["unreaped"], [], summary)
+        self.assertTrue(summary["pids"], summary)
+        self.assertEqual(strays, [], f"children survived the timeout: {strays}")
 
 
 # ---------------------------------------------------------------------------

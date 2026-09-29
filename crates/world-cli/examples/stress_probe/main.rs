@@ -9,6 +9,7 @@
 //!   spawn-storm --threads T --iters N --dir /tmp/R
 //!   fork-exec-storm --threads T --iters N --dir /tmp/R
 //!   touch <path> <marker>
+//!   pause <marker>   (test-only helper: blocks forever; see STRESS_PROBE_HANG)
 //!   report <marker>
 //!
 //! Safety: every mode that touches a directory tree (storm, spawn-storm,
@@ -27,7 +28,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -104,6 +105,36 @@ fn join_workers(handles: Vec<std::thread::JoinHandle<()>>, report: &Report) {
             report.error("worker_panic");
             report.violation(format!("worker {n} panicked: {why}"));
         }
+    }
+}
+
+/// SIGKILL `pid` (and its process group, if it leads one) and reap it with a
+/// bounded (2 s) `WNOHANG` poll, so a hung child is neither leaked nor waited
+/// on forever. Returns whether the child was reaped.
+fn kill_and_reap(pid: libc::pid_t) -> bool {
+    // SAFETY: plain signals and waitpid on a pid this process forked/spawned.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+        libc::kill(pid, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut status = 0;
+    loop {
+        let w = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if w == pid {
+            return true;
+        }
+        if w < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            // ECHILD: already reaped elsewhere.
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -790,8 +821,7 @@ fn spawn_report(
                 return Err(err);
             }
             if Instant::now() >= deadline {
-                libc::kill(pid, libc::SIGKILL);
-                libc::waitpid(pid, &mut status, 0);
+                kill_and_reap(pid);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!("spawned child {pid} did not exit within {SPAWN_WAIT:?}"),
@@ -880,22 +910,54 @@ fn cmd_fork_exec_storm(flags: &BTreeMap<String, String>) {
     }
 
     let report = Arc::new(Report::default());
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_millis(flag_u64(flags, "deadline-ms", 30_000));
     let exe = std::env::current_exe().expect("current_exe");
-    let outstanding: Arc<Mutex<BTreeMap<usize, libc::pid_t>>> =
-        Arc::new(Mutex::new(BTreeMap::new()));
+    let shared = Arc::new(ForkShared {
+        outstanding: Mutex::new(BTreeMap::new()),
+        stop: AtomicBool::new(false),
+        killed: Mutex::new(Vec::new()),
+        deadline,
+        // Test-only: exec `pause <marker>` instead of `touch`, so a child
+        // hangs and the timeout path can be exercised.
+        hang: std::env::var("STRESS_PROBE_HANG")
+            .ok()
+            .filter(|m| !m.is_empty()),
+    });
 
     let mut handles = Vec::new();
     for t in 0..threads {
         let dir = dir.clone();
         let report = Arc::clone(&report);
-        let outstanding = Arc::clone(&outstanding);
+        let shared = Arc::clone(&shared);
         let exe = exe.clone();
         handles.push(std::thread::spawn(move || {
-            fork_exec_worker(t, iters, &dir, &exe, &report, &outstanding, deadline);
+            fork_exec_worker(t, iters, &dir, &exe, &report, &shared);
         }));
     }
     join_workers(handles, &report);
+
+    // Backstop: anything still recorded (a panicked worker's child) is
+    // killed and reaped here, never leaked.
+    let leftovers: Vec<libc::pid_t> = shared
+        .outstanding
+        .lock()
+        .unwrap()
+        .values()
+        .copied()
+        .collect();
+    for pid in leftovers {
+        let reaped = kill_and_reap(pid);
+        shared.killed.lock().unwrap().push((pid, reaped));
+    }
+    if shared.stop.load(Ordering::SeqCst) {
+        let killed = shared.killed.lock().unwrap();
+        let pids: Vec<libc::pid_t> = killed.iter().map(|(p, _)| *p).collect();
+        let unreaped: Vec<libc::pid_t> =
+            killed.iter().filter(|(_, r)| !r).map(|(p, _)| *p).collect();
+        let summary = serde_json::json!({"timeout": true, "pids": pids, "unreaped": unreaped});
+        println!("{summary}");
+        std::process::exit(3);
+    }
 
     let expected: Vec<String> = (0..threads)
         .flat_map(|t| (0..iters).map(move |i| (t, i)))
@@ -931,17 +993,42 @@ fn build_envp() -> (Vec<CString>, Vec<*const libc::c_char>) {
     (env_entries, envp)
 }
 
+/// State shared by the fork-exec-storm workers.
+struct ForkShared {
+    /// The pid each worker is currently waiting on.
+    outstanding: Mutex<BTreeMap<usize, libc::pid_t>>,
+    /// Set when the shared deadline passes: every worker stops forking, kills
+    /// and reaps its own child, and returns.
+    stop: AtomicBool,
+    /// `(pid, reaped)` for every child killed because of the timeout.
+    killed: Mutex<Vec<(libc::pid_t, bool)>>,
+    deadline: Instant,
+    /// Test-only hang marker (`STRESS_PROBE_HANG`).
+    hang: Option<String>,
+}
+
+/// Timeout path of a worker: kill and reap its own child, recording whether
+/// it was reaped.
+fn give_up(shared: &ForkShared, t: usize, pid: libc::pid_t) {
+    let reaped = kill_and_reap(pid);
+    shared.killed.lock().unwrap().push((pid, reaped));
+    shared.outstanding.lock().unwrap().remove(&t);
+}
+
 fn fork_exec_worker(
     t: usize,
     iters: usize,
     dir: &Path,
     exe: &Path,
     report: &Report,
-    outstanding: &Mutex<BTreeMap<usize, libc::pid_t>>,
-    deadline: Instant,
+    shared: &ForkShared,
 ) {
+    let (outstanding, stop, deadline) = (&shared.outstanding, &shared.stop, shared.deadline);
     let tdir = dir.join(t.to_string());
     for i in 0..iters {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
         let path = tdir.join(i.to_string());
         let path_c = cstr(&path);
         let exec = i % 2 == 0;
@@ -950,13 +1037,27 @@ fn fork_exec_worker(
         let exe_c = cstr(exe);
         let touch_c = c"touch";
         let marker_c = CString::new(marker.as_str()).expect("marker contains NUL");
-        let argv: [*const libc::c_char; 5] = [
-            exe_c.as_ptr(),
-            touch_c.as_ptr(),
-            path_c.as_ptr(),
-            marker_c.as_ptr(),
-            std::ptr::null(),
-        ];
+        let pause_c = c"pause";
+        let hang_c = shared
+            .hang
+            .as_deref()
+            .map(|m| CString::new(m).expect("hang marker contains NUL"));
+        let argv: [*const libc::c_char; 5] = match &hang_c {
+            Some(h) => [
+                exe_c.as_ptr(),
+                pause_c.as_ptr(),
+                h.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+            ],
+            None => [
+                exe_c.as_ptr(),
+                touch_c.as_ptr(),
+                path_c.as_ptr(),
+                marker_c.as_ptr(),
+                std::ptr::null(),
+            ],
+        };
         let (_env_keep, envp) = build_envp();
 
         report.op();
@@ -979,6 +1080,8 @@ fn fork_exec_worker(
             // and envp are NUL-terminated arrays of pointers into CStrings
             // that outlive the child's use of them.
             unsafe {
+                // Its own process group, so a timeout can kill the whole group.
+                libc::setpgid(0, 0);
                 if exec {
                     libc::execve(exe_c.as_ptr(), argv.as_ptr(), envp.as_ptr());
                     libc::_exit(127);
@@ -999,6 +1102,10 @@ fn fork_exec_worker(
         }
 
         outstanding.lock().unwrap().insert(t, pid);
+        if stop.load(Ordering::SeqCst) {
+            give_up(shared, t, pid);
+            return;
+        }
         let mut status = 0;
         loop {
             // SAFETY: `pid` was just returned by `fork` above, in this
@@ -1016,12 +1123,10 @@ fn fork_exec_worker(
                 report.violation(format!("waitpid failed for pid {pid}: {err}"));
                 break;
             }
-            if Instant::now() >= deadline {
-                let pids: Vec<libc::pid_t> =
-                    outstanding.lock().unwrap().values().copied().collect();
-                let summary = serde_json::json!({"timeout": true, "pids": pids});
-                println!("{summary}");
-                std::process::exit(3);
+            if stop.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                stop.store(true, Ordering::SeqCst);
+                give_up(shared, t, pid);
+                return;
             }
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -1130,6 +1235,11 @@ fn main() {
     match args[1].as_str() {
         "report" => cmd_report(&args),
         "touch" => cmd_touch(&args),
+        "pause" => loop {
+            // Test-only helper for STRESS_PROBE_HANG: blocks until killed.
+            // SAFETY: pause() has no preconditions.
+            unsafe { libc::pause() };
+        },
         "storm" => cmd_storm(&parse_flags(&args[2..])),
         "spawn-storm" => cmd_spawn_storm(&parse_flags(&args[2..])),
         "fork-exec-storm" => cmd_fork_exec_storm(&parse_flags(&args[2..])),
