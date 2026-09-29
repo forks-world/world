@@ -166,28 +166,14 @@ fn flag_u64(flags: &BTreeMap<String, String>, name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Where a validated `--dir` is anchored.
-enum Root {
-    /// The lexical `/tmp` or `/private/tmp` prefix (must be proven redirected).
-    Tmp(&'static str),
-    /// `$STRESS_PROBE_EXTRA_ROOT`: a genuinely separate scratch root.
-    Extra(PathBuf),
-}
-
 /// Refuse to operate outside a redirected /tmp: `--dir` must start with
 /// "/tmp/" or "/private/tmp/" so that under the macOS shim, or a Linux bind
 /// mount, every path this binary touches can only ever land inside the
 /// workspace's own private tree -- never the real host filesystem, no
-/// matter what bug this process might otherwise have. A test harness that
-/// owns a genuinely separate scratch root (not under /tmp at all, e.g. for
-/// an unshimmed smoke run) can opt a specific prefix in via
-/// `STRESS_PROBE_EXTRA_ROOT`; a stray/unexpected invocation can never set
-/// that for itself.
-///
-/// `Root::Tmp` means the `/tmp` prefix matched, so the caller must also
-/// pass `verify_redirected`; `Root::Extra` means the
-/// `STRESS_PROBE_EXTRA_ROOT` branch matched (no redirection to prove).
-fn check_dir_allowed(dir: &Path) -> Result<Root, String> {
+/// matter what bug this process might otherwise have. There is no escape
+/// hatch: the returned prefix must always be proven redirected by
+/// `verify_redirected` before anything is touched.
+fn check_dir_allowed(dir: &Path) -> Result<&'static str, String> {
     // A `..` component could climb out of the allowed prefix textually.
     if dir
         .components()
@@ -198,17 +184,11 @@ fn check_dir_allowed(dir: &Path) -> Result<Root, String> {
     let s = dir.to_string_lossy();
     for prefix in ["/tmp", "/private/tmp"] {
         if s.starts_with(prefix) && s[prefix.len()..].starts_with('/') {
-            return Ok(Root::Tmp(prefix));
+            return Ok(prefix);
         }
     }
-    if let Ok(extra) = std::env::var("STRESS_PROBE_EXTRA_ROOT")
-        && !extra.is_empty()
-        && dir.starts_with(&extra)
-    {
-        return Ok(Root::Extra(PathBuf::from(extra)));
-    }
     Err(format!(
-        "--dir {} is not under /tmp or /private/tmp (and not under $STRESS_PROBE_EXTRA_ROOT); refusing to run",
+        "--dir {} is not under /tmp or /private/tmp; refusing to run",
         dir.display()
     ))
 }
@@ -327,7 +307,7 @@ const NOT_PRIVATE: &str = "not a real directory inside the private tree";
 
 /// Resolve `dir` to an fd, proving every component is a real directory
 /// inside the private tree. The anchor is `verify_redirected`'s fd for a
-/// `/tmp` dir (or an fd opened on `$STRESS_PROBE_EXTRA_ROOT`); the remaining
+/// `/tmp` dir; the remaining
 /// components are walked fd-relative: `.`/`..`/empty components are refused,
 /// each is `mkdirat`ed first when `create` (EEXIST ignored), then
 /// `openat`ed with `O_DIRECTORY|O_NOFOLLOW` (a symlink yields ELOOP/ENOTDIR
@@ -343,21 +323,9 @@ const NOT_PRIVATE: &str = "not a real directory inside the private tree";
 /// tree is owned by the harness, so that is outside the threat model; only
 /// the final component of each storm operation is `O_NOFOLLOW`.
 fn open_validated(dir: &Path, create: bool) -> Result<OwnedFd, String> {
-    let (root_fd, rest) = match check_dir_allowed(dir)? {
-        Root::Tmp(prefix) => {
-            let fd = verify_redirected(prefix)?;
-            let rest = dir.as_os_str().as_bytes()[prefix.len()..].to_vec();
-            (fd, rest)
-        }
-        Root::Extra(extra) => {
-            let fd = open_dir_fd(libc::AT_FDCWD, &cstr(&extra), false)
-                .map_err(|e| format!("open {}: {e}", extra.display()))?;
-            let rest = dir.strip_prefix(&extra).map_err(|e| e.to_string())?;
-            let mut rest_bytes = b"/".to_vec();
-            rest_bytes.extend_from_slice(rest.as_os_str().as_bytes());
-            (fd, rest_bytes)
-        }
-    };
+    let prefix = check_dir_allowed(dir)?;
+    let root_fd = verify_redirected(prefix)?;
+    let rest = dir.as_os_str().as_bytes()[prefix.len()..].to_vec();
     let root_dev = fstat_fd(&root_fd)
         .map_err(|e| format!("fstat root: {e}"))?
         .st_dev;

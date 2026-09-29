@@ -959,6 +959,7 @@ class StressProbeRefusesUnredirected(unittest.TestCase):
             "WORLD_TMP=/": self.clean_env(WORLD_TMP="/"),
             "WORLD_TMP=/private/tmp": self.clean_env(WORLD_TMP="/private/tmp"),
             "WORLD_TMP=/tmp": self.clean_env(WORLD_TMP="/tmp"),
+            "EXTRA_ROOT=/": self.clean_env(STRESS_PROBE_EXTRA_ROOT="/"),
             "WORLD_TMP relative": self.clean_env(WORLD_TMP="w"),
             "WORLD_TMP with ..": self.clean_env(WORLD_TMP=f"{self.owned}/../w"),
             "WORLD_TMP nonexistent": self.clean_env(WORLD_TMP=f"{self.owned}/missing"),
@@ -967,6 +968,48 @@ class StressProbeRefusesUnredirected(unittest.TestCase):
             for case, env in cases.items():
                 with self.subTest(mode=mode, case=case):
                     self.assert_refused(args, env, f"{mode}/{case}")
+
+    def test_extra_root_is_ignored(self):
+        """The removed STRESS_PROBE_EXTRA_ROOT escape hatch must have no
+        effect: a --dir outside /tmp is refused whatever it is set to."""
+        base = pathlib.Path(self.scratch.name)
+        sub = base / "sub"
+        sub.mkdir()
+        link = base / "lnk"
+        os.symlink(sub, link)
+        self.addCleanup(owned_remove, str(link), self.scratch.name)
+        extras = {
+            "slash": ("/", None),
+            "relative": (".", str(base)),
+            "symlink": (str(link), None),
+            "scratch itself": (str(base), None),
+        }
+        for label, (extra, cwd) in extras.items():
+            dirs = {
+                "slash": f"{base}/ex-{uuid.uuid4().hex}",
+                "relative": f"{base}/ex-{uuid.uuid4().hex}",
+                "symlink": f"{link}/ex-{uuid.uuid4().hex}",
+                "scratch itself": f"{base}/ex-{uuid.uuid4().hex}",
+            }
+            d = dirs[label]
+            modes = {
+                "storm": ["storm", "--threads", "1", "--iters", "1", "--dir", d],
+                "spawn-storm": ["spawn-storm", "--threads", "2", "--iters", "1", "--dir", d],
+                "fork-exec-storm": ["fork-exec-storm", "--threads", "1", "--iters", "1", "--dir", d],
+                "touch": ["touch", f"{d}/x", "marker"],
+            }
+            for mode, args in modes.items():
+                with self.subTest(extra=label, mode=mode):
+                    result = run_timeout(
+                        [STRESS_PROBE, *args],
+                        timeout=30,
+                        env=self.clean_env(STRESS_PROBE_EXTRA_ROOT=extra),
+                        cwd=cwd,
+                    )
+                    self.assertEqual(result.returncode, 2, f"{result.stdout} {result.stderr}")
+                    self.assertIn("is not under /tmp", result.stderr)
+                    self.assertFalse(os.path.lexists(d), f"created {d}")
+                    self.assertEqual(os.listdir(sub), [], "symlink target was written")
 
     def test_dotdot_dir_is_still_rejected(self):
         result = run_timeout(
