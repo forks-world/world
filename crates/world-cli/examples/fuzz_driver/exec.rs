@@ -1007,7 +1007,11 @@ fn write_fd(state: &mut RealState, fd: u32, data: &[u8]) -> Outcome {
             Ok(n) => ok(n as i64),
             Err(e) => err(e.raw_os_error().unwrap_or(libc::EIO)),
         },
-        Some(RealFd::Dir(_)) => err(libc::EBADF),
+        // Real write(2): the kernel rejects a directory fd itself.
+        Some(RealFd::Dir(d)) => {
+            let n = unsafe { libc::write(d.as_raw_fd(), data.as_ptr().cast(), data.len()) };
+            if n < 0 { err(io_errno()) } else { ok(n as i64) }
+        }
         None => err(libc::EBADF),
     }
 }
@@ -1024,7 +1028,17 @@ fn read_fd(state: &mut RealState, fd: u32, len: usize) -> Outcome {
                 Err(e) => err(e.raw_os_error().unwrap_or(libc::EIO)),
             }
         }
-        Some(RealFd::Dir(_)) => err(libc::EBADF),
+        // Real read(2): the kernel decides (EISDIR) instead of the harness.
+        Some(RealFd::Dir(d)) => {
+            let mut buf = vec![0u8; len];
+            let n = unsafe { libc::read(d.as_raw_fd(), buf.as_mut_ptr().cast(), len) };
+            if n < 0 {
+                err(io_errno())
+            } else {
+                buf.truncate(n as usize);
+                data_ok(n as i64, buf)
+            }
+        }
         None => err(libc::EBADF),
     }
 }

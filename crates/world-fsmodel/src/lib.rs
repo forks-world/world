@@ -1132,6 +1132,8 @@ impl Model {
                 pos,
                 write: true,
             }) => (node, pos),
+            // Directory fds are always read-only, so the kernel rejects the
+            // write on the fd mode first (EBADF), not on the node type.
             Some(_) => return errout(libc::EBADF),
             None => return errout(libc::EBADF),
         };
@@ -1160,7 +1162,9 @@ impl Model {
     fn do_read(&mut self, fd: u32, len: usize) -> Outcome {
         let (node, pos, write) = match self.fds.get(&fd) {
             Some(&FdEntry::File { node, pos, write }) => (node, pos, write),
-            Some(_) => return errout(libc::EBADF),
+            // read(2) on a directory fd: XNU's vnode read path and Linux's
+            // generic_read_dir both give EISDIR, for any len including 0.
+            Some(FdEntry::Dir { .. }) => return errout(libc::EISDIR),
             None => return errout(libc::EBADF),
         };
         let NodeKind::File(content) = &self.nodes[node].kind else {
@@ -2424,6 +2428,32 @@ mod tests {
         let r = m.apply(&Op::Read { fd: fd2, len: 100 });
         assert_eq!(r.data, b"hello");
         assert_eq!(r.ret, 5);
+    }
+
+    #[test]
+    fn dir_fd_read_is_eisdir_write_is_ebadf() {
+        for profile in [
+            Profile::MacShim { root: mac_root() },
+            Profile::LinuxMount { root: linux_root() },
+        ] {
+            let mut m = Model::new(profile);
+            m.add_fixture_dir(View::Virtual, b"/tmp/d");
+            let open = m.apply(&Op::Open {
+                path: b"/tmp/d".to_vec(),
+                flags: OpenFlags::default(),
+            });
+            assert_eq!(open.errno, 0);
+            let fd = open.ret as u32;
+            for len in [10, 0] {
+                let r = m.apply(&Op::Read { fd, len });
+                assert_eq!(r.errno, libc::EISDIR, "len {len}");
+            }
+            let w = m.apply(&Op::Write {
+                fd,
+                data: b"x".to_vec(),
+            });
+            assert_eq!(w.errno, libc::EBADF);
+        }
     }
 
     #[test]

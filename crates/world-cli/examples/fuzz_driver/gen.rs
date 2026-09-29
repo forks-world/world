@@ -626,21 +626,34 @@ impl Generator {
         )
     }
 
-    fn gen_write(&mut self) -> GenStep {
-        if self.open_files.is_empty() {
-            return plain(Op::Getcwd, Effect::None);
+    /// Any open fd, file or directory: read/write on a directory fd is
+    /// real behavior (EISDIR / EBADF) the model must match.
+    fn pick_any_fd(&mut self) -> Option<u32> {
+        let n = self.open_files.len() + self.open_dirs.len();
+        if n == 0 {
+            return None;
         }
-        let fd = self.open_files[self.rng.below(self.open_files.len() as u64) as usize];
+        let i = self.rng.below(n as u64) as usize;
+        Some(if i < self.open_files.len() {
+            self.open_files[i]
+        } else {
+            self.open_dirs[i - self.open_files.len()]
+        })
+    }
+
+    fn gen_write(&mut self) -> GenStep {
+        let Some(fd) = self.pick_any_fd() else {
+            return plain(Op::Getcwd, Effect::None);
+        };
         let len = self.rng.below(12) as usize;
         let data: Vec<u8> = (0..len).map(|i| b'a' + (i as u8 % 26)).collect();
         plain(Op::Write { fd, data }, Effect::None)
     }
 
     fn gen_read(&mut self) -> GenStep {
-        if self.open_files.is_empty() {
+        let Some(fd) = self.pick_any_fd() else {
             return plain(Op::Getcwd, Effect::None);
-        }
-        let fd = self.open_files[self.rng.below(self.open_files.len() as u64) as usize];
+        };
         plain(
             Op::Read {
                 fd,
