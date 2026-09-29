@@ -918,6 +918,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "world-fsmodel",
  "world-runtime",
 ]
 
