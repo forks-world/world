@@ -1052,6 +1052,16 @@ fn close_fd(state: &mut RealState, fd: u32) -> Outcome {
 }
 
 fn symlink_like(state: &mut RealState, target: &[u8], path: &[u8]) -> ExecResult<Outcome> {
+    // Both kernels copy the target in first, before looking at the link
+    // path, so these win over any parent error; Linux also rejects an
+    // empty target (macOS stores it).
+    if target.len() >= libc::PATH_MAX as usize {
+        return Ok(err(libc::ENAMETOOLONG));
+    }
+    #[cfg(target_os = "linux")]
+    if target.is_empty() {
+        return Ok(err(libc::ENOENT));
+    }
     let (parent, name, trailing) = guarded_parent(state, Start::Cwd, path)?;
     check_trailing(state, parent.as_raw_fd(), &name, trailing)?;
     // `target` is stored verbatim, never resolved/guarded by this harness
@@ -2057,6 +2067,25 @@ mod trailing_slash_guard_tests {
         long.resize(libc::PATH_MAX as usize, b'a');
         let a = mkdir_like(&mut f.state, Start::Root, &long, 0o755).map(|a| a.outcome);
         assert_eq!(errno_of(a), libc::ENAMETOOLONG);
+        victim_untouched(&f);
+    }
+
+    #[test]
+    fn symlink_target_is_judged_before_the_link_parent() {
+        let mut f = fixture();
+        // A target of PATH_MAX bytes wins over a missing parent.
+        let long = vec![b't'; libc::PATH_MAX as usize];
+        let missing = abs(&f, "nope/x");
+        let a = symlink_like(&mut f.state, &long, &missing);
+        assert_eq!(errno_of(a), libc::ENAMETOOLONG);
+        // Linux rejects an empty target even under a file parent.
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::write(f.sandbox.join("file"), b"").unwrap();
+            let under_file = abs(&f, "file/x");
+            let a = symlink_like(&mut f.state, b"", &under_file);
+            assert_eq!(errno_of(a), libc::ENOENT);
+        }
         victim_untouched(&f);
     }
 }

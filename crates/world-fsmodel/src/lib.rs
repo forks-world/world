@@ -878,14 +878,18 @@ impl Model {
             // once the parent resolves. macOS looks the name up through
             // links: missing/dangling ENOENT, non-directory ENOTDIR, a
             // directory EISDIR (EEXIST with O_EXCL).
-            match self.resolve_parent(start, path) {
+            match self.resolve_parent_unchecked(start, path) {
                 Ok((parent, name, _)) => {
                     match &self.nodes[parent].kind {
                         NodeKind::Dir | NodeKind::Opaque => {}
                         _ => return errout(libc::ENOTDIR),
                     }
+                    // Linux reports EISDIR before it looks the name up.
                     if !self.is_mac() {
                         return errout(libc::EISDIR);
+                    }
+                    if name.len() > NAME_MAX {
+                        return errout(libc::ENAMETOOLONG);
                     }
                     let key = self.key(&name);
                     return errout(match self.trail_mac(start, parent, &key, path) {
@@ -1199,6 +1203,12 @@ impl Model {
         if target.len() >= self.path_max() {
             return errout(libc::ENAMETOOLONG);
         }
+        // Linux resolves the target string first and rejects an empty one
+        // with ENOENT; macOS happily stores it (the link then never
+        // resolves).
+        if target.is_empty() && !self.is_mac() {
+            return errout(libc::ENOENT);
+        }
         match self.resolve_parent(Start::Cwd, path) {
             Ok((parent, name, trailing)) => {
                 match &self.nodes[parent].kind {
@@ -1485,6 +1495,11 @@ impl Model {
                         libc::EADDRINUSE,
                     ));
                 }
+                // The literal name must fit the sockaddr_un path.
+                let sun_path = if self.is_mac() { 104 } else { 108 };
+                if name.len() >= sun_path {
+                    return errout(libc::ENAMETOOLONG);
+                }
                 if self.nodes[parent].children.contains_key(&key) {
                     return errout(libc::EADDRINUSE);
                 }
@@ -1511,9 +1526,16 @@ impl Model {
         if name.is_empty() || name.contains(&b'/') {
             return errout(libc::EINVAL);
         }
+        if name.len() > NAME_MAX {
+            return errout(libc::ENAMETOOLONG);
+        }
         match &self.nodes[self.cwd].kind {
             NodeKind::Dir | NodeKind::Opaque => {}
             _ => return errout(libc::ENOTDIR),
+        }
+        // An exclusive create of `.`/`..` finds the entry that exists.
+        if name == b"." || name == b".." {
+            return errout(libc::EEXIST);
         }
         let key = self.key(name);
         if self.nodes[self.cwd].children.contains_key(&key) {
@@ -1564,7 +1586,28 @@ impl Model {
         }
     }
 
+    /// Parent directory and final name, with the kernel's lookup order: a
+    /// non-directory parent is ENOTDIR, then a final name over NAME_MAX is
+    /// ENAMETOOLONG.
     fn resolve_parent(&self, start: Start, path: &[u8]) -> Result<(NodeId, Vec<u8>, bool), Errno> {
+        let (parent, name, trailing) = self.resolve_parent_unchecked(start, path)?;
+        match &self.nodes[parent].kind {
+            NodeKind::Dir | NodeKind::Opaque => {}
+            _ => return Err(libc::ENOTDIR),
+        }
+        if name.len() > NAME_MAX {
+            return Err(libc::ENAMETOOLONG);
+        }
+        Ok((parent, name, trailing))
+    }
+
+    /// `resolve_parent` without the parent-kind and final-name checks, for
+    /// callers that order those against other errors themselves.
+    fn resolve_parent_unchecked(
+        &self,
+        start: Start,
+        path: &[u8],
+    ) -> Result<(NodeId, Vec<u8>, bool), Errno> {
         // The kernel sees the whole text, not just the directory part.
         if path.len() >= self.path_max() {
             return Err(libc::ENAMETOOLONG);
@@ -2551,6 +2594,216 @@ mod tests {
             path: b"/tmp/l".to_vec(),
         });
         assert_eq!(out.data, b"/etc/hosts");
+    }
+
+    fn long_name() -> Vec<u8> {
+        vec![b'L'; NAME_MAX + 1]
+    }
+
+    fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
+        let mut p = dir.to_vec();
+        p.push(b'/');
+        p.extend_from_slice(name);
+        p
+    }
+
+    fn sym(target: &[u8], path: &[u8]) -> Op {
+        Op::Symlink {
+            target: target.to_vec(),
+            path: path.to_vec(),
+        }
+    }
+
+    #[test]
+    fn empty_symlink_target_is_enoent_on_linux_only() {
+        let long = join(b"/tmp", &long_name());
+        // Linux: the target is rejected before anything about the link path.
+        let mut m = Model::new(Profile::LinuxMount { root: linux_root() });
+        m.add_fixture_file(View::Virtual, b"/tmp/file", vec![]);
+        m.add_fixture_file(View::Virtual, b"/tmp/existing", vec![]);
+        for path in [
+            &b"/tmp/x"[..],
+            b"/tmp/file/x",
+            b"/tmp/nope/x",
+            b"/tmp/existing",
+            &long,
+        ] {
+            let out = m.apply(&sym(b"", path));
+            assert_eq!(out.errno, libc::ENOENT, "{}", String::from_utf8_lossy(path));
+        }
+        let out = m.apply(&Op::Lstat {
+            path: b"/tmp/x".to_vec(),
+        });
+        assert_eq!(out.errno, libc::ENOENT, "tree must be unchanged");
+        // macOS: stored verbatim, never resolves; link-path errors still win.
+        let mut m = Model::new(Profile::MacShim { root: mac_root() });
+        m.add_fixture_file(View::Virtual, b"/tmp/file", vec![]);
+        assert_eq!(m.apply(&sym(b"", b"/tmp/x")).errno, 0);
+        let out = m.apply(&Op::Readlink {
+            path: b"/tmp/x".to_vec(),
+        });
+        assert_eq!((out.errno, out.data), (0, Vec::new()));
+        let out = m.apply(&Op::Stat {
+            path: b"/tmp/x".to_vec(),
+        });
+        assert_eq!(out.errno, libc::ENOENT);
+        assert_eq!(m.apply(&sym(b"", b"/tmp/file/x")).errno, libc::ENOTDIR);
+        assert_eq!(m.apply(&sym(b"", &long)).errno, libc::ENAMETOOLONG);
+    }
+
+    #[test]
+    fn mkstemp_name_max_and_dot_names() {
+        for profile in [
+            Profile::MacShim { root: mac_root() },
+            Profile::LinuxMount { root: linux_root() },
+        ] {
+            let mut m = Model::new(profile);
+            m.apply(&Op::Chdir {
+                path: b"/tmp".to_vec(),
+            });
+            let mk = |name: Vec<u8>| Op::MkstempAdopt { name };
+            assert_eq!(m.apply(&mk(long_name())).errno, libc::ENAMETOOLONG);
+            for name in [&b"."[..], b".."] {
+                assert_eq!(m.apply(&mk(name.to_vec())).errno, libc::EEXIST);
+            }
+            let list = m.apply(&Op::List {
+                path: b".".to_vec(),
+            });
+            assert!(list.data.is_empty(), "tree unchanged");
+            assert_eq!(m.apply(&mk(vec![b'a'; NAME_MAX])).errno, 0);
+        }
+    }
+
+    #[test]
+    fn name_max_lookup_order_table() {
+        let long = long_name();
+        for mac in [true, false] {
+            let profile = if mac {
+                Profile::MacShim { root: mac_root() }
+            } else {
+                Profile::LinuxMount { root: linux_root() }
+            };
+            let fresh = || {
+                let mut m = Model::new(profile.clone());
+                m.add_fixture_file(View::Virtual, b"/tmp/file", vec![]);
+                m.add_fixture_dir(View::Virtual, b"/tmp/dir");
+                m
+            };
+            let ex = OpenFlags {
+                create: true,
+                excl: true,
+                write: true,
+                ..Default::default()
+            };
+            let cr = OpenFlags {
+                create: true,
+                write: true,
+                ..Default::default()
+            };
+            let mk = |p: Vec<u8>| Op::Mkdir {
+                path: p,
+                mode: 0o755,
+            };
+            let un = |p: Vec<u8>| Op::Unlink { path: p };
+            let rd = |p: Vec<u8>| Op::Rmdir { path: p };
+            let ope = |p: Vec<u8>, f| Op::Open { path: p, flags: f };
+            let l_dir = join(b"/tmp", &long);
+            let mut l_slash = l_dir.clone();
+            l_slash.push(b'/');
+            let l_file = join(b"/tmp/file", &long);
+            let l_nope = join(b"/tmp/nope", &long);
+            // (op, expected errno); same on both profiles unless noted.
+            let mut rows: Vec<(Op, i32)> = vec![
+                (mk(l_dir.clone()), libc::ENAMETOOLONG),
+                (mk(l_slash.clone()), libc::ENAMETOOLONG),
+                (mk(l_file.clone()), libc::ENOTDIR),
+                (mk(l_nope.clone()), libc::ENOENT),
+                (un(l_dir.clone()), libc::ENAMETOOLONG),
+                (un(l_file.clone()), libc::ENOTDIR),
+                (un(b"/tmp/file/y".to_vec()), libc::ENOTDIR),
+                (rd(b"/tmp/file/y".to_vec()), libc::ENOTDIR),
+                (rd(l_dir.clone()), libc::ENAMETOOLONG),
+                (ope(l_dir.clone(), ex), libc::ENAMETOOLONG),
+                (ope(l_dir.clone(), cr), libc::ENAMETOOLONG),
+                (ope(l_file.clone(), cr), libc::ENOTDIR),
+                (sym(b"t", &l_dir), libc::ENAMETOOLONG),
+                (sym(b"t", &l_file), libc::ENOTDIR),
+                (
+                    Op::Bind {
+                        path: l_dir.clone(),
+                    },
+                    libc::ENAMETOOLONG,
+                ),
+                (
+                    Op::Bind {
+                        path: l_file.clone(),
+                    },
+                    libc::ENOTDIR,
+                ),
+            ];
+            rows.push((
+                ope(l_slash.clone(), cr),
+                if mac {
+                    libc::ENAMETOOLONG
+                } else {
+                    libc::EISDIR
+                },
+            ));
+            if mac {
+                // Linux rename looks the source up before the target's
+                // name (see docs/testing.md), so only macOS is pinned.
+                rows.push((
+                    Op::Rename {
+                        from: l_dir.clone(),
+                        to: b"/tmp/nope/x".to_vec(),
+                    },
+                    libc::ENAMETOOLONG,
+                ));
+                rows.push((
+                    Op::Rename {
+                        from: b"/tmp/nope".to_vec(),
+                        to: l_dir.clone(),
+                    },
+                    libc::ENOENT,
+                ));
+                rows.push((
+                    Op::Rename {
+                        from: b"/tmp/dir".to_vec(),
+                        to: join(b"/tmp/dir", &long),
+                    },
+                    libc::ENAMETOOLONG,
+                ));
+                rows.push((
+                    Op::Rename {
+                        from: b"/tmp/file/y".to_vec(),
+                        to: b"/tmp/x".to_vec(),
+                    },
+                    libc::ENOTDIR,
+                ));
+            }
+            for (op, want) in rows {
+                let mut m = fresh();
+                let got = m.apply(&op).errno;
+                assert_eq!(got, want, "mac={mac} {op:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bind_name_must_fit_sun_path() {
+        for (mac, cap) in [(true, 104usize), (false, 108)] {
+            let profile = if mac {
+                Profile::MacShim { root: mac_root() }
+            } else {
+                Profile::LinuxMount { root: linux_root() }
+            };
+            let mut m = Model::new(profile);
+            let fits = join(b"/tmp", &vec![b's'; cap - 1]);
+            let over = join(b"/tmp", &vec![b's'; cap]);
+            assert_eq!(m.apply(&Op::Bind { path: over }).errno, libc::ENAMETOOLONG);
+            assert_eq!(m.apply(&Op::Bind { path: fits.clone() }).errno, 0);
+            assert_eq!(m.apply(&Op::Bind { path: fits }).errno, libc::EADDRINUSE);
+        }
     }
 
     #[test]

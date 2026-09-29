@@ -122,3 +122,4 @@ shim 是用户态的透明改写，以下情况文档化为已知缺口，不在
 - APFS 大小写不敏感：用例生成器只使用小写 ASCII 文件名，不覆盖大小写折叠相关的路径冲突。
 - 需要真实内核 namespace 或需要 root 的部分（Linux 持有者竞争、macOS 特权 loopback）本地未必能跑，只在 CI 里保证覆盖。
 - 整条路径长度上限：模型按各 profile 的 `PATH_MAX`（mac 1024、Linux 4096，含结尾 NUL，即长度 `>=` 上限时 `ENAMETOOLONG`）判定；执行端会先对整条路径做同样的检查（因为它只把拆开后的父目录和末尾名字交给 syscall）。shim 自己的限制不建模：私有根前缀 + 子目录 + 剩余路径长度 `>= PATH_MAX` 时 shim 返回 `ENAMETOOLONG`，因此 `/tmp`、`/var/tmp` 下的绝对路径实际上限是 `PATH_MAX` 减去私有根前缀长度（`/private/...` 拼写再多几个字节），符号链接目标同理。macOS 的 `namei` 在跟随链接时还会在“链接内容长度 + 剩余路径长度 `>= MAXPATHLEN`”时返回 `ENAMETOOLONG`，Linux 没有这条规则，模型同样不建模。生成器的文件名 1-4 个字符、嵌套不超过约 8 层，生成的路径长度远小于 512 字节（debug 构建下有断言），所以这些缺口不会被生成器触发。
+- Linux `rename` 的查找顺序：内核先解析两侧父目录，再检查跨挂载（`EXDEV`），然后才查找源、目标；模型先查源再解析目标的父目录。因此在 Linux profile 上，源不存在同时目标末尾名字超过 `NAME_MAX`（模型 `ENAMETOOLONG`，内核 `ENOENT`）、源不存在同时目标父目录是文件（模型 `ENOENT`，内核 `ENOTDIR`）、跨挂载且源不存在（内核 `EXDEV`）这几种组合模型与内核不一致，且表驱动测试只固定了 macOS 上的 `rename` 顺序。生成器的名字只有 1-4 个字符，不会触发，只影响手写的回放输入。
