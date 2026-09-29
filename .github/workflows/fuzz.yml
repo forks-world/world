@@ -10,10 +10,13 @@ on:
         required: false
         type: string
       budget:
-        description: WORLD_FUZZ_BUDGET / WORLD_STRESS budget in seconds
+        description: >-
+          WORLD_FUZZ_BUDGET in seconds per fuzz class. Leave empty for the
+          per-job defaults (macOS 1200 / 900, Linux 1800). The macOS shim-diff
+          job runs two classes, so keep this at or below (timeout - 25 min) / 2
+          = 1500 s there.
         required: false
         type: string
-        default: "1800"
 
 permissions:
   contents: read
@@ -71,9 +74,12 @@ jobs:
       matrix:
         os: [macos-latest, macos-15]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # Two fuzz classes run back to back (ShimFuzz, then PrivilegedExecFuzz),
+    # each for its own WORLD_FUZZ_BUDGET, plus a cold build, corpus replay,
+    # minimize and setup/cleanup (~25 min). Budget cap per class is
+    # (timeout - 25 min) / 2 = 25 min.
+    timeout-minutes: 75
     env:
-      WORLD_FUZZ_BUDGET: ${{ inputs.budget || '1800' }}
       WORLD_FUZZ_SEED: ${{ inputs.seed || github.run_id }}
     steps:
       - uses: actions/checkout@v4
@@ -83,11 +89,16 @@ jobs:
           components: rustfmt, clippy
       - run: cargo build --workspace --locked && cargo build --workspace --examples --locked
       - name: Shim differential fuzz
+        env:
+          WORLD_FUZZ_BUDGET: ${{ inputs.budget || '1200' }}
         run: python3 -m unittest tests.test_fuzz -v
+      # Only the privileged class: ShimFuzz already ran with its own budget
+      # above, and re-running it here would double its time.
       - name: Shim differential fuzz (privileged silo integration)
         env:
           WORLD_SILO_INTEGRATION: "1"
-        run: python3 -m unittest tests.test_fuzz -v
+          WORLD_FUZZ_BUDGET: ${{ inputs.budget || '900' }}
+        run: python3 -m unittest tests.test_fuzz.PrivilegedExecFuzz -v
       - name: Remove leftover loopback aliases
         if: always()
         run: ifconfig lo0 | awk '/inet 127\.77\./{print $2}' | xargs -n1 -I{} sudo -n /sbin/ifconfig lo0 -alias {} || true

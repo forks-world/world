@@ -33,6 +33,10 @@ jobs:
       - name: Install pasta for workspace networking
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y passt
+      - name: No process::exit in world-fsmodel tests
+        # process::exit in a test thread kills the whole harness and hides
+        # every other result; delegate to a child process instead.
+        run: "! grep -rn 'process::exit' crates/world-fsmodel/tests"
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked

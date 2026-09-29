@@ -48,16 +48,18 @@ python3 -m unittest tests.test_fuzz -v
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `WORLD_FUZZ_BUDGET` | `10`（秒） | 单次运行的时间预算；夜间 CI 用 `1800` |
+| `WORLD_FUZZ_BUDGET` | `10`（秒） | **每个 fuzz 测试类**各自的时间预算（不是整次运行的总预算）；夜间 CI 在 macOS 上 `ShimFuzz` 用 `1200`、`PrivilegedExecFuzz` 用 `900`，Linux 用 `1800` |
 | `WORLD_FUZZ_SEED` | 随机 | 固定后可复现同一操作序列 |
 | `WORLD_FUZZ_OPS` | `40` | 单个操作序列的步数 |
 | `WORLD_FUZZ_ARTIFACTS` | `target/fuzz-artifacts` | 失败现场（种子、操作序列、双方快照）的落盘目录 |
 
-三个测试类分别覆盖不同后端：`ShimFuzz`（macOS，无需特权）、`LinuxFuzz`（Linux，经 `world exec`）、`PrivilegedExecFuzz`（macOS，需要 `WORLD_SILO_INTEGRATION=1`，会真实添加/删除 loopback 别名）。默认只跑无需特权的部分：
+三个测试类分别覆盖不同后端：`ShimFuzz`（macOS，无需特权）、`LinuxFuzz`（Linux，经 `world exec`）、`PrivilegedExecFuzz`（macOS，需要 `WORLD_SILO_INTEGRATION=1`，会真实添加/删除 loopback 别名）。默认只跑无需特权的部分。只跑特权那一类：
 
 ```sh
-WORLD_SILO_INTEGRATION=1 python3 -m unittest tests.test_fuzz -v
+WORLD_SILO_INTEGRATION=1 python3 -m unittest tests.test_fuzz.PrivilegedExecFuzz -v
 ```
+
+注意预算是按类计的：一个 job 里跑 N 个 fuzz 类，总耗时约为 N × `WORLD_FUZZ_BUDGET` 加上构建、语料重放、minimize 与清理（约 25 分钟）。所以 job 的 `timeout-minutes` 必须满足 `WORLD_FUZZ_BUDGET ≤ (timeout − 25 分钟) / N`；macOS `shim-diff`（75 分钟、2 个类）上限为 1500 秒。
 
 ### Layer 3：压力与并发
 
@@ -71,7 +73,7 @@ python3 -m unittest tests.test_stress -v
 WORLD_STRESS=1 WORLD_STRESS_SCALE=4 python3 -m unittest tests.test_stress -v
 ```
 
-`WORLD_STRESS_SCALE` 是并发数/迭代数的整数倍数。`test_network_soak` 额外需要 `WORLD_SILO_INTEGRATION=1` 且 `WORLD_STRESS=1` 才会运行。macOS 上超时会用 `sample` 抓取卡住进程的调用栈存进 `target/fuzz-artifacts`；Linux 有专门的持有者竞争（holder race）测试。
+`WORLD_STRESS_SCALE` 是并发数/迭代数的整数倍数。`stress_probe` 会在写任何东西之前先做 `verify_redirected`：`/tmp` 必须确实被重定向到私有根（macOS 用 `WORLD_TMP`，Linux 经 `world exec` 时由测试通过 `STRESS_PROBE_PHYSICAL_ROOT` 传入），否则以 `not running redirected` 退出 2（失败即拒绝，`StressProbeRefusesUnredirected` 覆盖）。所有工作线程都按总期限 join，超时或异常会被记录并使测试失败，而不是让线程悄悄退出。`test_network_soak` 额外需要 `WORLD_SILO_INTEGRATION=1` 且 `WORLD_STRESS=1` 才会运行。macOS 上超时会用 `sample` 抓取卡住进程的调用栈存进 `target/fuzz-artifacts`；Linux 有专门的持有者竞争（holder race）测试。
 
 ## 失败复现
 
@@ -95,8 +97,8 @@ WORLD_STRESS=1 WORLD_STRESS_SCALE=4 python3 -m unittest tests.test_stress -v
 
 ## CI
 
-- `test.yml`（PR + push main）：`WORLD_FUZZ_BUDGET=10`，只跑冒烟档位，目标是几分钟内给出信号；失败时上传 `target/fuzz-artifacts` 和 `**/proptest-regressions`。
-- `fuzz.yml`（每日 03:17 UTC 定时，也支持手动触发并指定 `seed`/`budget`）：大预算跑 Layer 1（`PROPTEST_CASES=100000`、`WORLD_FSMODEL_CASES=2000`，release 构建）、Layer 2（`WORLD_FUZZ_BUDGET=1800`，macOS 非特权 + 特权两遍，Linux 一遍）、Layer 3（`WORLD_STRESS=1`、`WORLD_STRESS_SCALE=4`，macOS 额外跑特权 soak）。每个 job 失败时上传产物，macOS job 结束时无论成败都会清理残留的 `127.77.*` loopback 别名和残留的 `wt-*` 私有临时目录。
+- `test.yml`（PR + push main）：`WORLD_FUZZ_BUDGET=10`，只跑冒烟档位，目标是几分钟内给出信号；另有一步 `! grep -rn 'process::exit' crates/world-fsmodel/tests`，禁止在测试线程里直接 `process::exit`；失败时上传 `target/fuzz-artifacts` 和 `**/proptest-regressions`。
+- `fuzz.yml`（每日 03:17 UTC 定时，也支持手动触发并指定 `seed`/`budget`，`budget` 的含义是每个 fuzz 类的秒数，留空使用各 job 的默认值）：大预算跑 Layer 1（`PROPTEST_CASES=100000`、`WORLD_FSMODEL_CASES=2000`，release 构建）、Layer 2（macOS `shim-diff` 75 分钟：`ShimFuzz` 1200 秒，再单独跑 `PrivilegedExecFuzz` 900 秒；Linux 60 分钟：1800 秒一个类）、Layer 3（`WORLD_STRESS=1`、`WORLD_STRESS_SCALE=4`，macOS 额外跑特权 soak）。每个 job 失败时上传产物，macOS job 结束时无论成败都会清理残留的 `127.77.*` loopback 别名和残留的 `wt-*` 私有临时目录。
 
 ## 已知限制
 

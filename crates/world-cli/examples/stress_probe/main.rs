@@ -8,6 +8,7 @@
 //!   storm --threads T --iters N --seed S --dir /tmp/R
 //!   spawn-storm --threads T --iters N --dir /tmp/R
 //!   fork-exec-storm --threads T --iters N --dir /tmp/R
+//!   touch <path> <marker>
 //!   report <marker>
 //!
 //! Safety: every mode that touches a directory tree (storm, spawn-storm,
@@ -15,6 +16,9 @@
 //! `/tmp` (see `check_dir_allowed`), so a bug here can never reach outside
 //! whatever `/tmp`/`/private/tmp` is redirected to (the macOS shim's
 //! WORLD_TMP tree, or a Linux bind mount) -- never the real host filesystem.
+//! The lexical check is backed by `verify_redirected`, which proves (without
+//! writing anything) that `/tmp` really is the redirected tree, and fails
+//! closed otherwise.
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
@@ -84,6 +88,22 @@ impl Report {
     }
 }
 
+/// Join every worker; a panicked worker is a violation, never silently
+/// dropped (its share of the invariants was not checked).
+fn join_workers(handles: Vec<std::thread::JoinHandle<()>>, report: &Report) {
+    for (n, h) in handles.into_iter().enumerate() {
+        if let Err(payload) = h.join() {
+            let why = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "non-string panic".into());
+            report.error("worker_panic");
+            report.violation(format!("worker {n} panicked: {why}"));
+        }
+    }
+}
+
 fn cstr(p: &Path) -> CString {
     CString::new(p.as_os_str().as_bytes()).expect("path contains NUL")
 }
@@ -121,7 +141,11 @@ fn flag_u64(flags: &BTreeMap<String, String>, name: &str, default: u64) -> u64 {
 /// an unshimmed smoke run) can opt a specific prefix in via
 /// `STRESS_PROBE_EXTRA_ROOT`; a stray/unexpected invocation can never set
 /// that for itself.
-fn check_dir_allowed(dir: &Path) -> Result<(), String> {
+///
+/// `Ok(true)` means the `/tmp` prefix matched, so the caller must also pass
+/// `verify_redirected`; `Ok(false)` means the `STRESS_PROBE_EXTRA_ROOT`
+/// branch matched (a genuinely separate scratch root, no redirection).
+fn check_dir_allowed(dir: &Path) -> Result<bool, String> {
     // A `..` component could climb out of the allowed prefix textually.
     if dir
         .components()
@@ -131,18 +155,99 @@ fn check_dir_allowed(dir: &Path) -> Result<(), String> {
     }
     let s = dir.to_string_lossy();
     if s.starts_with("/tmp/") || s.starts_with("/private/tmp/") {
-        return Ok(());
+        return Ok(true);
     }
     if let Ok(extra) = std::env::var("STRESS_PROBE_EXTRA_ROOT")
         && !extra.is_empty()
         && dir.starts_with(&extra)
     {
-        return Ok(());
+        return Ok(false);
     }
     Err(format!(
         "--dir {} is not under /tmp or /private/tmp (and not under $STRESS_PROBE_EXTRA_ROOT); refusing to run",
         dir.display()
     ))
+}
+
+/// Host temp roots a "physical root" must never be, or live under: were it
+/// one of them, "/tmp is redirected to <phys>/tmp" would be tautological.
+const HOST_TEMP_ROOTS: [&str; 4] = ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"];
+
+/// Prove, without writing anything, that `/tmp` is redirected to a private
+/// tree rather than being the shared host temp dir. The physical root comes
+/// from `STRESS_PROBE_PHYSICAL_ROOT` (the Linux harness passes the workspace
+/// temp root) or else `WORLD_TMP` (the macOS shim's root); it must be set,
+/// absolute, `..`-free, and not the filesystem root, `/private`, or anything
+/// at or under a host temp root. Then `stat("/tmp")` (redirected by the shim
+/// or bind-mounted on Linux, so it names `<phys>/tmp`) must be the very same
+/// (st_dev, st_ino) as `lstat("<phys>/tmp")`, which the shim never remaps
+/// because `<phys>` is outside every temp root. Unshimmed, `/tmp` is the host
+/// temp dir and the identities differ. Every failure -- including any I/O
+/// error -- refuses (fail closed).
+fn verify_redirected() -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let fail =
+        |why: String| -> Result<(), String> { Err(format!("not running redirected: {why}")) };
+
+    let phys = std::env::var_os("STRESS_PROBE_PHYSICAL_ROOT")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("WORLD_TMP").filter(|v| !v.is_empty()));
+    let Some(phys) = phys else {
+        return fail("neither STRESS_PROBE_PHYSICAL_ROOT nor WORLD_TMP is set".into());
+    };
+    let phys = PathBuf::from(phys);
+    if !phys.is_absolute() {
+        return fail(format!("physical root {} is not absolute", phys.display()));
+    }
+    if phys
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return fail(format!("physical root {} contains `..`", phys.display()));
+    }
+    let real = match std::fs::canonicalize(&phys) {
+        Ok(r) => r,
+        Err(e) => {
+            return fail(format!(
+                "cannot resolve physical root {}: {e}",
+                phys.display()
+            ));
+        }
+    };
+    let too_broad = real == Path::new("/") || real == Path::new("/private");
+    let under_host_temp = |p: &Path| HOST_TEMP_ROOTS.iter().any(|r| p.starts_with(r));
+    if too_broad || under_host_temp(&real) || under_host_temp(&phys) {
+        return fail(format!(
+            "physical root {} (resolves to {}) is a host temp root or too broad",
+            phys.display(),
+            real.display()
+        ));
+    }
+    let redirected = match std::fs::metadata("/tmp") {
+        Ok(m) => m,
+        Err(e) => return fail(format!("stat /tmp: {e}")),
+    };
+    let private_tmp = real.join("tmp");
+    let private = match std::fs::symlink_metadata(&private_tmp) {
+        Ok(m) => m,
+        Err(e) => return fail(format!("lstat {}: {e}", private_tmp.display())),
+    };
+    if !private.is_dir() || (redirected.dev(), redirected.ino()) != (private.dev(), private.ino()) {
+        return fail(format!(
+            "/tmp is not {} (a shared host temp dir would be touched)",
+            private_tmp.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Lexical `check_dir_allowed`, plus `verify_redirected` whenever the
+/// `/tmp` prefix (not the explicit extra root) is what allowed `dir`.
+fn guard_dir(dir: &Path) -> Result<(), String> {
+    if check_dir_allowed(dir)? {
+        verify_redirected()?;
+    }
+    Ok(())
 }
 
 fn flag_dir(flags: &BTreeMap<String, String>) -> PathBuf {
@@ -151,7 +256,7 @@ fn flag_dir(flags: &BTreeMap<String, String>) -> PathBuf {
             .get("dir")
             .unwrap_or_else(|| panic!("--dir is required")),
     );
-    if let Err(msg) = check_dir_allowed(&dir) {
+    if let Err(msg) = guard_dir(&dir) {
         eprintln!("stress_probe: {msg}");
         std::process::exit(2);
     }
@@ -196,9 +301,7 @@ fn cmd_storm(flags: &BTreeMap<String, String>) {
             chdir_worker(threads, iters, &dir, &report, world_tmp.as_deref());
         }));
     }
-    for h in handles {
-        let _ = h.join();
-    }
+    join_workers(handles, &report);
 
     // Each worker's deterministic final file: the last iteration's renamed
     // file is left in place (see `storm_worker`).
@@ -393,9 +496,7 @@ fn cmd_spawn_storm(flags: &BTreeMap<String, String>) {
             handles.push(std::thread::spawn(move || churn_worker(iters, &report)));
         }
     }
-    for h in handles {
-        let _ = h.join();
-    }
+    join_workers(handles, &report);
 
     let expected: Vec<String> = (0..threads)
         .filter(|t| t % 2 == 0)
@@ -453,6 +554,9 @@ fn spawn_worker(t: usize, iters: usize, dir: &Path, exe: &Path, report: &Report)
     }
 }
 
+/// Upper bound on how long a spawned child may run before it is killed.
+const SPAWN_WAIT: Duration = Duration::from_secs(30);
+
 /// Spawn `exe report <marker>` with stdout redirected to `out` and the cwd
 /// changed to `chdir_to`, both via posix_spawn file actions; wait for it and
 /// return its exit status.
@@ -477,16 +581,7 @@ fn spawn_report(
     // `spawn_allowed` in vendor/silo-bind/src/world.rs) as a would-be
     // injection escape, not a bug -- so the child must see the same
     // environment this process does.
-    let env_entries: Vec<CString> = std::env::vars_os()
-        .map(|(k, v)| {
-            let mut entry = k.into_encoded_bytes();
-            entry.push(b'=');
-            entry.extend_from_slice(&v.into_encoded_bytes());
-            CString::new(entry).expect("environment entry contains NUL")
-        })
-        .collect();
-    let mut envp: Vec<*const libc::c_char> = env_entries.iter().map(|e| e.as_ptr()).collect();
-    envp.push(std::ptr::null());
+    let (_env_keep, envp) = build_envp();
 
     // SAFETY: `actions` is initialized before any other use and destroyed on
     // every exit path below.
@@ -527,15 +622,28 @@ fn spawn_report(
             return Err(std::io::Error::from_raw_os_error(r));
         }
         let mut status = 0;
+        let deadline = Instant::now() + SPAWN_WAIT;
         loop {
-            let w = libc::waitpid(pid, &mut status, 0);
-            if w >= 0 {
+            let w = libc::waitpid(pid, &mut status, libc::WNOHANG);
+            if w == pid {
                 break;
             }
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::Interrupted {
+            if w < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
                 return Err(err);
             }
+            if Instant::now() >= deadline {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("spawned child {pid} did not exit within {SPAWN_WAIT:?}"),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
         Ok(if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
@@ -600,10 +708,13 @@ fn churn_worker(iters: usize, report: &Report) {
 // fork-exec-storm
 
 /// `fork-exec-storm --threads T --iters N --dir /tmp/R`: in a multithreaded
-/// process, each thread repeatedly forks; the child does nothing but an
-/// interposed `open` of /tmp/R/<t>/<i> (built before the fork, so the child
-/// never allocates) then `_exit`s, while the parent waits with a bounded
-/// deadline (WNOHANG polling) so a hang shows up as pids on stdout and exit
+/// process, each thread repeatedly forks. On even iterations the child
+/// `execve`s `stress_probe touch /tmp/R/<t>/<i> <marker>` (argv/envp built
+/// before the fork so the child never allocates), which proves both that the
+/// exec path works and that interposition survives exec (the exec'd image
+/// runs its own `verify_redirected`); on odd iterations the child does an
+/// interposed in-child `open` of the same path then writes the marker and `_exit`s. The parent
+/// waits with a bounded deadline (WNOHANG polling) so a hang shows up as pids on stdout and exit
 /// 3, never an unbounded wait.
 fn cmd_fork_exec_storm(flags: &BTreeMap<String, String>) {
     let threads = flag_u64(flags, "threads", 4).max(1) as usize;
@@ -617,6 +728,7 @@ fn cmd_fork_exec_storm(flags: &BTreeMap<String, String>) {
 
     let report = Arc::new(Report::default());
     let deadline = Instant::now() + Duration::from_secs(30);
+    let exe = std::env::current_exe().expect("current_exe");
     let outstanding: Arc<Mutex<BTreeMap<usize, libc::pid_t>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
 
@@ -625,13 +737,12 @@ fn cmd_fork_exec_storm(flags: &BTreeMap<String, String>) {
         let dir = dir.clone();
         let report = Arc::clone(&report);
         let outstanding = Arc::clone(&outstanding);
+        let exe = exe.clone();
         handles.push(std::thread::spawn(move || {
-            fork_exec_worker(t, iters, &dir, &report, &outstanding, deadline);
+            fork_exec_worker(t, iters, &dir, &exe, &report, &outstanding, deadline);
         }));
     }
-    for h in handles {
-        let _ = h.join();
-    }
+    join_workers(handles, &report);
 
     let expected: Vec<String> = (0..threads)
         .flat_map(|t| (0..iters).map(move |i| (t, i)))
@@ -650,10 +761,28 @@ fn cmd_fork_exec_storm(flags: &BTreeMap<String, String>) {
     report.finish(expected);
 }
 
+/// The environment as a NUL-terminated `envp`, forwarded whole: under the
+/// macOS shim an exec whose envp drops DYLD_INSERT_LIBRARIES/WORLD_TMP is
+/// refused as an injection escape.
+fn build_envp() -> (Vec<CString>, Vec<*const libc::c_char>) {
+    let env_entries: Vec<CString> = std::env::vars_os()
+        .map(|(k, v)| {
+            let mut entry = k.into_encoded_bytes();
+            entry.push(b'=');
+            entry.extend_from_slice(&v.into_encoded_bytes());
+            CString::new(entry).expect("environment entry contains NUL")
+        })
+        .collect();
+    let mut envp: Vec<*const libc::c_char> = env_entries.iter().map(|e| e.as_ptr()).collect();
+    envp.push(std::ptr::null());
+    (env_entries, envp)
+}
+
 fn fork_exec_worker(
     t: usize,
     iters: usize,
     dir: &Path,
+    exe: &Path,
     report: &Report,
     outstanding: &Mutex<BTreeMap<usize, libc::pid_t>>,
     deadline: Instant,
@@ -662,6 +791,20 @@ fn fork_exec_worker(
     for i in 0..iters {
         let path = tdir.join(i.to_string());
         let path_c = cstr(&path);
+        let exec = i % 2 == 0;
+        let marker = format!("fe-t{t}-i{i}");
+        // Everything the exec branch needs is built before the fork.
+        let exe_c = cstr(exe);
+        let touch_c = c"touch";
+        let marker_c = CString::new(marker.as_str()).expect("marker contains NUL");
+        let argv: [*const libc::c_char; 5] = [
+            exe_c.as_ptr(),
+            touch_c.as_ptr(),
+            path_c.as_ptr(),
+            marker_c.as_ptr(),
+            std::ptr::null(),
+        ];
+        let (_env_keep, envp) = build_envp();
 
         report.op();
         // SAFETY: fork() has no preconditions of its own; only the child
@@ -678,17 +821,25 @@ fn fork_exec_worker(
             continue;
         }
         if pid == 0 {
-            // SAFETY: async-signal-safe only: a direct open/close/_exit,
-            // nothing allocated or locked since the fork above.
+            // SAFETY: async-signal-safe only: a direct execve/open/write/
+            // close/_exit, nothing allocated or locked since the fork above; argv
+            // and envp are NUL-terminated arrays of pointers into CStrings
+            // that outlive the child's use of them.
             unsafe {
+                if exec {
+                    libc::execve(exe_c.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                    libc::_exit(127);
+                }
                 let fd = libc::open(
                     path_c.as_ptr(),
                     libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
                     0o644,
                 );
                 if fd >= 0 {
+                    let bytes = marker_c.as_bytes();
+                    let n = libc::write(fd, bytes.as_ptr().cast(), bytes.len());
                     libc::close(fd);
-                    libc::_exit(0);
+                    libc::_exit(if n == bytes.len() as isize { 0 } else { 1 });
                 }
                 libc::_exit(1);
             }
@@ -725,9 +876,27 @@ fn fork_exec_worker(
 
         if libc::WIFEXITED(status) {
             let code = libc::WEXITSTATUS(status);
-            if code != 0 {
+            if code == 127 && exec {
+                report.error("exec_failed");
+                report.violation(format!("exec failed for {}", path.display()));
+            } else if code != 0 {
                 report.error("child_exit");
                 report.violation(format!("child for {} exited {code}", path.display()));
+            } else {
+                match std::fs::read_to_string(&path) {
+                    Ok(content) if content == marker => {}
+                    Ok(content) => {
+                        report.error("content_mismatch");
+                        report.violation(format!(
+                            "{}: expected {marker:?}, got {content:?}",
+                            path.display()
+                        ));
+                    }
+                    Err(e) => {
+                        report.error("read_output");
+                        report.violation(format!("read {}: {e}", path.display()));
+                    }
+                }
             }
         } else {
             report.error("child_signal");
@@ -752,14 +921,46 @@ fn cmd_report(args: &[String]) {
     let _ = std::io::stdout().flush();
 }
 
+/// `touch <path> <marker>`: child target for fork-exec-storm. Refuses (exit
+/// 2) unless the path's parent passes `guard_dir` (lexical `/tmp` check plus
+/// `verify_redirected`, so this also proves interposition survived exec),
+/// then creates/truncates `path` and writes `marker` to it.
+fn cmd_touch(args: &[String]) {
+    use std::io::Write;
+    let (Some(path), Some(marker)) = (args.get(2), args.get(3)) else {
+        eprintln!("usage: stress_probe touch <path> <marker>");
+        std::process::exit(2);
+    };
+    let path = PathBuf::from(path);
+    let Some(parent) = path.parent() else {
+        eprintln!("stress_probe: {} has no parent", path.display());
+        std::process::exit(2);
+    };
+    if let Err(msg) = guard_dir(parent) {
+        eprintln!("stress_probe: {msg}");
+        std::process::exit(2);
+    }
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(marker.as_bytes()));
+    if let Err(e) = result {
+        eprintln!("stress_probe: touch {}: {e}", path.display());
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: stress_probe <storm|spawn-storm|fork-exec-storm|report> ...");
+        eprintln!("usage: stress_probe <storm|spawn-storm|fork-exec-storm|touch|report> ...");
         std::process::exit(2);
     }
     match args[1].as_str() {
         "report" => cmd_report(&args),
+        "touch" => cmd_touch(&args),
         "storm" => cmd_storm(&parse_flags(&args[2..])),
         "spawn-storm" => cmd_spawn_storm(&parse_flags(&args[2..])),
         "fork-exec-storm" => cmd_fork_exec_storm(&parse_flags(&args[2..])),

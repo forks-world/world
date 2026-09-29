@@ -15,6 +15,7 @@ import concurrent.futures
 import json
 import os
 import pathlib
+import queue
 import random
 import shutil
 import subprocess
@@ -23,6 +24,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 
 # Importable both as `tests.test_stress` (sibling `test_runtime` not on
 # sys.path) and via `unittest discover -s tests` (this file's own directory
@@ -167,6 +169,69 @@ def owned_move(src, dst, *roots):
     assert_owned(src, *roots)
     assert_owned(dst, *roots)
     shutil.move(str(src), str(dst))
+
+
+def run_workers(workers, join_timeout, stop=None, run_for=None):
+    """Run `workers` (a list of (name, fn)) on daemon threads and join them
+    ALL against one overall deadline. Any exception (including
+    subprocess.TimeoutExpired) escaping a worker is recorded instead of
+    silently ending the thread. With `run_for` (and a `stop` Event) the
+    workers are left to loop for that long and then told to stop. Returns
+    (errors, alive): the recorded exception strings and the names of threads
+    still running after `stop` was set and the deadline passed. Callers must
+    assert both are empty, `alive` first (a stuck thread makes every later
+    invariant meaningless).
+    """
+    errors = []
+    lock = threading.Lock()
+
+    def wrap(name, fn):
+        def body():
+            try:
+                fn()
+            except BaseException as e:  # noqa: BLE001 - record, never swallow
+                with lock:
+                    errors.append(f"{name}: {type(e).__name__}: {e}")
+
+        return body
+
+    threads = [threading.Thread(target=wrap(name, fn), name=name, daemon=True) for name, fn in workers]
+    for t in threads:
+        t.start()
+    try:
+        if run_for is not None:
+            time.sleep(run_for)
+    finally:
+        # Always stop and join, even if the sleep above was interrupted: no
+        # test may leave a background thread (and the subprocesses it keeps
+        # spawning) running past its own body.
+        if run_for is not None and stop is not None:
+            stop.set()
+        end = time.monotonic() + join_timeout
+        for t in threads:
+            t.join(max(0.0, end - time.monotonic()))
+        if stop is not None:
+            stop.set()
+    return errors, [t.name for t in threads if t.is_alive()]
+
+
+def read_ready_line(proc, timeout=30):
+    """First stdout line of `proc`, bounded. A plain readline can block
+    forever (a hung or silent server, or a partial line), and select on a
+    text pipe can still block on a partial line, so the read happens on a
+    helper thread and the wait is a bounded queue get. Raises AssertionError
+    on timeout; the caller owns killing `proc` (the helper thread then sees
+    EOF and exits).
+    """
+    q = queue.Queue()
+    reader = threading.Thread(
+        target=lambda: q.put(proc.stdout.readline()), name=f"ready-reader-{proc.pid}", daemon=True
+    )
+    reader.start()
+    try:
+        return q.get(timeout=timeout)
+    except queue.Empty:
+        raise AssertionError(f"no readiness line from pid {proc.pid} within {timeout}s") from None
 
 
 def old_dir(home):
@@ -572,22 +637,17 @@ class TempRootSymlinkRace(unittest.TestCase):
                         env=env,
                     )
 
-            threads = (
-                [threading.Thread(target=attacker)]
-                + [threading.Thread(target=exec_worker) for _ in range(exec_workers)]
-                + [threading.Thread(target=create_worker)]
+            # One exec_worker iteration can take run_with_sample's 15 s
+            # timeout + 15 s sample + 10 s reap; a create_worker iteration
+            # 15 s. Join every worker against one deadline that covers that.
+            workers = (
+                [("attacker", attacker)]
+                + [(f"exec-{i}", exec_worker) for i in range(exec_workers)]
+                + [("create", create_worker)]
             )
-            for t in threads:
-                t.start()
-            try:
-                time.sleep(race_seconds)
-            finally:
-                # Always stop and join every thread, even if something above
-                # raised: no test may leave a background thread (and the
-                # subprocesses it keeps spawning) running past its own body.
-                stop.set()
-                for t in threads:
-                    t.join(timeout=30)
+            errors, alive = run_workers(workers, join_timeout=60, stop=stop, run_for=race_seconds)
+            self.assertEqual(alive, [], f"race workers still running: {alive}")
+            self.assertEqual(errors, [], errors)
 
             self.assertEqual(failures, [], failures)
 
@@ -639,8 +699,9 @@ class TempRootSymlinkRace(unittest.TestCase):
 # host /tmp/R; on CI runners dyld instead tries to load the library into
 # sandbox-exec itself). Either way the storm would not reliably run through
 # the shim, which is worse, not better. These tests rely instead on stress_probe's own `--dir`
-# allowlist (`check_dir_allowed` in stress_probe/main.rs) plus the shim's
-# WORLD_TMP redirection itself.
+# allowlist plus `verify_redirected` (see `guard_dir` in stress_probe/main.rs:
+# it refuses unless `/tmp` provably is WORLD_TMP/tmp, so a storm that is not
+# really shimmed fails closed) and the shim's WORLD_TMP redirection itself.
 
 
 @unittest.skipUnless(MACOS, "native silo shim requires macOS")
@@ -670,6 +731,19 @@ class ShimStorms(unittest.TestCase):
         for path in summary["expected_files"]:
             self.assertTrue(self.physical(path).exists(), f"missing physical file: {path}")
         self.assertFalse(os.path.lexists("/tmp/R"), "host /tmp/R must not exist")
+
+    def assert_fork_exec_summary(self, result, threads, iters):
+        """Every fork ran (ops == threads*iters) and every file holds its own
+        marker: even iterations exec'd `stress_probe touch` (so the exec'd
+        image ran its own verify_redirected under the shim), odd ones wrote
+        it from the forked child."""
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["ops"], threads * iters, summary)
+        self.assertEqual(len(summary["expected_files"]), threads * iters)
+        for t in range(threads):
+            for i in range(iters):
+                path = self.physical(f"/tmp/R/{t}/{i}")
+                self.assertEqual(path.read_text(), f"fe-t{t}-i{i}", str(path))
 
     def with_gmalloc(self, env):
         lib = "/usr/lib/libgmalloc.dylib"
@@ -729,6 +803,7 @@ class ShimStorms(unittest.TestCase):
             env=self.env(),
         )
         self.assert_probe_ok(result, "fork-exec-storm")
+        self.assert_fork_exec_summary(result, threads, iters)
         if STRESS:
             gm_env = self.with_gmalloc(self.env())
             if gm_env is not None:
@@ -739,6 +814,167 @@ class ShimStorms(unittest.TestCase):
                     env=gm_env,
                 )
                 self.assert_probe_ok(result, "fork-exec-storm-gmalloc")
+                self.assert_fork_exec_summary(result, 2, 3)
+
+
+# ---------------------------------------------------------------------------
+# 5a. stress_probe refuses to run unredirected (fail-closed)
+
+
+@unittest.skipUnless(MACOS or LINUX, "stress_probe runs on macOS and Linux")
+class StressProbeRefusesUnredirected(unittest.TestCase):
+    """Run natively (no shim, no namespace), so `/tmp` is the shared host
+    temp dir and `verify_redirected` must refuse before creating anything.
+    The positive case is every ShimStorms test (macOS) and the Linux
+    harness."""
+
+    def setUp(self):
+        self.target = f"/tmp/sp-{uuid.uuid4().hex}"
+        self.addCleanup(self.cleanup_target)
+        self.scratch = short_dir(".wt-sp-refuse-")
+        self.addCleanup(self.scratch.cleanup)
+        # A real, owned physical-root-shaped dir with a `tmp` inside: the
+        # only thing wrong with it is that nothing redirects /tmp to it.
+        self.owned = pathlib.Path(self.scratch.name) / "w"
+        (self.owned / "tmp").mkdir(parents=True)
+
+    def cleanup_target(self):
+        # Remove ONLY the exact unique path this test chose; anything else
+        # (including a different /tmp/sp-* entry) is never touched.
+        if os.path.lexists(self.target):
+            assert self.target.startswith("/tmp/sp-") and "/" not in self.target[len("/tmp/") :]
+            assert_owned(self.target, "/tmp")
+            if os.path.isdir(self.target) and not os.path.islink(self.target):
+                shutil.rmtree(self.target, ignore_errors=True)
+            else:
+                os.remove(self.target)
+
+    def clean_env(self, **extra):
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("WORLD_TMP", "STRESS_PROBE_PHYSICAL_ROOT", "STRESS_PROBE_EXTRA_ROOT", "DYLD_INSERT_LIBRARIES")
+        }
+        env.update(extra)
+        return env
+
+    def assert_refused(self, args, env, label):
+        result = run_timeout([STRESS_PROBE, *args], timeout=30, env=env)
+        try:
+            self.assertEqual(result.returncode, 2, f"{label}: {result.stdout} {result.stderr}")
+            self.assertIn("not running redirected", result.stderr, label)
+            self.assertFalse(os.path.lexists(self.target), f"{label}: created {self.target}")
+        finally:
+            # Fail closed even for the assertion above: never leave a
+            # created path behind for the next case to trip over.
+            self.cleanup_target()
+
+    def test_refuses_without_redirection(self):
+        modes = {
+            "storm": ["storm", "--threads", "1", "--iters", "1", "--dir", self.target],
+            "spawn-storm": ["spawn-storm", "--threads", "2", "--iters", "1", "--dir", self.target],
+            "fork-exec-storm": ["fork-exec-storm", "--threads", "1", "--iters", "1", "--dir", self.target],
+            "touch": ["touch", f"{self.target}/x", "marker"],
+        }
+        cases = {
+            "no env": self.clean_env(),
+            "WORLD_TMP set, no injection": self.clean_env(WORLD_TMP=str(self.owned)),
+            "PHYSICAL_ROOT set, no injection": self.clean_env(STRESS_PROBE_PHYSICAL_ROOT=str(self.owned)),
+            "WORLD_TMP=/private": self.clean_env(WORLD_TMP="/private"),
+            "WORLD_TMP=/": self.clean_env(WORLD_TMP="/"),
+            "WORLD_TMP=/private/tmp": self.clean_env(WORLD_TMP="/private/tmp"),
+            "WORLD_TMP=/tmp": self.clean_env(WORLD_TMP="/tmp"),
+            "WORLD_TMP relative": self.clean_env(WORLD_TMP="w"),
+            "WORLD_TMP with ..": self.clean_env(WORLD_TMP=f"{self.owned}/../w"),
+            "WORLD_TMP nonexistent": self.clean_env(WORLD_TMP=f"{self.owned}/missing"),
+        }
+        for mode, args in modes.items():
+            for case, env in cases.items():
+                with self.subTest(mode=mode, case=case):
+                    self.assert_refused(args, env, f"{mode}/{case}")
+
+    def test_dotdot_dir_is_still_rejected(self):
+        result = run_timeout(
+            [STRESS_PROBE, "storm", "--dir", f"{self.target}/../x"], timeout=30, env=self.clean_env()
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("..", result.stderr)
+        self.assertFalse(os.path.lexists(self.target))
+
+
+# ---------------------------------------------------------------------------
+# 5a'. unit tests for this file's own bounded-concurrency helpers (no
+# privileges, no world binary).
+
+
+class WorkerHelpers(unittest.TestCase):
+    def test_run_workers_records_exceptions(self):
+        def timing_out():
+            raise subprocess.TimeoutExpired(["x"], 15)
+
+        def boom():
+            raise KeyError("k")
+
+        errors, alive = run_workers([("a", timing_out), ("b", boom), ("c", lambda: None)], join_timeout=10)
+        self.assertEqual(alive, [])
+        self.assertEqual(len(errors), 2, errors)
+        self.assertTrue(any(e.startswith("a: TimeoutExpired") for e in errors), errors)
+        self.assertTrue(any(e.startswith("b: KeyError") for e in errors), errors)
+
+    def test_run_workers_reports_workers_that_outlive_their_budget(self):
+        release = threading.Event()
+        stop = threading.Event()
+        # A worker that ignores `stop` and sleeps past the budget.
+        errors, alive = run_workers([("slow", lambda: release.wait(30))], join_timeout=0.3, stop=stop)
+        try:
+            self.assertEqual(alive, ["slow"])
+            self.assertEqual(errors, [])
+            self.assertTrue(stop.is_set())
+        finally:
+            release.set()
+            for t in threading.enumerate():
+                if t.name == "slow":
+                    t.join(5)
+        self.assertEqual([t.name for t in threading.enumerate() if t.name == "slow"], [])
+
+    def test_run_workers_run_for_sets_stop_and_joins(self):
+        stop = threading.Event()
+        errors, alive = run_workers(
+            [("loop", lambda: stop.wait(30))], join_timeout=10, stop=stop, run_for=0.2
+        )
+        self.assertEqual((errors, alive), ([], []))
+
+    def test_read_ready_line_is_bounded_and_leaves_nothing_behind(self):
+        proc = subprocess.Popen(
+            ["sleep", "60"], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True
+        )
+        start = time.monotonic()
+        try:
+            with self.assertRaises(AssertionError):
+                read_ready_line(proc, timeout=1)
+            self.assertLess(time.monotonic() - start, 30)
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+            proc.stdout.close()
+        for t in threading.enumerate():
+            if t.name == f"ready-reader-{proc.pid}":
+                t.join(10)
+        self.assertEqual(
+            [t.name for t in threading.enumerate() if t.name == f"ready-reader-{proc.pid}"], []
+        )
+        self.assertIsNotNone(proc.poll())
+
+    def test_read_ready_line_returns_a_line(self):
+        proc = subprocess.Popen(
+            ["echo", "READY 1"], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True
+        )
+        try:
+            self.assertEqual(read_ready_line(proc, timeout=10), "READY 1\n")
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+            proc.stdout.close()
 
 
 # ---------------------------------------------------------------------------
@@ -823,36 +1059,52 @@ class LinuxHolderRace(unittest.TestCase):
             hangs = []
             lock = threading.Lock()
 
+            loop_seconds = n(3, 10)
+
             def loop(id_):
-                deadline = time.time() + n(3, 10)
-                while time.time() < deadline and not stop.is_set():
+                deadline = time.time() + loop_seconds
+
+                def live():
+                    # Checked before EVERY action, not just the top of the
+                    # loop: one pass is three commands of up to 30 s each.
+                    return not stop.is_set() and time.time() < deadline
+
+                while live():
                     for action in (["setup", id_], ["teardown", id_]):
+                        if not live():
+                            return
                         try:
                             run_timeout(
                                 [WORLD, "workspace", "--state-dir", state, *action],
                                 timeout=30,
                                 env=env,
                             )
-                        except subprocess.TimeoutExpired as e:
+                        except Exception as e:  # noqa: BLE001 - any failure is recorded
                             with lock:
-                                hangs.append((id_, action, str(e)))
+                                hangs.append((id_, action, f"{type(e).__name__}: {e}"))
+                    if not live():
+                        return
                     try:
                         run_timeout(
                             [WORLD, "exec", id_, "--state-dir", state, "--timeout", "5s", "--", "/bin/true"],
                             timeout=30,
                             env=env,
                         )
-                    except subprocess.TimeoutExpired as e:
+                    except Exception as e:  # noqa: BLE001
                         with lock:
-                            hangs.append((id_, "exec", str(e)))
+                            hangs.append((id_, "exec", f"{type(e).__name__}: {e}"))
 
-            threads = [threading.Thread(target=loop, args=(id_,)) for id_ in ids]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=n(3, 10) + 60)
-            stop.set()
-
+            # One overall deadline for every worker: the loop budget, plus
+            # the three 30 s commands of a final in-flight pass, plus slack.
+            errors, alive = run_workers(
+                [(f"holder-{id_}", lambda id_=id_: loop(id_)) for id_ in ids],
+                join_timeout=loop_seconds + 3 * 30 + 30,
+                stop=stop,
+            )
+            # Stuck workers first: recovery checks below are meaningless
+            # while a worker still races them.
+            self.assertEqual(alive, [], f"holder-race workers still running: {alive}")
+            self.assertEqual(errors, [], errors)
             self.assertEqual(hangs, [], hangs)
 
             # A clean setup+exec+teardown must work for every workspace
@@ -946,35 +1198,50 @@ class NetworkSoak(unittest.TestCase):
         duration = 60 * SCALE
         names = list(self.worlds)
         stop_at = time.time() + duration
+        stop = threading.Event()
         errors = []
         lock = threading.Lock()
         servers = {}
+        logs = []
 
         def stop_servers():
             for proc, _ in servers.values():
                 proc.terminate()
                 try:
-                    proc.communicate(timeout=5)
+                    proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                    proc.communicate(timeout=5)
+                    proc.wait(timeout=5)
+            for log in logs:
+                log.close()
 
         try:
             for name in names:
+                # stderr goes to a file, never an undrained PIPE: a chatty
+                # server would otherwise fill the pipe and hang.
+                log = open(self.root / f"server-{name}.log", "wb")
+                logs.append(log)
                 proc = subprocess.Popen(
                     [str(x) for x in self.command(name, "serve", "127.0.0.1:0", name)],
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=log,
+                    stdin=subprocess.DEVNULL,
                     text=True,
                     env=self.env,
                 )
-                line = proc.stdout.readline()
+                # Registered before the readiness read so a hang or failure
+                # there still gets this process killed by stop_servers.
+                servers[name] = (proc, None)
+                line = read_ready_line(proc, timeout=30)
                 self.assertTrue(line.startswith("READY"), (name, line))
                 servers[name] = (proc, int(line.split()[1]))
 
             def client_loop(name):
-                while time.time() < stop_at:
+                while time.time() < stop_at and not stop.is_set():
                     for other, (_, port) in servers.items():
+                        # Checked before each call: one pass is up to 8 x 15 s.
+                        if time.time() >= stop_at or stop.is_set():
+                            return
                         result = run_timeout(
                             self.command(name, "get", f"127.0.0.1:{port}"), timeout=15, env=self.env
                         )
@@ -986,16 +1253,20 @@ class NetworkSoak(unittest.TestCase):
                                     f"{name}->{other}: rc={result.returncode} out={result.stdout!r}"
                                 )
 
-            threads = [threading.Thread(target=client_loop, args=(name,)) for name in names]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=duration + 60)
+            # A timed-out client call is recorded by run_workers (it would
+            # otherwise silently end that worker and shrink the soak).
+            worker_errors, alive = run_workers(
+                [(f"soak-{name}", lambda name=name: client_loop(name)) for name in names],
+                join_timeout=duration + 8 * 15 + 30,
+                stop=stop,
+            )
         finally:
             # No test may leave a background process running, whether it
             # passed, failed, or raised.
             stop_servers()
 
+        self.assertEqual(alive, [], f"soak clients still running: {alive}")
+        self.assertEqual(worker_errors, [], worker_errors[:20])
         self.assertEqual(errors, [], errors[:20])
 
 
