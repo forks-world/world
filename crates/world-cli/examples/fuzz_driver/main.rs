@@ -387,6 +387,45 @@ struct RunOutcome {
     model_tree_json: String,
     /// Same, for the `/var/tmp/<run-id>` sandbox root.
     model_var_tree_json: String,
+    /// Report-only: `lstat` of each absolute path operand of the diverging op
+    /// (and, for a symlink, its `readlink` and its target's `lstat`), taken
+    /// right after the divergence. Never fed back into the run.
+    operand_snapshot: serde_json::Value,
+}
+
+/// Report-only `lstat` snapshot of the absolute paths named by `op_line`.
+fn operand_snapshot(op_line: &str) -> serde_json::Value {
+    use std::os::unix::fs::MetadataExt;
+    let describe = |p: &std::path::Path| match std::fs::symlink_metadata(p) {
+        Ok(m) => {
+            let ft = m.file_type();
+            let kind = if ft.is_symlink() {
+                "symlink"
+            } else if ft.is_dir() {
+                "dir"
+            } else if ft.is_file() {
+                "file"
+            } else {
+                "other"
+            };
+            serde_json::json!({ "kind": kind, "ino": m.ino(), "size": m.len() })
+        }
+        Err(e) => serde_json::json!({ "error": e.raw_os_error() }),
+    };
+    let mut out = serde_json::Map::new();
+    for tok in op_line.split_whitespace().filter(|t| t.starts_with('/')) {
+        let bare = tok.trim_end_matches('/');
+        let bare = if bare.is_empty() { "/" } else { bare };
+        let path = std::path::Path::new(bare);
+        let mut entry = describe(path);
+        if let Ok(target) = std::fs::read_link(path) {
+            let resolved = path.parent().unwrap_or(path).join(&target);
+            entry["link"] = serde_json::json!(target.to_string_lossy());
+            entry["target"] = describe(&resolved);
+        }
+        out.insert(tok.to_string(), entry);
+    }
+    serde_json::Value::Object(out)
 }
 
 /// Execute `steps` against a fresh model and the real filesystem, in
@@ -582,6 +621,10 @@ fn execute(
         }
     }
 
+    let operand_snapshot = first_divergence
+        .as_ref()
+        .map(|d| operand_snapshot(&d.op_line))
+        .unwrap_or(serde_json::Value::Null);
     let tree_mismatch = if first_divergence.is_none() {
         check_final_tree(&model, run_id)
     } else {
@@ -610,6 +653,7 @@ fn execute(
         tree_mismatch,
         model_tree_json,
         model_var_tree_json,
+        operand_snapshot,
     }
 }
 
@@ -858,6 +902,7 @@ fn finish(seed: u64, ops: usize, run_id: &str, outcome: RunOutcome) -> i32 {
         "result": result,
         "first_divergence": first_divergence_json,
         "known_divergences": known,
+        "operand_snapshot": outcome.operand_snapshot,
         "model_tree": model_tree,
         "model_var_tree": model_var_tree,
     });

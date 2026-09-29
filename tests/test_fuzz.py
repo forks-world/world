@@ -15,6 +15,7 @@ Knobs: WORLD_FUZZ_BUDGET (seconds, default 10), WORLD_FUZZ_SEED, WORLD_FUZZ_OPS
 import json
 import os
 import pathlib
+import platform
 import random
 import shutil
 import stat
@@ -393,6 +394,43 @@ class GuardProbes(unittest.TestCase):
                     self.assertEqual(snapshot(), before)
                     self.assertFalse(os.path.lexists(gone))
 
+    def test_trailing_slash_use_of_a_symlink_to_an_outside_file_is_refused(self):
+        """A link to a *file* outside the sandbox: whether `link/` is
+        followed varies by OS, so unlink/rmdir/rename with it are refused
+        before the syscall and the victim file survives."""
+        with tempfile.TemporaryDirectory() as scratch:
+            victim = pathlib.Path(scratch) / "victim"
+            victim.write_text("precious")
+            v = escape_op_path(victim)
+
+            def snapshot():
+                return sorted(os.listdir(scratch)), victim.read_text(), victim.stat().st_mtime_ns
+
+            before = snapshot()
+            cases = {
+                "unlink": lambda rid: [f"unlink /tmp/{rid}/lf/"],
+                "rmdir": lambda rid: [f"rmdir /tmp/{rid}/lf/"],
+                "rename-source": lambda rid: [f"rename /tmp/{rid}/lf/ /tmp/{rid}/y"],
+            }
+            for name, make in cases.items():
+                with self.subTest(case=name):
+                    rid = fresh_run_id()
+                    text = (
+                        f"# profile mac\n# seed 1\n# run-id {rid}\n# allow-escaping-links 0\n"
+                        f"mkdir /tmp/{rid} 755\nmkdir /var/tmp/{rid} 755\nchdir /tmp/{rid}\n"
+                        f"symlink {v} /tmp/{rid}/lf\n" + "".join(line + "\n" for line in make(rid))
+                    )
+                    ops = pathlib.Path(scratch) / f"{name}.ops"
+                    ops.write_text(text)
+                    try:
+                        r = run_timeout([FUZZ_DRIVER, "replay", ops, "--run-id", rid], 20)
+                    finally:
+                        self.remove_roots(rid)
+                        ops.unlink()
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertIn("outside the sandbox", r.stderr)
+                    self.assertEqual(snapshot(), before)
+
     def test_op_with_parent_outside_the_sandbox_is_refused_before_any_syscall(self):
         rid = fresh_run_id()
         victim = f"should-never-exist-{rid}"
@@ -518,6 +556,13 @@ class ShimFuzz(HostTempGuard, unittest.TestCase):
             self.skipTest("no corpus files")
         for ops_file in files:
             with self.subTest(file=ops_file.name):
+                if ops_file.name == "seed-trailing-slash-symlinks.ops" and sys.platform == "darwin":
+                    # Whether the kernel follows `link/` differs by macOS
+                    # version (`unlink lf/` removed the link on 15, ENOTDIR
+                    # on 27); only 27 has been measured.
+                    major = int((platform.mac_ver()[0] or "0").split(".")[0] or 0)
+                    if major < 27:
+                        self.skipTest(f"trailing-slash symlink semantics unmeasured on macOS {major}")
                 run_id = fresh_run_id()
                 try:
                     result = run_timeout([FUZZ_DRIVER, "replay", ops_file, "--run-id", run_id, "--keep"], RUN_TIMEOUT, env=self.env)

@@ -329,34 +329,32 @@ fn guarded_parent_at(
     Ok((parent_fd, name, trailing))
 }
 
-/// Safety check for a trailing-slash final component. macOS follows a
-/// symlink given as `link/` for rename and rmdir (measured: `rename ld/ y`
-/// renamed the link's target directory) and creates at a dangling link's
-/// target for mkdir and rename-onto, so the real syscall could act outside
-/// the sandbox. When `trailing` is set and `name` in `parent` is a symlink,
-/// the link is opened as `name/` (`O_DIRECTORY`) and its target must itself
-/// be a sandbox node whose own parent passes `parent_allowed`; otherwise the
-/// call is refused with a harness error before any syscall. If the target is
-/// not an openable directory: ENOTDIR (a file), ELOOP and ENAMETOOLONG are
-/// harmless for every call;
-/// ENOENT (dangling) is harmless unless the call `creates` (mkdir, rename
-/// destination), in which case the place it would create (at the end of the
-/// link chain) must be inside the sandbox too; anything else is refused.
-fn check_trailing(
-    state: &RealState,
-    parent: RawFd,
-    name: &[u8],
-    trailing: bool,
-    creates: bool,
-) -> ExecResult<()> {
+/// Safety check for a trailing-slash final component. Whether a kernel
+/// follows a symlink given as `link/` differs by OS and version (macOS 15 and
+/// 27 measured differently for `unlink lf/`; macOS follows it for rename and
+/// rmdir and creates at a dangling link's target for mkdir and rename-onto),
+/// and a target that is a plain file can still be reached. So the guard does
+/// not depend on any of that: when `trailing` is set and `name` in `parent`
+/// is a symlink, whatever the operation and whatever the target's type, the
+/// whole link chain is walked (bounded by MAXSYMLINKS) with `readlinkat`,
+/// requiring every hop's parent (`guarded_parent_at`) and the final target to
+/// be inside the sandbox; otherwise the call is refused with a harness error
+/// before any syscall. A link ending in `.`, `..` or naming `/` has no
+/// bare final name: it is opened `O_DIRECTORY` and its resolved path must be
+/// a sandbox node with an allowed parent. An hop that fails with
+/// ENOENT/ENOTDIR/ELOOP/ENAMETOOLONG stays `Ok`: the kernel fails there too.
+fn check_trailing(state: &RealState, parent: RawFd, name: &[u8], trailing: bool) -> ExecResult<()> {
     if !trailing {
         return Ok(());
     }
-    let (run_id, phys) = (state.run_id.as_str(), state.physical_root.as_deref());
-    let c = cstr(name).map_err(ExecError::Errno)?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let r = unsafe { libc::fstatat(parent, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
-    if r != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFLNK {
+    let run_id = state.run_id.as_str();
+    let is_link = |dirfd: RawFd, n: &[u8]| -> ExecResult<bool> {
+        let c = cstr(n).map_err(ExecError::Errno)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::fstatat(dirfd, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+        Ok(r == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK)
+    };
+    if !is_link(parent, name)? {
         return Ok(());
     }
     let refuse = |why: String| {
@@ -365,67 +363,72 @@ fn check_trailing(
             String::from_utf8_lossy(name)
         )))
     };
-    let slashed = cstr(&literal(name, true)).map_err(ExecError::Errno)?;
-    let fd = unsafe {
-        libc::openat(
-            parent,
-            slashed.as_ptr(),
-            libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        let e = io_errno();
-        if matches!(e, libc::ENOTDIR | libc::ELOOP | libc::ENAMETOOLONG)
-            || (e == libc::ENOENT && !creates)
-        {
+    let mut hold: Option<OwnedFd> = None;
+    let mut hop_parent = parent;
+    let mut hop_name = name.to_vec();
+    for _ in 0..=state.max_symlinks {
+        if !is_link(hop_parent, &hop_name)? {
+            // The end of the chain: the parent was already checked.
             return Ok(());
         }
-        if e != libc::ENOENT {
-            return refuse(format!("cannot open its target as a directory (errno {e})"));
+        let hc = cstr(&hop_name).map_err(ExecError::Errno)?;
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        let n = unsafe {
+            libc::readlinkat(hop_parent, hc.as_ptr(), buf.as_mut_ptr().cast(), buf.len())
+        };
+        if n <= 0 {
+            return refuse("cannot read a link in the chain".to_string());
         }
-        // Dangling, and the call would create at the end of the chain: walk
-        // it (bounded by MAXSYMLINKS), requiring every hop's parent to be
-        // inside the sandbox.
-        let mut hold: Option<OwnedFd> = None;
-        let mut hop_parent = parent;
-        let mut hop_name = name.to_vec();
-        for _ in 0..=state.max_symlinks {
-            let hc = cstr(&hop_name).map_err(ExecError::Errno)?;
-            let mut hst: libc::stat = unsafe { std::mem::zeroed() };
-            let r = unsafe {
-                libc::fstatat(hop_parent, hc.as_ptr(), &mut hst, libc::AT_SYMLINK_NOFOLLOW)
-            };
-            if r != 0 || (hst.st_mode & libc::S_IFMT) != libc::S_IFLNK {
-                // The end of the chain: what gets created lands here, under
-                // a parent already checked.
-                return Ok(());
-            }
-            let mut buf = vec![0u8; libc::PATH_MAX as usize];
-            let n = unsafe {
-                libc::readlinkat(hop_parent, hc.as_ptr(), buf.as_mut_ptr().cast(), buf.len())
-            };
-            if n <= 0 {
-                return refuse("cannot read a link in the chain".to_string());
-            }
-            buf.truncate(n as usize);
-            let base = if buf[0] == b'/' {
-                state.root_fd.as_raw_fd()
-            } else {
-                hop_parent
-            };
-            match guarded_parent_at(state, base, &buf) {
-                Ok((pfd, n, _)) => {
-                    hop_parent = pfd.as_raw_fd();
-                    hop_name = n;
-                    hold = Some(pfd);
-                }
-                // The kernel would fail resolving it as well.
-                Err(ExecError::Errno(_)) => return Ok(()),
-                Err(e) => return Err(e),
-            }
+        buf.truncate(n as usize);
+        let base = if buf[0] == b'/' {
+            state.root_fd.as_raw_fd()
+        } else {
+            hop_parent
+        };
+        let dotted = match split_parent_name(&buf) {
+            Err(libc::EINVAL) => true,
+            Ok((_, n, _)) => n == b"." || n == b"..",
+            Err(_) => false,
+        };
+        if dotted {
+            return check_dir_target(state, base, &buf, &refuse);
         }
-        drop(hold);
-        return refuse("too many links".to_string());
+        match guarded_parent_at(state, base, &buf) {
+            Ok((pfd, n, _)) => {
+                hop_parent = pfd.as_raw_fd();
+                hop_name = n;
+                hold = Some(pfd);
+            }
+            // The kernel would fail resolving it as well.
+            Err(ExecError::Errno(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+    drop(hold);
+    refuse("too many links".to_string())
+}
+
+/// End of a link chain that names a directory without a bare final name
+/// (`.`, `..`, `/`): open it and require the resolved directory to be a
+/// sandbox node whose own parent passes `parent_allowed`.
+fn check_dir_target(
+    state: &RealState,
+    base: RawFd,
+    path: &[u8],
+    refuse: &dyn Fn(String) -> ExecResult<()>,
+) -> ExecResult<()> {
+    let (run_id, phys) = (state.run_id.as_str(), state.physical_root.as_deref());
+    let c = cstr(path).map_err(ExecError::Errno)?;
+    let fd = unsafe { libc::openat(base, c.as_ptr(), libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        let e = io_errno();
+        if matches!(
+            e,
+            libc::ENOENT | libc::ENOTDIR | libc::ELOOP | libc::ENAMETOOLONG
+        ) {
+            return Ok(());
+        }
+        return refuse(format!("cannot open its target as a directory (errno {e})"));
     }
     let target = unsafe { OwnedFd::from_raw_fd(fd) };
     let real = match dirfd_realpath(target.as_raw_fd()) {
@@ -753,7 +756,7 @@ pub fn apply_real(state: &mut RealState, op: &Op) -> ExecResult<Applied> {
 
 fn mkdir_like(state: &mut RealState, start: Start, path: &[u8], mode: u32) -> ExecResult<Applied> {
     let (parent, name, trailing) = guarded_parent(state, start, path)?;
-    check_trailing(state, parent.as_raw_fd(), &name, trailing, true)?;
+    check_trailing(state, parent.as_raw_fd(), &name, trailing)?;
     let c = cstr(&literal(&name, trailing)).map_err(ExecError::Errno)?;
     let r = unsafe { libc::mkdirat(parent.as_raw_fd(), c.as_ptr(), mode as libc::mode_t) };
     Ok(plain(if r == 0 { ok(0) } else { err(io_errno()) }))
@@ -1009,7 +1012,7 @@ fn close_fd(state: &mut RealState, fd: u32) -> Outcome {
 
 fn symlink_like(state: &mut RealState, target: &[u8], path: &[u8]) -> ExecResult<Outcome> {
     let (parent, name, trailing) = guarded_parent(state, Start::Cwd, path)?;
-    check_trailing(state, parent.as_raw_fd(), &name, trailing, false)?;
+    check_trailing(state, parent.as_raw_fd(), &name, trailing)?;
     // `target` is stored verbatim, never resolved/guarded by this harness
     // (a dangling or "weird" target is exactly the point of testing
     // symlinks): the shim's own lexical rewriting of it is under test.
@@ -1034,14 +1037,8 @@ fn readlink_like(state: &RealState, path: &[u8]) -> ExecResult<Outcome> {
 fn rename_like(state: &mut RealState, from: &[u8], to: &[u8]) -> ExecResult<Outcome> {
     let (from_parent, from_name, from_trailing) = guarded_parent(state, Start::Cwd, from)?;
     let (to_parent, to_name, to_trailing) = guarded_parent(state, Start::Cwd, to)?;
-    check_trailing(
-        state,
-        from_parent.as_raw_fd(),
-        &from_name,
-        from_trailing,
-        false,
-    )?;
-    check_trailing(state, to_parent.as_raw_fd(), &to_name, to_trailing, true)?;
+    check_trailing(state, from_parent.as_raw_fd(), &from_name, from_trailing)?;
+    check_trailing(state, to_parent.as_raw_fd(), &to_name, to_trailing)?;
     let fname = cstr(&literal(&from_name, from_trailing)).map_err(ExecError::Errno)?;
     let tname = cstr(&literal(&to_name, to_trailing)).map_err(ExecError::Errno)?;
     let r = unsafe {
@@ -1062,7 +1059,7 @@ fn unlink_like(
     is_rmdir: bool,
 ) -> ExecResult<Outcome> {
     let (parent, name, trailing) = guarded_parent(state, start, path)?;
-    check_trailing(state, parent.as_raw_fd(), &name, trailing, false)?;
+    check_trailing(state, parent.as_raw_fd(), &name, trailing)?;
     let c = cstr(&literal(&name, trailing)).map_err(ExecError::Errno)?;
     let flag = if is_rmdir { libc::AT_REMOVEDIR } else { 0 };
     let r = unsafe { libc::unlinkat(parent.as_raw_fd(), c.as_ptr(), flag) };
@@ -1125,7 +1122,7 @@ fn unix_sockaddr(path: &[u8]) -> Option<(libc::sockaddr_un, libc::socklen_t)> {
 /// (`bind`/`connect` have no `*at` form); the parent's own cwd is untouched.
 fn bind_like(state: &mut RealState, path: &[u8]) -> ExecResult<Outcome> {
     let (parent, name, trailing) = guarded_parent(state, Start::Cwd, path)?;
-    check_trailing(state, parent.as_raw_fd(), &name, trailing, false)?;
+    check_trailing(state, parent.as_raw_fd(), &name, trailing)?;
     let Some((addr, len)) = unix_sockaddr(&literal(&name, trailing)) else {
         return Ok(err(libc::ENAMETOOLONG));
     };
@@ -1869,15 +1866,13 @@ mod trailing_slash_guard_tests {
         assert!(refused(bind_like(&mut f.state, &out)));
         victim_untouched(&f);
         // A dangling link into the victim: mkdir and rename-onto would
-        // create there, so both are refused; an unlink just fails.
+        // create there, so both are refused; so is an unlink (the guard does
+        // not depend on the OS-specific errno).
         std::os::unix::fs::symlink(f.victim.join("newdir"), f.sandbox.join("dang")).unwrap();
         let dang = abs(&f, "dang/");
         assert!(refused(mkdir_like(&mut f.state, Start::Cwd, &dang, 0o755)));
         assert!(refused(rename_like(&mut f.state, &d, &dang)));
-        assert!(matches!(
-            unlink_like(&mut f.state, Start::Cwd, &dang, false),
-            Ok(o) if o.errno == libc::ENOENT
-        ));
+        assert!(refused(unlink_like(&mut f.state, Start::Cwd, &dang, false)));
         assert!(!f.victim.join("newdir").exists());
         victim_untouched(&f);
         // Without the slash the link itself is the operand: fine, and the
@@ -1889,13 +1884,34 @@ mod trailing_slash_guard_tests {
     }
 
     #[test]
+    fn trailing_slash_use_of_a_symlink_to_an_outside_file_is_refused() {
+        let mut f = fixture();
+        std::os::unix::fs::symlink(f.victim.join("keep"), f.sandbox.join("outf")).unwrap();
+        let outf = abs(&f, "outf/");
+        let y = abs(&f, "y");
+        assert!(refused(unlink_like(&mut f.state, Start::Cwd, &outf, false)));
+        assert!(refused(unlink_like(&mut f.state, Start::Cwd, &outf, true)));
+        assert!(refused(rename_like(&mut f.state, &outf, &y)));
+        victim_untouched(&f);
+        // A link to `..` of the sandbox root's parent ends in `..`.
+        std::os::unix::fs::symlink("../..", f.sandbox.join("up")).unwrap();
+        let up = abs(&f, "up/");
+        assert!(refused(rmdir_or_unlink(&mut f.state, &up)));
+        victim_untouched(&f);
+    }
+
+    fn rmdir_or_unlink(state: &mut RealState, p: &[u8]) -> ExecResult<()> {
+        unlink_like(state, Start::Cwd, p, true).map(|_| ())
+    }
+
+    #[test]
     fn trailing_slash_use_of_an_inside_symlink_is_allowed() {
         let f = fixture();
-        let ok = check_trailing(&f.state, f.state.cwd_fd.as_raw_fd(), b"in", true, true);
+        let ok = check_trailing(&f.state, f.state.cwd_fd.as_raw_fd(), b"in", true);
         assert!(ok.is_ok());
         // A non-symlink and a missing name are never refused here.
         for name in [&b"d"[..], b"missing"] {
-            let r = check_trailing(&f.state, f.state.cwd_fd.as_raw_fd(), name, true, true);
+            let r = check_trailing(&f.state, f.state.cwd_fd.as_raw_fd(), name, true);
             assert!(r.is_ok());
         }
     }

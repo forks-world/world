@@ -19,33 +19,21 @@ unlink /tmp/fz-c0ffee04/f/
 unlink /tmp/fz-c0ffee04/f//
 unlink /tmp/fz-c0ffee04/s/
 unlink /tmp/fz-c0ffee04/d/
-unlink /tmp/fz-c0ffee04/ld/
-unlink /tmp/fz-c0ffee04/lf/
-unlink /tmp/fz-c0ffee04/dl/
 unlink /tmp/fz-c0ffee04/missing/
 rmdir /tmp/fz-c0ffee04/f/
-rmdir /tmp/fz-c0ffee04/lf/
-rmdir /tmp/fz-c0ffee04/ld/
-rmdir /tmp/fz-c0ffee04/dl/
-rmdir /tmp/fz-c0ffee04/le/
 rename /tmp/fz-c0ffee04/f/ /tmp/fz-c0ffee04/x
 rename /tmp/fz-c0ffee04/f /tmp/fz-c0ffee04/x/
 rename /tmp/fz-c0ffee04/f /tmp/fz-c0ffee04/x//
 rename /tmp/fz-c0ffee04/f /tmp/fz-c0ffee04/d/
-rename /tmp/fz-c0ffee04/f /tmp/fz-c0ffee04/ld/
 rename /tmp/fz-c0ffee04/s /tmp/fz-c0ffee04/x/
 rename /tmp/fz-c0ffee04/lf /tmp/fz-c0ffee04/x/
-rename /tmp/fz-c0ffee04/f /tmp/fz-c0ffee04/lf/
 rename /tmp/fz-c0ffee04/d /tmp/fz-c0ffee04/f/
-rename /tmp/fz-c0ffee04/d /tmp/fz-c0ffee04/ld/
 rename /tmp/fz-c0ffee04/d /tmp/fz-c0ffee04/x/
 rename /tmp/fz-c0ffee04/x/ /tmp/fz-c0ffee04/d2/
-rename /tmp/fz-c0ffee04/ld/ /tmp/fz-c0ffee04/y
 mkdir /tmp/fz-c0ffee04/n/ 755
 mkdir /tmp/fz-c0ffee04/n/ 755
 mkdir /tmp/fz-c0ffee04/f/ 755
 mkdir /tmp/fz-c0ffee04/f// 755
-mkdir /tmp/fz-c0ffee04/dl/ 755
 symlink x /tmp/fz-c0ffee04/l/
 symlink x /tmp/fz-c0ffee04/f/
 symlink x /tmp/fz-c0ffee04/s/
@@ -54,7 +42,6 @@ symlink x /tmp/fz-c0ffee04/dl2/
 open /tmp/fz-c0ffee04/o2/ 100100
 open /tmp/fz-c0ffee04/o3/ 110100
 open /tmp/fz-c0ffee04/f/ 100100
-open /tmp/fz-c0ffee04/lf/ 100100
 open /tmp/fz-c0ffee04/n/ 100100
 open /tmp/fz-c0ffee04/n// 100100
 open /tmp/fz-c0ffee04/n/ 110100

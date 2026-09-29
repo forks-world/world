@@ -300,7 +300,18 @@ impl Generator {
     /// rmdir, which the driver would (correctly) refuse and abort the run.
     fn spell_for_trailing(&mut self, canonical: &[u8]) -> Vec<u8> {
         let mut out = self.spell_for_mutation(canonical);
-        if !self.escaping_links.contains(&canonical.to_vec()) && self.rng.chance(1, 32) {
+        // Whether a kernel follows `link/` differs across macOS versions
+        // (`unlink lf/` removed the link on 15, gave ENOTDIR on 27), so on
+        // macOS no symlink node is ever given a trailing slash.
+        let mac_symlink = self.mac
+            && self
+                .nodes
+                .iter()
+                .any(|n| n.path == canonical && n.kind == Kind::Symlink);
+        if !mac_symlink
+            && !self.escaping_links.contains(&canonical.to_vec())
+            && self.rng.chance(1, 32)
+        {
             out.push(b'/');
             if self.rng.chance(1, 4) {
                 out.push(b'/');
