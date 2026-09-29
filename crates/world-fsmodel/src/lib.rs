@@ -1851,31 +1851,43 @@ fn escape(bytes: &[u8]) -> String {
     s
 }
 
-/// Inverse of [`escape`].
-fn unescape(s: &str) -> Vec<u8> {
+/// Value of an ASCII hex digit.
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Inverse of [`escape`]. Byte-based (never slices the `str`, so multi-byte
+/// UTF-8 cannot panic) and strict: a `%` must be followed by exactly two
+/// ASCII hex digits, otherwise the token is malformed and the result is
+/// `None` (this also rejects `%+f`, which `from_str_radix` would accept).
+fn unescape(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
-        {
-            out.push(v);
+        if bytes[i] == b'%' {
+            let hi = hex_val(*bytes.get(i + 1)?)?;
+            let lo = hex_val(*bytes.get(i + 2)?)?;
+            out.push((hi << 4) | lo);
             i += 3;
-            continue;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
         }
-        out.push(bytes[i]);
-        i += 1;
     }
-    out
+    Some(out)
 }
 
-/// [`unescape`] for a path-like operand: `None` if the decoded bytes contain
-/// a NUL, which no real syscall can carry (the C string would be truncated).
+/// [`unescape`] for a path-like operand: `None` if malformed or if the
+/// decoded bytes contain a NUL, which no real syscall can carry (the C
+/// string would be truncated).
 fn unescape_path(s: &str) -> Option<Vec<u8>> {
-    let v = unescape(s);
-    if v.contains(&0) { None } else { Some(v) }
+    unescape(s).filter(|v| !v.contains(&0))
 }
 
 fn flag_char(v: bool) -> char {
@@ -1979,8 +1991,17 @@ impl Op {
     }
 
     /// Parse a line produced by [`Op::to_line`]; `None` for anything else.
+    /// Trailing tokens are rejected.
     pub fn from_line(s: &str) -> Option<Op> {
         let mut it = s.split(' ');
+        let op = Self::parse_tokens(&mut it)?;
+        if it.next().is_some() {
+            return None;
+        }
+        Some(op)
+    }
+
+    fn parse_tokens(it: &mut std::str::Split<'_, char>) -> Option<Op> {
         let cmd = it.next()?;
         match cmd {
             "mkdir" => Some(Op::Mkdir {
@@ -1993,7 +2014,7 @@ impl Op {
             }),
             "write" => Some(Op::Write {
                 fd: it.next()?.parse().ok()?,
-                data: unescape(it.next()?),
+                data: unescape(it.next()?)?,
             }),
             "read" => Some(Op::Read {
                 fd: it.next()?.parse().ok()?,
@@ -3594,6 +3615,33 @@ mod tests {
             data: b"a\0b".to_vec(),
         };
         assert_eq!(Op::from_line(&w.to_line()), Some(w));
+    }
+
+    #[test]
+    fn malformed_escapes_and_trailing_tokens_are_rejected() {
+        for line in [
+            "stat %a\u{e9}",
+            "stat %",
+            "stat %a",
+            "stat a%",
+            "stat %zz",
+            "stat %\u{e9}",
+            "stat %+f",
+            "stat %-1",
+            "write 3 %a",
+            "write 3 %zz",
+            "mkdir a 755 junk",
+            "getcwd junk",
+            "stat a b",
+        ] {
+            assert_eq!(Op::from_line(line), None, "{line:?}");
+        }
+        assert_eq!(
+            Op::from_line("stat %41%2f%2F"),
+            Some(Op::Stat {
+                path: b"A//".to_vec()
+            })
+        );
     }
 
     #[test]

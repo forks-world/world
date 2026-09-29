@@ -293,6 +293,14 @@ fn cmd_replay(file: &std::path::Path, run_id_override: Option<String>, keep: boo
             return 2;
         }
     };
+    if !valid_run_id(&parsed.run_id) {
+        eprintln!(
+            "fuzz_driver: refusing invalid run id {:?} in the header of {} (expected ^fz-[0-9a-f]{{8,}}$)",
+            parsed.run_id,
+            file.display()
+        );
+        return 2;
+    }
     let new_run_id = run_id_override.unwrap_or_else(fresh_run_id);
     if !valid_run_id(&new_run_id) {
         eprintln!(
