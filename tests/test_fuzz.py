@@ -487,6 +487,48 @@ class GuardProbes(unittest.TestCase):
                     self.assertIn("outside the sandbox", r.stderr)
                     self.assertEqual(snapshot(), before)
 
+    def test_connect_and_bind_through_outside_paths_are_refused(self):
+        """`connect` follows a final symlink and macOS `bind` creates at a
+        dangling link's target: both must be refused before the syscall. The
+        host listener never sees a connection and nothing is created."""
+        import socket
+
+        with tempfile.TemporaryDirectory() as scratch:
+            sock_path = pathlib.Path(scratch) / "s"
+            newsock = pathlib.Path(scratch) / "newsock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(listener.close)
+            listener.bind(str(sock_path))
+            listener.listen(4)
+            listener.setblocking(False)
+            s = escape_op_path(sock_path)
+            n = escape_op_path(newsock)
+            cases = {
+                "connect-absolute": lambda rid: [f"connect {s}"],
+                "connect-final-link": lambda rid: [f"symlink {s} /tmp/{rid}/ls", f"connect /tmp/{rid}/ls"],
+                "bind-dangling-link": lambda rid: [f"symlink {n} /tmp/{rid}/dsock", f"bind /tmp/{rid}/dsock"],
+            }
+            for name, make in cases.items():
+                with self.subTest(case=name):
+                    rid = fresh_run_id()
+                    text = (
+                        f"# profile mac\n# seed 1\n# run-id {rid}\n# allow-escaping-links 0\n"
+                        f"mkdir /tmp/{rid} 755\nmkdir /var/tmp/{rid} 755\nchdir /tmp/{rid}\n"
+                        + "".join(line + "\n" for line in make(rid))
+                    )
+                    ops = pathlib.Path(scratch) / f"{name}.ops"
+                    ops.write_text(text)
+                    try:
+                        r = run_timeout([FUZZ_DRIVER, "replay", ops, "--run-id", rid], 20)
+                    finally:
+                        self.remove_roots(rid)
+                        ops.unlink()
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertIn("outside the sandbox", r.stderr)
+                    with self.assertRaises(BlockingIOError):
+                        listener.accept()
+                    self.assertFalse(os.path.lexists(newsock))
+
     def test_op_with_parent_outside_the_sandbox_is_refused_before_any_syscall(self):
         rid = fresh_run_id()
         victim = f"should-never-exist-{rid}"

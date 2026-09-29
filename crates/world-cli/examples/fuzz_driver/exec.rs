@@ -44,7 +44,10 @@
 //! 3. `bind`/`connect` have no `*at` form (and a `sockaddr_un` path is at most
 //!    ~104 bytes, less than a shimmed physical path): they run in a
 //!    short-lived forked child that `fchdir`s to the already-guarded parent
-//!    directory and uses the bare final name. `mkstemp` is executed as a
+//!    directory and uses the bare final name. Both go through
+//!    `guarded_parent` and then `check_final_link`, because `connect` follows
+//!    a final symlink (it could reach a host listener) and macOS `bind`
+//!    creates the socket at a dangling link's target. `mkstemp` is executed as a
 //!    guarded create-exclusive of the literal name (see `mkstemp_like`).
 //! 4. `remove_sandbox_tree` (the final cleanup) walks only via `*at` calls
 //!    opened with `O_NOFOLLOW`, so it can never be redirected through a
@@ -360,6 +363,15 @@ fn check_trailing(state: &RealState, parent: RawFd, name: &[u8], trailing: bool)
     if !trailing {
         return Ok(());
     }
+    check_final_link(state, parent, name)
+}
+
+/// The link-chain walk behind `check_trailing`, for callers whose syscall
+/// follows (or may follow) a final symlink regardless of a trailing slash:
+/// `connect` (both OSes follow it) and `bind` (macOS creates the socket at a
+/// dangling link's target). If `name` in `parent` is a symlink the whole chain
+/// is walked and every hop must stay inside the sandbox; see `check_trailing`.
+fn check_final_link(state: &RealState, parent: RawFd, name: &[u8]) -> ExecResult<()> {
     let run_id = state.run_id.as_str();
     let is_link = |dirfd: RawFd, n: &[u8]| -> ExecResult<bool> {
         let c = cstr(n).map_err(ExecError::Errno)?;
@@ -372,7 +384,7 @@ fn check_trailing(state: &RealState, parent: RawFd, name: &[u8], trailing: bool)
     }
     let refuse = |why: String| {
         Err(ExecError::Harness(format!(
-            "refusing trailing-slash use of symlink {:?} (run {run_id}): {why}",
+            "refusing use of symlink {:?} (run {run_id}): {why}",
             String::from_utf8_lossy(name)
         )))
     };
@@ -1173,7 +1185,9 @@ fn unix_sockaddr(path: &[u8]) -> Option<(libc::sockaddr_un, libc::socklen_t)> {
 /// (`bind`/`connect` have no `*at` form); the parent's own cwd is untouched.
 fn bind_like(state: &mut RealState, path: &[u8]) -> ExecResult<Outcome> {
     let (parent, name, trailing) = guarded_parent(state, Start::Cwd, path)?;
-    check_trailing(state, parent.as_raw_fd(), &name, trailing)?;
+    // Always walk a final symlink: macOS `bind` creates at a dangling link's
+    // target (Linux answers EADDRINUSE without following).
+    check_final_link(state, parent.as_raw_fd(), &name)?;
     let Some((addr, len)) = unix_sockaddr(&literal(&name, trailing)) else {
         return Ok(err(libc::ENAMETOOLONG));
     };
@@ -1332,20 +1346,16 @@ fn reap_until(pid: libc::pid_t, deadline: Instant) -> ExecResult<()> {
 }
 
 fn connect_like(state: &mut RealState, path: &[u8]) -> ExecResult<Outcome> {
-    // Non-mutating (connect never changes the filesystem namespace): the
-    // parent is opened like any read-only lookup, no guard needed beyond the
-    // generator's own rule of keeping every path inside the sandbox.
-    // The generator never puts a trailing slash on a connect path, so the
-    // bare name is used.
-    let (dir, name, _) = split_parent_name(path).map_err(ExecError::Errno)?;
-    let base = start_fd(state, Start::Cwd).map_err(ExecError::Errno)?;
-    let c = cstr(&dir).map_err(ExecError::Errno)?;
-    let fd = unsafe { libc::openat(base, c.as_ptr(), libc::O_DIRECTORY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Ok(err(io_errno()));
-    }
-    let parent = unsafe { OwnedFd::from_raw_fd(fd) };
-    in_virtual_cwd(parent.as_raw_fd(), &CwdQuery::Connect(name))
+    // `connect` reaches whatever a path (and a final symlink) names, even a
+    // listener outside the sandbox, so it gets the same guard as `bind`: the
+    // parent must be inside the sandbox and the final link chain is walked.
+    // The child then `fchdir`s into the checked fd and uses the bare name.
+    let (parent, name, trailing) = guarded_parent(state, Start::Cwd, path)?;
+    check_final_link(state, parent.as_raw_fd(), &name)?;
+    in_virtual_cwd(
+        parent.as_raw_fd(),
+        &CwdQuery::Connect(literal(&name, trailing)),
+    )
 }
 
 fn mkstemp_like(state: &mut RealState, name: &[u8]) -> ExecResult<Applied> {
@@ -1884,6 +1894,8 @@ mod trailing_slash_guard_tests {
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
+        // "s" is the test's own listener socket (connect tests).
+        names.retain(|n| n != "s");
         names.sort();
         assert_eq!(names, ["keep", "sub"]);
         assert_eq!(std::fs::read(f.victim.join("keep")).unwrap(), b"keep");
@@ -2086,6 +2098,55 @@ mod trailing_slash_guard_tests {
             let a = symlink_like(&mut f.state, b"", &under_file);
             assert_eq!(errno_of(a), libc::ENOENT);
         }
+        victim_untouched(&f);
+    }
+
+    fn assert_no_connection(l: &std::os::unix::net::UnixListener) {
+        match l.accept() {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            other => panic!("listener saw a connection: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connect_outside_socket_is_refused() {
+        let mut f = fixture();
+        let sock = f.victim.join("s");
+        let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        l.set_nonblocking(true).unwrap();
+        std::os::unix::fs::symlink(&sock, f.sandbox.join("ls")).unwrap();
+        let outside = sock.as_os_str().as_bytes().to_vec();
+        for path in [outside, abs(&f, "out/s"), abs(&f, "ls")] {
+            assert!(
+                refused(connect_like(&mut f.state, &path)),
+                "{}",
+                String::from_utf8_lossy(&path)
+            );
+            assert_no_connection(&l);
+        }
+        victim_untouched(&f);
+    }
+
+    #[test]
+    fn connect_inside_socket_succeeds() {
+        let mut f = fixture();
+        let s = abs(&f, "s");
+        assert_eq!(errno_of(bind_like(&mut f.state, &s)), 0);
+        assert_eq!(errno_of(connect_like(&mut f.state, &s)), 0);
+        std::os::unix::fs::symlink("s", f.sandbox.join("li")).unwrap();
+        let li = abs(&f, "li");
+        assert_eq!(errno_of(connect_like(&mut f.state, &li)), 0);
+        victim_untouched(&f);
+    }
+
+    #[test]
+    fn bind_through_dangling_link_to_outside_is_refused() {
+        let mut f = fixture();
+        let target = f.victim.join("newsock");
+        std::os::unix::fs::symlink(&target, f.sandbox.join("dsock")).unwrap();
+        let p = abs(&f, "dsock");
+        assert!(refused(bind_like(&mut f.state, &p)));
+        assert!(!target.exists());
         victim_untouched(&f);
     }
 }
