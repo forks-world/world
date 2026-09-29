@@ -1,5 +1,6 @@
 """Stress/concurrency tests for the workspace registry, temp-root hardening,
-and the macOS silo shim's threaded storms.
+the macOS silo shim's threaded storms, and the same storms through a
+Linux workspace (`world exec`).
 
 Tiers:
   default (no env)     -- smoke: fixed seeds, small counts, ~20s total.
@@ -751,8 +752,110 @@ class TempRootSymlinkRace(unittest.TestCase):
 # really shimmed fails closed) and the shim's WORLD_TMP redirection itself.
 
 
+class StormChecks:
+    """Shared storm/spawn-storm/fork-exec-storm checks (a mixin, not a
+    TestCase). Subclasses provide `physical_root` (a Path: the tree `/tmp` is
+    redirected under, i.e. `<physical_root>/tmp` is the probe's `/tmp`) and
+    `run_probe(argv, name, timeout, **extra_env)`."""
+
+    def physical(self, virtual_path):
+        return self.physical_root / pathlib.Path(virtual_path).relative_to("/")
+
+    def new_vdir(self):
+        """A unique probe dir `/tmp/st-<id>`, with its physical removal
+        registered (sandboxed to `<physical_root>/tmp`) before it is returned,
+        so a failing test cannot leak it."""
+        vdir = f"/tmp/st-{uuid.uuid4().hex[:8]}"
+        self.addCleanup(owned_rmtree, self.physical(vdir), self.physical_root / "tmp")
+        return vdir
+
+    def assert_probe_ok(self, result, name, vdir):
+        self.assertEqual(result.returncode, 0, f"{name}: {result.stdout} {result.stderr}")
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["violations"], [], summary["violations"])
+        self.assertEqual(summary["errors_by_kind"], {}, summary)
+        for path in summary["expected_files"]:
+            self.assertTrue(self.physical(path).exists(), f"missing physical file: {path}")
+        self.assertFalse(os.path.lexists(vdir), f"host {vdir} must not exist")
+
+    def assert_fork_exec_summary(self, result, threads, iters, vdir):
+        """Every fork ran (ops == threads*iters) and every file holds its own
+        marker: even iterations exec'd `stress_probe touch` (so the exec'd
+        image ran its own verify_redirected), odd ones wrote it from the
+        forked child."""
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["ops"], threads * iters, summary)
+        self.assertEqual(len(summary["expected_files"]), threads * iters)
+        for t in range(threads):
+            for i in range(iters):
+                path = self.physical(f"{vdir}/{t}/{i}")
+                self.assertEqual(path.read_text(), f"fe-t{t}-i{i}", str(path))
+
+    def test_storm(self):
+        threads, iters = n(2, 6), n(5, 60)
+        vdir = self.new_vdir()
+        result = self.run_probe(
+            ["storm", "--threads", threads, "--iters", iters, "--seed", "123", "--dir", vdir],
+            "storm",
+            60,
+        )
+        self.assert_probe_ok(result, "storm", vdir)
+
+    def test_spawn_storm(self):
+        threads, iters = n(2, 4), n(3, 20)
+        vdir = self.new_vdir()
+        result = self.run_probe(
+            ["spawn-storm", "--threads", threads, "--iters", iters, "--dir", vdir],
+            "spawn-storm",
+            90,
+        )
+        self.assert_probe_ok(result, "spawn-storm", vdir)
+
+    def test_fork_exec_storm(self):
+        threads, iters = n(2, 6), n(3, 20)
+        vdir = self.new_vdir()
+        result = self.run_probe(
+            ["fork-exec-storm", "--threads", threads, "--iters", iters, "--dir", vdir],
+            "fork-exec-storm",
+            90,
+        )
+        self.assert_probe_ok(result, "fork-exec-storm", vdir)
+        self.assert_fork_exec_summary(result, threads, iters, vdir)
+
+    def test_injected_errors_fail_the_probe(self):
+        """Worker errors must fail the probe: each test-only injected failure
+        (STRESS_PROBE_INJECT) exits 1 with a counted error and a violation
+        naming the kind; an unknown kind refuses (exit 2)."""
+        for mode, kind in [
+            ("storm", "chdir"),
+            ("storm", "getcwd"),
+            ("spawn-storm", "file_actions_init"),
+        ]:
+            with self.subTest(mode=mode, kind=kind):
+                vdir = self.new_vdir()
+                result = self.run_probe(
+                    [mode, "--threads", "2", "--iters", "3", "--dir", vdir],
+                    f"inject-{kind}",
+                    60,
+                    STRESS_PROBE_INJECT=kind,
+                )
+                self.assertEqual(result.returncode, 1, f"{result.stdout} {result.stderr}")
+                summary = json.loads(result.stdout)
+                self.assertGreater(summary["errors_by_kind"].get(kind, 0), 0, summary)
+                self.assertTrue(any(kind in v for v in summary["violations"]), summary)
+        with self.subTest(kind="bogus"):
+            vdir = self.new_vdir()
+            result = self.run_probe(
+                ["storm", "--threads", "2", "--iters", "3", "--dir", vdir],
+                "inject-bogus",
+                60,
+                STRESS_PROBE_INJECT="bogus",
+            )
+            self.assertEqual(result.returncode, 2, f"{result.stdout} {result.stderr}")
+
+
 @unittest.skipUnless(MACOS, "native silo shim requires macOS")
-class ShimStorms(unittest.TestCase):
+class ShimStorms(StormChecks, unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="world-stress-shim-")
         self.addCleanup(self.temp.cleanup)
@@ -760,6 +863,7 @@ class ShimStorms(unittest.TestCase):
         self.short = short_dir(".wt-stress-shim-")
         self.addCleanup(self.short.cleanup)
         self.world_tmp = pathlib.Path(self.short.name) / "w"
+        self.physical_root = self.world_tmp
         (self.world_tmp / "tmp").mkdir(parents=True)
         (self.world_tmp / "var/tmp").mkdir(parents=True)
         self.ack = self.dir / "ack"
@@ -768,29 +872,13 @@ class ShimStorms(unittest.TestCase):
     def env(self, **extra):
         return shim_env(self.world_tmp, self.ack, **extra)
 
-    def physical(self, virtual_path):
-        return self.world_tmp / pathlib.Path(virtual_path).relative_to("/")
-
-    def assert_probe_ok(self, result, name):
-        self.assertEqual(result.returncode, 0, f"{name}: {result.stdout} {result.stderr}")
-        summary = json.loads(result.stdout)
-        self.assertEqual(summary["violations"], [], summary["violations"])
-        for path in summary["expected_files"]:
-            self.assertTrue(self.physical(path).exists(), f"missing physical file: {path}")
-        self.assertFalse(os.path.lexists("/tmp/R"), "host /tmp/R must not exist")
-
-    def assert_fork_exec_summary(self, result, threads, iters):
-        """Every fork ran (ops == threads*iters) and every file holds its own
-        marker: even iterations exec'd `stress_probe touch` (so the exec'd
-        image ran its own verify_redirected under the shim), odd ones wrote
-        it from the forked child."""
-        summary = json.loads(result.stdout)
-        self.assertEqual(summary["ops"], threads * iters, summary)
-        self.assertEqual(len(summary["expected_files"]), threads * iters)
-        for t in range(threads):
-            for i in range(iters):
-                path = self.physical(f"/tmp/R/{t}/{i}")
-                self.assertEqual(path.read_text(), f"fe-t{t}-i{i}", str(path))
+    def run_probe(self, argv, name, timeout, **extra_env):
+        return run_with_sample(
+            [STRESS_PROBE, *argv],
+            timeout=timeout,
+            name=f"shim-{name}",
+            env=self.env(**extra_env),
+        )
 
     def with_gmalloc(self, env):
         lib = "/usr/lib/libgmalloc.dylib"
@@ -801,67 +889,45 @@ class ShimStorms(unittest.TestCase):
         merged["MALLOC_STRICT_SIZE"] = "1"
         return merged
 
-    def test_shim_storm(self):
-        threads, iters = n(2, 6), n(5, 60)
-        result = run_with_sample(
-            [STRESS_PROBE, "storm", "--threads", threads, "--iters", iters, "--seed", "123", "--dir", "/tmp/R"],
-            timeout=60,
-            name="shim-storm",
-            env=self.env(),
-        )
-        self.assert_probe_ok(result, "storm")
-        if STRESS:
-            gm_env = self.with_gmalloc(self.env())
-            if gm_env is not None:
-                result = run_with_sample(
-                    [STRESS_PROBE, "storm", "--threads", "2", "--iters", "5", "--seed", "7", "--dir", "/tmp/R"],
-                    timeout=90,
-                    name="shim-storm-gmalloc",
-                    env=gm_env,
-                )
-                self.assert_probe_ok(result, "storm-gmalloc")
+    def gmalloc_run(self, argv, name, timeout):
+        gm_env = self.with_gmalloc(self.env())
+        if gm_env is None:
+            return None
+        return run_with_sample([STRESS_PROBE, *argv], timeout=timeout, name=f"shim-{name}-gmalloc", env=gm_env)
 
-    def test_shim_spawn_storm(self):
-        threads, iters = n(2, 4), n(3, 20)
-        result = run_with_sample(
-            [STRESS_PROBE, "spawn-storm", "--threads", threads, "--iters", iters, "--dir", "/tmp/R"],
-            timeout=90,
-            name="shim-spawn-storm",
-            env=self.env(),
+    def test_storm_gmalloc(self):
+        if not STRESS:
+            self.skipTest("full tier only")
+        vdir = self.new_vdir()
+        result = self.gmalloc_run(
+            ["storm", "--threads", "2", "--iters", "5", "--seed", "7", "--dir", vdir], "storm", 90
         )
-        self.assert_probe_ok(result, "spawn-storm")
-        if STRESS:
-            gm_env = self.with_gmalloc(self.env())
-            if gm_env is not None:
-                result = run_with_sample(
-                    [STRESS_PROBE, "spawn-storm", "--threads", "2", "--iters", "3", "--dir", "/tmp/R"],
-                    timeout=120,
-                    name="shim-spawn-storm-gmalloc",
-                    env=gm_env,
-                )
-                self.assert_probe_ok(result, "spawn-storm-gmalloc")
+        if result is None:
+            self.skipTest("libgmalloc not available")
+        self.assert_probe_ok(result, "storm-gmalloc", vdir)
 
-    def test_shim_fork_exec_storm(self):
-        threads, iters = n(2, 6), n(3, 20)
-        result = run_with_sample(
-            [STRESS_PROBE, "fork-exec-storm", "--threads", threads, "--iters", iters, "--dir", "/tmp/R"],
-            timeout=90,
-            name="shim-fork-exec-storm",
-            env=self.env(),
+    def test_spawn_storm_gmalloc(self):
+        if not STRESS:
+            self.skipTest("full tier only")
+        vdir = self.new_vdir()
+        result = self.gmalloc_run(
+            ["spawn-storm", "--threads", "2", "--iters", "3", "--dir", vdir], "spawn-storm", 120
         )
-        self.assert_probe_ok(result, "fork-exec-storm")
-        self.assert_fork_exec_summary(result, threads, iters)
-        if STRESS:
-            gm_env = self.with_gmalloc(self.env())
-            if gm_env is not None:
-                result = run_with_sample(
-                    [STRESS_PROBE, "fork-exec-storm", "--threads", "2", "--iters", "3", "--dir", "/tmp/R"],
-                    timeout=120,
-                    name="shim-fork-exec-storm-gmalloc",
-                    env=gm_env,
-                )
-                self.assert_probe_ok(result, "fork-exec-storm-gmalloc")
-                self.assert_fork_exec_summary(result, 2, 3)
+        if result is None:
+            self.skipTest("libgmalloc not available")
+        self.assert_probe_ok(result, "spawn-storm-gmalloc", vdir)
+
+    def test_fork_exec_storm_gmalloc(self):
+        if not STRESS:
+            self.skipTest("full tier only")
+        vdir = self.new_vdir()
+        result = self.gmalloc_run(
+            ["fork-exec-storm", "--threads", "2", "--iters", "3", "--dir", vdir], "fork-exec-storm", 120
+        )
+        if result is None:
+            self.skipTest("libgmalloc not available")
+        self.assert_probe_ok(result, "fork-exec-storm-gmalloc", vdir)
+        self.assert_fork_exec_summary(result, 2, 3, vdir)
 
     def test_fork_exec_storm_timeout_reaps_children(self):
         """A hung child (test-only STRESS_PROBE_HANG: exec `pause <marker>`)
@@ -870,7 +936,7 @@ class ShimStorms(unittest.TestCase):
         marker = f"stress-hang-{uuid.uuid4().hex}"
         result = run_with_sample(
             [STRESS_PROBE, "fork-exec-storm", "--threads", "2", "--iters", "2",
-             "--dir", "/tmp/R", "--deadline-ms", "500"],
+             "--dir", self.new_vdir(), "--deadline-ms", "500"],
             timeout=60,
             name="shim-fork-exec-storm-timeout",
             env=self.env(STRESS_PROBE_HANG=marker),
@@ -1342,6 +1408,63 @@ class LinuxHolderRace(unittest.TestCase):
                         pathlib.Path(f"/proc/{pid}").exists(),
                         f"orphan holder for {id_}: pid {pid} still alive",
                     )
+
+
+@unittest.skipUnless(LINUX, "Linux World namespaces")
+class LinuxWorkspaceStorms(StormChecks, unittest.TestCase):
+    """The shared storms run inside a real Linux workspace via `world exec`
+    (private /tmp bind mount). stress_probe proves `/tmp` is the workspace's
+    `<temp_root>/tmp` (STRESS_PROBE_PHYSICAL_ROOT) and fails closed otherwise."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Every resource is registered with addClassCleanup the moment it
+        # exists (LIFO, and run even when setUpClass raises).
+        # Workspaces refuse workdirs under /tmp and record their private /tmp
+        # under HOME: keep both inside the build tree.
+        (ROOT / "target").mkdir(exist_ok=True)
+        cls.temp = tempfile.TemporaryDirectory(prefix="world-stress-lstorm-", dir=ROOT / "target")
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.root = pathlib.Path(cls.temp.name)
+        cls.state = cls.root / "state"
+        cls.home = cls.root / "home"
+        cls.home.mkdir()
+        work = cls.root / "S"
+        work.mkdir()
+        cls.env = dict(os.environ, HOME=str(cls.home))
+        # Teardown tolerates a workspace that was never created (run_timeout
+        # does not raise on a non-zero exit); registered before create.
+        cls.addClassCleanup(
+            run_timeout,
+            [WORLD, "workspace", "--state-dir", cls.state, "teardown", "S"],
+            30,
+            env=cls.env,
+        )
+        result = run_timeout(
+            [WORLD, "workspace", "--state-dir", cls.state, "create", "S", "--workdir", work],
+            timeout=30,
+            env=cls.env,
+        )
+        if result.returncode:
+            raise AssertionError(result.stderr)
+        cls.physical_root = pathlib.Path(json.loads(result.stdout)["temp_root"])
+        # Every later destructive call is sandboxed to this temp root.
+        assert_owned(cls.physical_root, cls.home)
+        result = run_timeout(
+            [WORLD, "workspace", "--state-dir", cls.state, "setup", "S"], timeout=30, env=cls.env
+        )
+        if result.returncode:
+            raise AssertionError(result.stderr)
+
+    def run_probe(self, argv, name, timeout, **extra_env):
+        env = dict(self.env, STRESS_PROBE_PHYSICAL_ROOT=str(self.physical_root), **extra_env)
+        return run_with_sample(
+            [WORLD, "exec", "S", "--state-dir", self.state, "--timeout", f"{timeout}s", "--",
+             STRESS_PROBE, *argv],
+            timeout=timeout + 30,
+            name=f"linux-{name}",
+            env=env,
+        )
 
 
 # ---------------------------------------------------------------------------
