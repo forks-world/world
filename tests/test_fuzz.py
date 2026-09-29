@@ -12,12 +12,14 @@ Knobs: WORLD_FUZZ_BUDGET (seconds, default 10), WORLD_FUZZ_SEED, WORLD_FUZZ_OPS
 (default 40), WORLD_FUZZ_ARTIFACTS (default target/fuzz-artifacts).
 """
 
+import ipaddress
 import json
 import os
 import pathlib
 import platform
 import random
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -196,6 +198,50 @@ def escape_op_path(path):
     return "".join(out)
 
 
+def check_alias_ip(ip):
+    """Only ever touch addresses inside the 127.77.0.0/16 range the workspace
+    allocator hands out; in particular never 127.0.0.1."""
+    addr = ipaddress.ip_address(ip)
+    if addr not in ipaddress.ip_network("127.77.0.0/16"):
+        raise AssertionError(f"refusing to manage loopback alias {ip}: outside 127.77.0.0/16")
+    return str(addr)
+
+
+def alias_present(ip):
+    """True when `ip` is bindable on this host (the same test the shim's
+    `alias_ready` uses)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((ip, 0))
+        except OSError:
+            return False
+    return True
+
+
+def remove_alias(ip):
+    """Tolerant, verifying removal: a no-op when the alias is absent (a failed
+    or timed-out add), otherwise `-alias` and a check that it is really gone."""
+    ip = check_alias_ip(ip)
+    if not alias_present(ip):
+        return
+    result = subprocess.run(
+        ["sudo", "-n", "/sbin/ifconfig", "lo0", "-alias", ip],
+        capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL,
+    )
+    if alias_present(ip):
+        raise AssertionError(f"loopback alias {ip} is still present after removal: {result.stderr}")
+
+
+def add_alias(ip):
+    """Register the removal BEFORE adding (unittest runs class cleanups even
+    when setUpClass raises), and refuse an address that is already aliased:
+    the allocator skips those, so it belongs to someone else."""
+    ip = check_alias_ip(ip)
+    if alias_present(ip):
+        raise AssertionError(f"loopback alias {ip} is already present; not taking it over")
+    return ip
+
+
 class HostTempGuard:
     """Shared by every class that runs the driver: a sentinel dir plus a
     before/after listing of the *host* temp dirs, so a run that escaped its
@@ -213,19 +259,28 @@ class HostTempGuard:
 
     @classmethod
     def guard_start(cls):
+        """Call first in setUpClass. Registers guard_finish with
+        addClassCleanup immediately, so it runs (last, LIFO) even when the
+        rest of setUpClass raises."""
+        cls.guard_armed = False
+        cls.guard_before = {b: cls.host_fz(b) for b in cls.host_bases}
         cls.guard_sentinel = pathlib.Path(cls.host_bases[0]) / f"fz-sentinel-{uuid.uuid4().hex[:8]}"
         cls.guard_sentinel.mkdir()
+        cls.addClassCleanup(cls.guard_finish)
         (cls.guard_sentinel / "file").write_text("sentinel")
-        cls.guard_before = {b: cls.host_fz(b) for b in cls.host_bases}
+        cls.guard_armed = True
 
     @classmethod
     def guard_finish(cls):
-        """Clean up and report; call last in tearDownClass. Tolerates a
-        guard_start that never ran."""
+        """Registered by guard_start as a class cleanup: clean up and report.
+        Tolerates a guard_start that never ran or never armed."""
         sentinel = getattr(cls, "guard_sentinel", None)
         if sentinel is None:
             return
         cls.guard_sentinel = None
+        if not getattr(cls, "guard_armed", False):
+            owned_rmtree(sentinel, sentinel)
+            return
         leaked = {}
         for base in cls.host_bases:
             new = cls.host_fz(base) - cls.guard_before.get(base, set())
@@ -483,21 +538,15 @@ class CheckTrees(unittest.TestCase):
 class ShimFuzz(HostTempGuard, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.guard_start()
         cls.home = short_dir(".wt-fuzz-")
+        cls.addClassCleanup(cls.home.cleanup)
         cls.root = pathlib.Path(cls.home.name) / "w"
         for sub in ["tmp", "var/tmp"]:
             (cls.root / sub).mkdir(parents=True)
         cls.ack = pathlib.Path(cls.home.name) / "ack"
         cls.ack.touch()
         cls.env = shim_env(cls.root, cls.ack)
-        cls.guard_start()
-
-    @classmethod
-    def tearDownClass(cls):
-        try:
-            cls.home.cleanup()
-        finally:
-            cls.guard_finish()
 
     def cleanup_run(self, run_id):
         owned_rmtree(self.root / "tmp" / run_id, self.root)
@@ -586,8 +635,8 @@ class ShimFuzz(HostTempGuard, unittest.TestCase):
 
 class ExecFuzzMixin(HostTempGuard):
     """Shared loop for the two `world exec` based classes (also carries the
-    host-temp leak/sentinel guard: call `guard_start()` first in setUpClass
-    and `guard_finish()` last in tearDownClass)."""
+    host-temp leak/sentinel guard: call `guard_start()` first in setUpClass; it
+    registers `guard_finish` as a class cleanup)."""
 
     profile = None
     world_name = "F"
@@ -644,42 +693,37 @@ class ExecFuzzMixin(HostTempGuard):
 class LinuxFuzz(ExecFuzzMixin, unittest.TestCase):
     profile = "linux"
 
+    @staticmethod
+    def _restore_home(home):
+        if home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = home
+
     @classmethod
     def setUpClass(cls):
+        # Every resource is registered with addClassCleanup the moment it
+        # exists (LIFO, and run even when setUpClass raises).
         cls.guard_start()
         # Workspaces refuse workdirs under /tmp and record their private /tmp
         # under HOME: keep both inside the build tree (LinuxWorkspace pattern).
         (ROOT / "target").mkdir(exist_ok=True)
         cls.temp = tempfile.TemporaryDirectory(prefix="world-fuzz-test-", dir=ROOT / "target")
+        cls.addClassCleanup(cls.temp.cleanup)
         cls.root = pathlib.Path(cls.temp.name)
         cls.state = cls.root / "state"
-        cls.home = os.environ.get("HOME")
+        cls.addClassCleanup(cls._restore_home, os.environ.get("HOME"))
         os.environ["HOME"] = str(cls.root / "home")
         (cls.root / "home").mkdir()
         work = cls.root / "F"
         work.mkdir()
-        try:
-            for action in [["create", "F", "--workdir", work], ["setup", "F"]]:
-                result = run_timeout([WORLD, "workspace", "--state-dir", cls.state, *action], 30)
-                if result.returncode:
-                    raise AssertionError(result.stderr)
-        except BaseException:
-            cls.tearDownClass()
-            raise
-
-    @classmethod
-    def tearDownClass(cls):
-        try:
-            run_timeout([WORLD, "workspace", "--state-dir", cls.state, "teardown", "F"], 30)
-        finally:
-            if cls.home is None:
-                os.environ.pop("HOME", None)
-            else:
-                os.environ["HOME"] = cls.home
-            try:
-                cls.temp.cleanup()
-            finally:
-                cls.guard_finish()
+        # Teardown tolerates a workspace that was never created (run_timeout
+        # does not raise on a non-zero exit).
+        cls.addClassCleanup(run_timeout, [WORLD, "workspace", "--state-dir", cls.state, "teardown", "F"], 30)
+        for action in [["create", "F", "--workdir", work], ["setup", "F"]]:
+            result = run_timeout([WORLD, "workspace", "--state-dir", cls.state, *action], 30)
+            if result.returncode:
+                raise AssertionError(result.stderr)
 
     def temp_root(self):
         result = run_timeout([WORLD, "workspace", "--state-dir", self.state, "show", "F"], 15)
@@ -696,14 +740,18 @@ class PrivilegedExecFuzz(ExecFuzzMixin, unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # Every resource is registered with addClassCleanup the moment it
+        # exists (LIFO, and run even when setUpClass raises).
         cls.guard_start()
         cls.temp = tempfile.TemporaryDirectory(prefix="world-fuzz-silo-")
+        cls.addClassCleanup(cls.temp.cleanup)
         cls.root = pathlib.Path(cls.temp.name)
         cls.state = cls.root / "state"
         # A dedicated HOME (short, under the real HOME, never /tmp): the
         # workspace's temp root (~/.world/tmp/<ip>) must land in a
         # test-owned dir, never under the real developer/CI HOME.
         cls.home_dir = short_dir(".wt-fuzz-silo-")
+        cls.addClassCleanup(cls.home_dir.cleanup)
         cls.home = pathlib.Path(cls.home_dir.name)
         cls.child_env = dict(os.environ, HOME=str(cls.home))
         work = cls.root / "F"
@@ -712,33 +760,19 @@ class PrivilegedExecFuzz(ExecFuzzMixin, unittest.TestCase):
             [WORLD, "workspace", "--state-dir", cls.state, "create", "F", "--workdir", work], 15, env=cls.child_env
         )
         if result.returncode:
-            cls.temp.cleanup()
-            cls.home_dir.cleanup()
-            cls.guard_finish()
             raise AssertionError(result.stderr)
         cls.info = json.loads(result.stdout)
+        # assert_owned (inside owned_rmtree) keeps this under the dedicated HOME.
+        cls.addClassCleanup(owned_rmtree, pathlib.Path(cls.info["temp_root"]), cls.home)
+        # Validate the address before any ifconfig call, refuse one that is
+        # already aliased, and register the removal BEFORE adding.
+        ip = add_alias(cls.info["ip"])
+        cls.addClassCleanup(remove_alias, ip)
         # CI runner has passwordless sudo. Never alter sudoers or /etc/hosts.
         subprocess.run(
-            ["sudo", "-n", "/sbin/ifconfig", "lo0", "alias", cls.info["ip"], "netmask", "255.0.0.0"],
+            ["sudo", "-n", "/sbin/ifconfig", "lo0", "alias", ip, "netmask", "255.0.0.0"],
             check=True, timeout=10, stdin=subprocess.DEVNULL,
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        try:
-            owned_rmtree(pathlib.Path(cls.info["temp_root"]), cls.home)
-        finally:
-            try:
-                subprocess.run(
-                    ["sudo", "-n", "/sbin/ifconfig", "lo0", "-alias", cls.info["ip"]],
-                    check=True, timeout=10, stdin=subprocess.DEVNULL,
-                )
-            finally:
-                try:
-                    cls.temp.cleanup()
-                    cls.home_dir.cleanup()
-                finally:
-                    cls.guard_finish()
 
     def temp_root(self):
         return pathlib.Path(self.info["temp_root"])

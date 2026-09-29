@@ -12,6 +12,7 @@ Tiers:
 """
 
 import concurrent.futures
+import ipaddress
 import json
 import os
 import pathlib
@@ -19,6 +20,7 @@ import queue
 import random
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -110,6 +112,50 @@ def shim_env(root, ack, **extra):
         WORLD_TMP=str(root),
         **extra,
     )
+
+
+def check_alias_ip(ip):
+    """Only ever touch addresses inside the 127.77.0.0/16 range the workspace
+    allocator hands out; in particular never 127.0.0.1."""
+    addr = ipaddress.ip_address(ip)
+    if addr not in ipaddress.ip_network("127.77.0.0/16"):
+        raise AssertionError(f"refusing to manage loopback alias {ip}: outside 127.77.0.0/16")
+    return str(addr)
+
+
+def alias_present(ip):
+    """True when `ip` is bindable on this host (the same test the shim's
+    `alias_ready` uses)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((ip, 0))
+        except OSError:
+            return False
+    return True
+
+
+def remove_alias(ip):
+    """Tolerant, verifying removal: a no-op when the alias is absent (a failed
+    or timed-out add), otherwise `-alias` and a check that it is really gone."""
+    ip = check_alias_ip(ip)
+    if not alias_present(ip):
+        return
+    result = subprocess.run(
+        ["sudo", "-n", "/sbin/ifconfig", "lo0", "-alias", ip],
+        capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL,
+    )
+    if alias_present(ip):
+        raise AssertionError(f"loopback alias {ip} is still present after removal: {result.stderr}")
+
+
+def add_alias(ip):
+    """Register the removal BEFORE adding (unittest runs class cleanups even
+    when setUpClass raises), and refuse an address that is already aliased:
+    the allocator skips those, so it belongs to someone else."""
+    ip = check_alias_ip(ip)
+    if alias_present(ip):
+        raise AssertionError(f"loopback alias {ip} is already present; not taking it over")
+    return ip
 
 
 def short_dir(prefix):
@@ -1298,17 +1344,17 @@ class NetworkSoak(unittest.TestCase):
             # assert_owned (inside owned_rmtree) keeps this under the
             # dedicated HOME.
             cls.addClassCleanup(owned_rmtree, pathlib.Path(info["temp_root"]), cls.home)
+            # Validate the address, refuse one already aliased, and register
+            # the (tolerant, verifying) removal BEFORE adding.
+            ip = add_alias(info["ip"])
+            cls.addClassCleanup(remove_alias, ip)
             subprocess.run(
-                ["sudo", "-n", "/sbin/ifconfig", "lo0", "alias", info["ip"], "netmask", "255.0.0.0"],
+                ["sudo", "-n", "/sbin/ifconfig", "lo0", "alias", ip, "netmask", "255.0.0.0"],
                 check=True,
                 timeout=10,
+                stdin=subprocess.DEVNULL,
             )
-            cls.addClassCleanup(cls._remove_alias, info["ip"])
             cls.worlds[name] = info
-
-    @staticmethod
-    def _remove_alias(ip):
-        subprocess.run(["sudo", "-n", "/sbin/ifconfig", "lo0", "-alias", ip], check=True, timeout=10)
 
     def command(self, world, *args):
         return [WORLD, "exec", world, "--state-dir", self.state, "--timeout", "90s", "--", PROBE, *args]
