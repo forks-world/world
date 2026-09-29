@@ -456,13 +456,38 @@ impl Model {
         path: &[u8],
         follow_last: bool,
     ) -> Result<NodeId, Errno> {
+        self.resolve_impl(view, start, path, follow_last, None)
+    }
+
+    /// [`Model::resolve`] that also records, in walk order, every symlink
+    /// node followed (nested ones and those followed before an error
+    /// included) in `crossed`.
+    pub fn resolve_traced(
+        &self,
+        view: View,
+        start: Start,
+        path: &[u8],
+        follow_last: bool,
+        crossed: &mut Vec<NodeId>,
+    ) -> Result<NodeId, Errno> {
+        self.resolve_impl(view, start, path, follow_last, Some(crossed))
+    }
+
+    fn resolve_impl(
+        &self,
+        view: View,
+        start: Start,
+        path: &[u8],
+        follow_last: bool,
+        trace: Option<&mut Vec<NodeId>>,
+    ) -> Result<NodeId, Errno> {
         let mut link_count = 0u32;
         let start_node = match start {
             Start::Root => self.root_node,
             Start::Cwd => self.cwd,
             Start::Fd(fd) => self.fd_dir(fd)?,
         };
-        self.resolve_inner(view, start_node, path, follow_last, &mut link_count)
+        self.resolve_inner(view, start_node, path, follow_last, &mut link_count, trace)
     }
 
     fn resolve_inner(
@@ -472,6 +497,7 @@ impl Model {
         path: &[u8],
         follow_last: bool,
         link_count: &mut u32,
+        mut trace: Option<&mut Vec<NodeId>>,
     ) -> Result<NodeId, Errno> {
         if path.len() > self.path_max() {
             return Err(libc::ENAMETOOLONG);
@@ -516,7 +542,8 @@ impl Model {
             let mut target = child;
             let must_follow = !is_last || follow_last || trailing_slash;
             if must_follow && matches!(self.nodes[target].kind, NodeKind::Symlink(_)) {
-                target = self.follow_symlink(view, cur, target, link_count)?;
+                target =
+                    self.follow_symlink(view, cur, target, link_count, trace.as_deref_mut())?;
             }
             if !is_last || trailing_slash {
                 match &self.nodes[target].kind {
@@ -535,11 +562,15 @@ impl Model {
         dir: NodeId,
         link_node: NodeId,
         link_count: &mut u32,
+        mut trace: Option<&mut Vec<NodeId>>,
     ) -> Result<NodeId, Errno> {
         let target = match &self.nodes[link_node].kind {
             NodeKind::Symlink(t) => t.clone(),
             _ => return Ok(link_node),
         };
+        if let Some(t) = trace.as_deref_mut() {
+            t.push(link_node);
+        }
         *link_count += 1;
         if *link_count > self.max_symlinks() {
             return Err(libc::ELOOP);
@@ -552,7 +583,7 @@ impl Model {
         } else {
             dir
         };
-        self.resolve_inner(view, base, &target, true, link_count)
+        self.resolve_inner(view, base, &target, true, link_count, trace)
     }
 
     /// The canonical path of `node` in `view`: physical realpath-like for
@@ -733,7 +764,7 @@ impl Model {
         };
         let target = if matches!(self.nodes[id].kind, NodeKind::Symlink(_)) {
             let mut link_count = 0u32;
-            match self.follow_symlink(View::Virtual, parent, id, &mut link_count) {
+            match self.follow_symlink(View::Virtual, parent, id, &mut link_count, None) {
                 Ok(t) => t,
                 Err(libc::ENOENT) => {
                     let (p, n, _) = self.resolve_for_create(start, path)?;
@@ -1025,7 +1056,7 @@ impl Model {
                 None => return Err(libc::ENOENT),
             };
             if matches!(self.nodes[target].kind, NodeKind::Symlink(_)) {
-                target = self.follow_symlink(view, cur, target, link_count)?;
+                target = self.follow_symlink(view, cur, target, link_count, None)?;
             }
             match &self.nodes[target].kind {
                 NodeKind::Dir | NodeKind::Opaque => {}
@@ -1637,7 +1668,7 @@ impl Model {
                             cur
                         };
                         let mut link_count = 0u32;
-                        self.resolve_inner(view, base, &target, true, &mut link_count)
+                        self.resolve_inner(view, base, &target, true, &mut link_count, None)
                             .unwrap_or(id)
                     }
                     _ => id,
@@ -1948,6 +1979,44 @@ mod tests {
     fn resolve_ok(m: &Model, view: View, path: &[u8]) -> NodeId {
         m.resolve(view, Start::Root, path, true)
             .unwrap_or_else(|e| panic!("resolve({path:?}) failed: {e}"))
+    }
+
+    #[test]
+    fn resolve_traced_records_every_followed_symlink() {
+        let mut m = Model::new(Profile::MacShim { root: mac_root() });
+        m.add_fixture_dir(View::Virtual, b"/tmp/d");
+        let inner = m.add_fixture_symlink(View::Virtual, b"/tmp/inner", b"d".to_vec());
+        let outer = m.add_fixture_symlink(View::Virtual, b"/tmp/outer", b"inner".to_vec());
+        let dead = m.add_fixture_symlink(View::Virtual, b"/tmp/dead", b"nowhere".to_vec());
+        let mut crossed = Vec::new();
+        let n = m
+            .resolve_traced(
+                View::Virtual,
+                Start::Root,
+                b"/tmp/outer",
+                true,
+                &mut crossed,
+            )
+            .unwrap();
+        assert_eq!(n, resolve_ok(&m, View::Virtual, b"/tmp/d"));
+        // (`/tmp` itself is the first symlink followed on the macOS profile.)
+        assert_eq!(crossed[crossed.len() - 2..], [outer, inner]);
+        // Not followed when it is the final component and follow_last is off.
+        crossed.clear();
+        m.resolve_traced(
+            View::Virtual,
+            Start::Root,
+            b"/tmp/outer",
+            false,
+            &mut crossed,
+        )
+        .unwrap();
+        assert!(!crossed.contains(&outer));
+        // A link followed before an error is still recorded.
+        crossed.clear();
+        let r = m.resolve_traced(View::Virtual, Start::Root, b"/tmp/dead", true, &mut crossed);
+        assert_eq!(r, Err(libc::ENOENT));
+        assert_eq!(crossed.last(), Some(&dead));
     }
 
     #[test]

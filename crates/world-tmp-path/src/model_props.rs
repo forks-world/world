@@ -21,7 +21,11 @@
 //!   where `map`'s lexical result and the model's virtual-view resolution
 //!   are known to diverge. Off by default, so those cases neither run nor
 //!   fail; with the knob set, a divergence there is reported (`eprintln`),
-//!   not asserted, so the suite stays green either way.
+//!   not asserted, so the suite stays green either way. Only a mismatch whose
+//!   selected path actually crosses one of those escaping links (traced with
+//!   `Model::resolve_traced`, see `crosses_gap`) is downgraded; a mismatch on
+//!   any other path still fails. (Relative-path cases assume the cwd was not
+//!   reached through such a link; `base_virtual_path_strategy` has none.)
 use super::*;
 use proptest::prelude::*;
 use world_fsmodel::{Model, NodeId, Op, Profile, Start, View, errno_equiv};
@@ -148,7 +152,10 @@ fn tree_plan_strategy() -> impl Strategy<Value = TreePlan> {
         )
 }
 
-fn build_model(plan: &TreePlan) -> Model {
+/// The model plus the node ids of the escaping-link fixtures (the documented
+/// gap): `/tmp/escape`, and `/tmp/abs` when its target names a host temp root.
+fn build_model(plan: &TreePlan) -> (Model, Vec<NodeId>) {
+    let mut gap = Vec::new();
     let mut m = Model::new(Profile::MacShim {
         root: ROOT.to_vec(),
     });
@@ -165,7 +172,10 @@ fn build_model(plan: &TreePlan) -> Model {
         m.add_fixture_symlink(View::Virtual, b"/tmp/rel", t.clone());
     }
     if let Some(t) = &plan.abs_target {
-        m.add_fixture_symlink(View::Virtual, b"/tmp/abs", t.clone());
+        let id = m.add_fixture_symlink(View::Virtual, b"/tmp/abs", t.clone());
+        if under_host_temp_root(t) {
+            gap.push(id);
+        }
     }
     if plan.has_var_x {
         m.add_fixture_dir(View::Virtual, b"/var/tmp/x");
@@ -177,10 +187,28 @@ fn build_model(plan: &TreePlan) -> Model {
     if plan.escaping {
         // A relative symlink inside the private root that climbs above it:
         // documented as an escaping-links gap (see module docs).
-        m.add_fixture_symlink(View::Virtual, b"/tmp/escape", b"../../../outside".to_vec());
+        let id = m.add_fixture_symlink(View::Virtual, b"/tmp/escape", b"../../../outside".to_vec());
+        gap.push(id);
         m.add_fixture_dir(View::Physical, b"/Users/outside");
     }
-    m
+    (m, gap)
+}
+
+/// Whether resolving `path` virtually (and, when given, `effective`
+/// physically) follows any of the escaping-link nodes in `gap_ids`.
+fn crosses_gap(
+    model: &Model,
+    gap_ids: &[NodeId],
+    start: Start,
+    path: &[u8],
+    effective: Option<&[u8]>,
+) -> bool {
+    let mut crossed = Vec::new();
+    let _ = model.resolve_traced(View::Virtual, start, path, true, &mut crossed);
+    if let Some(eff) = effective {
+        let _ = model.resolve_traced(View::Physical, start, eff, true, &mut crossed);
+    }
+    crossed.iter().any(|id| gap_ids.contains(id))
 }
 
 /// A resolver backed by the model, mimicking the shim's use of the real
@@ -246,13 +274,14 @@ fn path_strategy(escaping: bool) -> impl Strategy<Value = Vec<u8>> {
 fn assert_matches_model(
     plan: &TreePlan,
     model: &Model,
+    gap_ids: &[NodeId],
     path: &[u8],
     start_view_both_sides: Start,
     mapped: Result<Option<usize>, i32>,
     out: &[u8],
 ) -> Result<(), TestCaseError> {
-    let report_or_fail = |msg: String| -> Result<(), TestCaseError> {
-        if plan.escaping {
+    let report_or_fail = |msg: String, crossed: bool| -> Result<(), TestCaseError> {
+        if plan.escaping && crossed {
             eprintln!("known escaping-link divergence (WORLD_FSMODEL_ESCAPING_LINKS=1): {msg}");
             Ok(())
         } else {
@@ -267,40 +296,59 @@ fn assert_matches_model(
             };
             let phys = model.resolve(View::Physical, start_view_both_sides, &effective, true);
             let virt = model.resolve(View::Virtual, start_view_both_sides, path, true);
+            let crossed = crosses_gap(
+                model,
+                gap_ids,
+                start_view_both_sides,
+                path,
+                Some(&effective),
+            );
             match (phys, virt) {
                 (Ok(p), Ok(v)) => {
                     if p != v {
-                        return report_or_fail(format!(
-                            "node mismatch for {:?} (effective {:?}): physical={p} virtual={v}",
-                            String::from_utf8_lossy(path),
-                            String::from_utf8_lossy(&effective)
-                        ));
+                        return report_or_fail(
+                            format!(
+                                "node mismatch for {:?} (effective {:?}): physical={p} virtual={v}",
+                                String::from_utf8_lossy(path),
+                                String::from_utf8_lossy(&effective)
+                            ),
+                            crossed,
+                        );
                     }
                     Ok(())
                 }
                 (Err(pe), Err(ve)) => {
                     if !errno_equiv(LINUX, pe, ve) {
-                        return report_or_fail(format!(
-                            "errno mismatch for {:?}: physical={pe} virtual={ve}",
-                            String::from_utf8_lossy(path)
-                        ));
+                        return report_or_fail(
+                            format!(
+                                "errno mismatch for {:?}: physical={pe} virtual={ve}",
+                                String::from_utf8_lossy(path)
+                            ),
+                            crossed,
+                        );
                     }
                     Ok(())
                 }
-                (pr, vr) => report_or_fail(format!(
-                    "one side succeeded, the other failed for {:?}: physical={pr:?} virtual={vr:?}",
-                    String::from_utf8_lossy(path)
-                )),
+                (pr, vr) => report_or_fail(
+                    format!(
+                        "one side succeeded, the other failed for {:?}: physical={pr:?} virtual={vr:?}",
+                        String::from_utf8_lossy(path)
+                    ),
+                    crossed,
+                ),
             }
         }
         Err(e) => {
             let virt = model.resolve(View::Virtual, start_view_both_sides, path, true);
             match virt {
                 Err(ve) if errno_equiv(LINUX, e, ve) => Ok(()),
-                other => report_or_fail(format!(
-                    "map_with failed ({e}) but virtual resolve gave {other:?} for {:?}",
-                    String::from_utf8_lossy(path)
-                )),
+                other => report_or_fail(
+                    format!(
+                        "map_with failed ({e}) but virtual resolve gave {other:?} for {:?}",
+                        String::from_utf8_lossy(path)
+                    ),
+                    crosses_gap(model, gap_ids, start_view_both_sides, path, None),
+                ),
             }
         }
     }
@@ -364,11 +412,11 @@ proptest! {
     /// virtual-view resolution (or fail with an equivalent errno).
     #[test]
     fn map_with_matches_model((plan, path) in plan_and_path_strategy()) {
-        let model = build_model(&plan);
+        let (model, gap) = build_model(&plan);
         let mut out = [0u8; PATH_MAX];
         let mut resolve = resolver_from_model(&model);
         let mapped = map_with(ROOT, &path, &mut out, &mut resolve);
-        assert_matches_model(&plan, &model, &path, Start::Root, mapped, &out)?;
+        assert_matches_model(&plan, &model, &gap, &path, Start::Root, mapped, &out)?;
     }
 
     /// Same, but resolved relative to a random cwd/dirfd base rather than
@@ -379,7 +427,7 @@ proptest! {
             (Just(plan), base_virtual_path_strategy(), relpath_strategy())
         }),
     ) {
-        let mut model = build_model(&plan);
+        let (mut model, gap) = build_model(&plan);
         // Resolve the chosen base in the *virtual* view (what a real chdir
         // into it would land on), matching `do_chdir`'s own resolution.
         let Ok(base_node): Result<NodeId, i32> =
@@ -408,7 +456,7 @@ proptest! {
         };
         let mut out = [0u8; PATH_MAX];
         let mapped = map_at_with(ROOT, &relpath, &mut out, base, &mut resolve);
-        assert_matches_model(&plan, &model, &relpath, Start::Cwd, mapped, &out)?;
+        assert_matches_model(&plan, &model, &gap, &relpath, Start::Cwd, mapped, &out)?;
     }
 
     /// `map_target` never calls the resolver, and when it does map a target,
@@ -634,5 +682,56 @@ proptest! {
             result.is_ok() || result == Err(libc::ELOOP) || result == Err(libc::ENAMETOOLONG),
             "unexpected result {result:?} for {path:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------
+// The known-gap suppression is limited to paths that cross a gap link.
+// ---------------------------------------------------------------------
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    fn escaping_plan() -> TreePlan {
+        TreePlan {
+            has_a: true,
+            has_a_b: false,
+            has_a_f: false,
+            rel_target: None,
+            abs_target: Some(b"/tmp/a".to_vec()),
+            has_var_x: false,
+            has_host_project: false,
+            escaping: true,
+        }
+    }
+
+    #[test]
+    fn crosses_gap_only_for_paths_through_an_escaping_link() {
+        let (m, gap) = build_model(&escaping_plan());
+        assert_eq!(gap.len(), 2);
+        for (path, want) in [
+            (&b"/tmp/a"[..], false),
+            (b"/etc/hosts", false),
+            (b"/tmp/escape/x", true),
+            (b"/tmp/abs/..", true),
+        ] {
+            assert_eq!(
+                crosses_gap(&m, &gap, Start::Root, path, Some(path)),
+                want,
+                "{}",
+                String::from_utf8_lossy(path)
+            );
+        }
+    }
+
+    #[test]
+    fn escaping_mode_still_fails_a_mismatch_on_an_ordinary_path() {
+        let plan = escaping_plan();
+        let (m, gap) = build_model(&plan);
+        let mut out = [0u8; PATH_MAX];
+        out[..10].copy_from_slice(b"/etc/hosts");
+        let r = assert_matches_model(&plan, &m, &gap, b"/tmp/a", Start::Root, Ok(Some(10)), &out);
+        assert!(r.is_err(), "a mismatch on /tmp/a must not be suppressed");
     }
 }
