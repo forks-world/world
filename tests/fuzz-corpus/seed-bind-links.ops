@@ -1,0 +1,42 @@
+# profile mac
+# seed 1
+# run-id fz-c0ffee0c
+# allow-escaping-links 0
+mkdir /tmp/fz-c0ffee0c 755
+mkdir /var/tmp/fz-c0ffee0c 755
+chdir /tmp/fz-c0ffee0c
+mkdir /tmp/fz-c0ffee0c/dd 755
+open /tmp/fz-c0ffee0c/f 100100
+close 3
+symlink target /tmp/fz-c0ffee0c/s
+symlink dd/t2 /tmp/fz-c0ffee0c/s2
+symlink nodir/t3 /tmp/fz-c0ffee0c/s3
+symlink f /tmp/fz-c0ffee0c/s4
+symlink s5b /tmp/fz-c0ffee0c/s5a
+symlink s5c /tmp/fz-c0ffee0c/s5b
+symlink loopb /tmp/fz-c0ffee0c/loopa
+symlink loopa /tmp/fz-c0ffee0c/loopb
+symlink f/x /tmp/fz-c0ffee0c/s6
+symlink /tmp/fz-c0ffee0c/dd/t7 /tmp/fz-c0ffee0c/abs
+symlink /var/tmp/fz-c0ffee0c/v /tmp/fz-c0ffee0c/cross
+bind s
+bind /tmp/fz-c0ffee0c/s2
+bind s3
+bind s4
+bind s5a
+bind loopa
+bind s6
+bind abs
+bind cross
+bind target
+bind s
+connect s
+connect s2
+connect dd/t2
+connect s5a
+connect abs
+connect cross
+lstat /tmp/fz-c0ffee0c/s
+list /tmp/fz-c0ffee0c
+list /tmp/fz-c0ffee0c/dd
+list /var/tmp/fz-c0ffee0c

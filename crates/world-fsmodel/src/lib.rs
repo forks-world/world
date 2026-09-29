@@ -1629,6 +1629,28 @@ impl Model {
                 if name.len() >= self.sun_path_cap() {
                     return errout(libc::ENAMETOOLONG);
                 }
+                // macOS follows a final symlink (and a dangling chain) and
+                // creates the socket at the chain's end (measured on 27:
+                // missing target parent ENOENT, a loop ELOOP, through a file
+                // ENOTDIR, onto an existing node EADDRINUSE). Linux never
+                // follows: any existing name is EADDRINUSE.
+                let (parent, key) = match self.nodes[parent].children.get(&key) {
+                    Some(&id)
+                        if self.is_mac() && matches!(self.nodes[id].kind, NodeKind::Symlink(_)) =>
+                    {
+                        match self.resolve_for_create(Start::Cwd, path) {
+                            Ok((p, n, _)) => (p, self.key(&n)),
+                            // The chain ends at an existing node.
+                            Err(libc::EEXIST) => return errout(libc::EADDRINUSE),
+                            Err(e) => return errout(e),
+                        }
+                    }
+                    _ => (parent, key),
+                };
+                match &self.nodes[parent].kind {
+                    NodeKind::Dir | NodeKind::Opaque => {}
+                    _ => return errout(libc::ENOTDIR),
+                }
                 if self.nodes[parent].children.contains_key(&key) {
                     return errout(libc::EADDRINUSE);
                 }
@@ -3109,6 +3131,80 @@ mod tests {
             assert_eq!(m.apply(&Op::Bind { path: over }).errno, libc::ENAMETOOLONG);
             assert_eq!(m.apply(&Op::Bind { path: fits.clone() }).errno, 0);
             assert_eq!(m.apply(&Op::Bind { path: fits }).errno, libc::EADDRINUSE);
+        }
+    }
+
+    /// macOS `bind` follows a final symlink and creates the socket at a
+    /// dangling chain's end; Linux answers EADDRINUSE for any existing name
+    /// (both measured).
+    #[test]
+    fn bind_through_a_final_symlink() {
+        for profile in [
+            Profile::MacShim { root: mac_root() },
+            Profile::LinuxMount { root: linux_root() },
+        ] {
+            let mac = matches!(profile, Profile::MacShim { .. });
+            let mut m = Model::new(profile);
+            m.add_fixture_dir(View::Virtual, b"/tmp/dd");
+            m.add_fixture_file(View::Virtual, b"/tmp/f", Vec::new());
+            let links: &[(&[u8], &[u8])] = &[
+                (b"s", b"target"),
+                (b"s2", b"dd/t2"),
+                (b"s3", b"nodir/t3"),
+                (b"s4", b"f"),
+                (b"s5a", b"s5b"),
+                (b"s5b", b"s5c"),
+                (b"loopa", b"loopb"),
+                (b"loopb", b"loopa"),
+                (b"s6", b"f/x"),
+                (b"abs", b"/tmp/dd/t7"),
+            ];
+            for (name, target) in links {
+                m.add_fixture_symlink(View::Virtual, &join(b"/tmp", name), target.to_vec());
+            }
+            let mut bind = |p: &[u8]| {
+                m.apply(&Op::Bind {
+                    path: join(b"/tmp", p),
+                })
+                .errno
+            };
+            let want: &[(&[u8], i32, i32)] = &[
+                (b"s", 0, libc::EADDRINUSE),
+                (b"s2", 0, libc::EADDRINUSE),
+                (b"s3", libc::ENOENT, libc::EADDRINUSE),
+                (b"s4", libc::EADDRINUSE, libc::EADDRINUSE),
+                (b"s5a", 0, libc::EADDRINUSE),
+                (b"loopa", libc::ELOOP, libc::EADDRINUSE),
+                (b"s6", libc::ENOTDIR, libc::EADDRINUSE),
+                (b"abs", 0, libc::EADDRINUSE),
+                // The socket now sits at the first link's target.
+                (b"target", libc::EADDRINUSE, 0),
+                (b"s", libc::EADDRINUSE, libc::EADDRINUSE),
+            ];
+            for &(p, on_mac, on_linux) in want {
+                let want = if mac { on_mac } else { on_linux };
+                assert_eq!(
+                    bind(p),
+                    want,
+                    "mac={mac} bind {}",
+                    String::from_utf8_lossy(p)
+                );
+            }
+            // Final symlinks not followed (the last argument).
+            let kind = |m: &Model, p: &[u8]| {
+                m.resolve(View::Virtual, Start::Root, p, false)
+                    .ok()
+                    .map(|id| m.nodes[id].kind.clone())
+            };
+            for p in [&b"/tmp/dd/t2"[..], b"/tmp/s5c", b"/tmp/dd/t7"] {
+                assert_eq!(
+                    kind(&m, p).map(|k| matches!(k, NodeKind::Socket)),
+                    if mac { Some(true) } else { None },
+                    "mac={mac} {}",
+                    String::from_utf8_lossy(p)
+                );
+            }
+            assert!(matches!(kind(&m, b"/tmp/s"), Some(NodeKind::Symlink(_))));
         }
     }
 

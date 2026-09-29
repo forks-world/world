@@ -93,7 +93,7 @@ WORLD_STRESS=1 WORLD_STRESS_SCALE=4 python3 -m unittest tests.test_stress -v
        target/debug/examples/fuzz_driver replay <artifact-file>
      ```
 
-     `minimize` 同样要带这套环境前缀（把 `replay` 换成 `minimize`）。测试在 macOS 上失败时已自动做过一次最小化，产物在 `target/fuzz-artifacts`。
+     `minimize` 同样要带这套环境前缀（把 `replay` 换成 `minimize`）。最小化只接受“同一个”失败：发散的命令、细节类别（第一个 `:` 之前的文字，run id 归一化），以及模型/真实两侧具体的 errno 和返回值正负都必须一致；读出的数据、路径和目录树内容不参与比较。测试在 macOS 上失败时已自动做过一次最小化，产物在 `target/fuzz-artifacts`。
    - Linux（`world exec`，`LinuxFuzz` / `PrivilegedExecFuzz`）：
 
      ```sh

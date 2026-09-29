@@ -11,10 +11,14 @@ use std::time::{Duration, Instant};
 use crate::{fresh_run_id, parse_ops_file};
 
 /// The shape of a divergence, used so minimization keeps reproducing the
-/// *same* kind of failure instead of drifting to some unrelated one (e.g.
-/// "the sandbox root doesn't exist any more"): the diverging op's command
-/// word plus the first words of its detail message, or "tree" for a final
-/// tree mismatch.
+/// *same* failure instead of drifting to some unrelated one (e.g. "the
+/// sandbox root doesn't exist any more", or the same op now failing with a
+/// different errno): the diverging op's command word ("tree" for a final
+/// tree mismatch), the detail's category (the text before its first `:`,
+/// with the replay's own run id normalized away, since every attempt uses a
+/// fresh one), and the concrete model/real errno and return-sign pairs.
+/// Data payloads (read bytes, paths, tree dumps) are left out: removing
+/// unrelated ops may legitimately change them.
 fn signature(stdout: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(stdout.lines().next()?).ok()?;
     let d = v.get("first_divergence")?;
@@ -27,8 +31,22 @@ fn signature(stdout: &str) -> Option<String> {
         .and_then(|o| o.split(' ').next())
         .unwrap_or("tree");
     let detail = d.get("detail").and_then(|x| x.as_str()).unwrap_or("");
-    let head: Vec<&str> = detail.split(' ').take(2).collect();
-    Some(format!("{op}|{}", head.join(" ")))
+    let mut category = detail.split(':').next().unwrap_or("").to_string();
+    if let Some(run_id) = v.get("run_id").and_then(|r| r.as_str())
+        && !run_id.is_empty()
+    {
+        category = category.replace(run_id, "<run>");
+    }
+    let field = |k: &str| d.get(k).and_then(|x| x.as_i64());
+    let sign = |r: Option<i64>| r.map(|r| if r < 0 { "-" } else { "+" }).unwrap_or("?");
+    let errno = |e: Option<i64>| e.map(|e| e.to_string()).unwrap_or_else(|| "?".to_string());
+    Some(format!(
+        "{op}|{category}|model={}{} real={}{}",
+        sign(field("model_ret")),
+        errno(field("model_errno")),
+        sign(field("real_ret")),
+        errno(field("real_errno")),
+    ))
 }
 
 /// Best-effort removal of a (killed) replay's sandbox roots, through the same
@@ -241,4 +259,85 @@ fn tempdir() -> std::io::Result<std::path::PathBuf> {
     let base = std::env::temp_dir().join(format!("fuzz-driver-ddmin-{}", std::process::id()));
     std::fs::create_dir_all(&base)?;
     Ok(base)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signature;
+
+    fn out(run_id: &str, divergence: serde_json::Value) -> String {
+        serde_json::json!({ "run_id": run_id, "result": "diverge", "first_divergence": divergence })
+            .to_string()
+    }
+
+    fn errno_div(op: &str, model: i64, real: i64) -> serde_json::Value {
+        serde_json::json!({
+            "op": op,
+            "detail": format!("errno mismatch: model={model} real={real}"),
+            "model_ret": -1, "model_errno": model,
+            "real_ret": if real == 0 { 0 } else { -1 }, "real_errno": real,
+        })
+    }
+
+    #[test]
+    fn errno_pairs_are_part_of_the_signature() {
+        let a = signature(&out(
+            "fz-00000001",
+            errno_div("open /tmp/fz-00000001/x 100100", 2, 0),
+        ));
+        let same = signature(&out(
+            "fz-00000002",
+            errno_div("open /tmp/fz-00000002/y 000000", 2, 0),
+        ));
+        let other = signature(&out(
+            "fz-00000003",
+            errno_div("open /tmp/fz-00000003/x 100100", 20, 0),
+        ));
+        let swapped = signature(&out(
+            "fz-00000004",
+            errno_div("open /tmp/fz-00000004/x 100100", 2, 13),
+        ));
+        assert!(a.is_some());
+        assert_eq!(a, same);
+        assert_ne!(a, other);
+        assert_ne!(a, swapped);
+    }
+
+    #[test]
+    fn tree_mismatches_ignore_the_run_id_and_dump_but_keep_the_root() {
+        let tree = |rid: &str, root: &str, dump: &str| {
+            out(
+                rid,
+                serde_json::json!({
+                    "detail": format!("final tree mismatch under /{root}/{rid}: model=[{dump}] real=[]"),
+                }),
+            )
+        };
+        let a = signature(&tree("fz-00000001", "tmp", "a"));
+        assert_eq!(a, signature(&tree("fz-00000002", "tmp", "b, c")));
+        assert_ne!(a, signature(&tree("fz-00000003", "var/tmp", "a")));
+        assert!(
+            a.unwrap()
+                .starts_with("tree|final tree mismatch under /tmp/<run>|")
+        );
+    }
+
+    #[test]
+    fn data_mismatches_ignore_the_payload() {
+        let data = |bytes: &str| {
+            out(
+                "fz-00000001",
+                serde_json::json!({
+                    "op": "read 3 8",
+                    "detail": format!("data mismatch: real={bytes:?} model=\"\""),
+                    "model_ret": 0, "model_errno": 0, "real_ret": 2, "real_errno": 0,
+                }),
+            )
+        };
+        assert_eq!(signature(&data("ab")), signature(&data("abcdef")));
+        assert_eq!(
+            signature(&out("fz-00000001", serde_json::Value::Null)),
+            None
+        );
+    }
 }
