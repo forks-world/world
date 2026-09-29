@@ -1,0 +1,51 @@
+# profile linux
+# seed 7
+# run-id fz-c0ffee02
+# allow-escaping-links 0
+mkdir /tmp/fz-c0ffee02 755
+mkdir /var/tmp/fz-c0ffee02 755
+chdir /tmp/fz-c0ffee02
+mkdir /var/../tmp/fz-c0ffee02/s 755
+mkdir /tmp/fz-c0ffee02/84 755
+mkdir /tmp/fz-c0ffee02/q4es 755
+mkdir /tmp/fz-c0ffee02/84/qh 755
+mkdir /tmp/fz-c0ffee02/84/qh/ft 755
+mkdir /tmp/fz-c0ffee02/84/qh/ft/v 755
+mkdir /tmp/fz-c0ffee02/84/qh/ft/v/p13 755
+mkdir /tmp/fz-c0ffee02/84/qh/ft/v/p13/6 755
+mkdir /tmp/fz-c0ffee02/84/qh/ft/v/p13/6/s 755
+open /tmp/fz-c0ffee02/84/qh/uvht 100100
+open /var/tmp/fz-c0ffee02/2i 100100
+symlink uvht /tmp/fz-c0ffee02/84/qh/4s6s
+symlink 4s6s /tmp/fz-c0ffee02/84/qh/cct
+symlink cct /tmp/fz-c0ffee02/84/qh/s5c4
+symlink s5c4 /tmp/fz-c0ffee02/84/qh/g8a
+symlink g8a /tmp/fz-c0ffee02/84/qh/1j
+symlink yr /var/tmp/fz-c0ffee02/okre
+symlink okre /var/tmp/fz-c0ffee02/yr
+mkdir /var/tmp/fz-c0ffee02/22d 755
+close 3
+read 4 6
+open ./84 000000
+openat 9977 ol 110100
+opendir .
+write 5 abc
+lstat ./84/qh/ft/v/p13/6/s
+mkdir 84/qh/ft/v/p13/6/k 755
+readlink /tmp/fz-c0ffee02/84/qh/s5c4
+symlink /var/tmp/fz-c0ffee02/22d /var/../tmp/fz-c0ffee02/84/qh/ft/v/fz-c0ffee02
+getcwd
+symlink /tmp/fz-c0ffee02/84/qh/g8a /tmp/fz-c0ffee02/84/qh/ft/v/q
+opendir /tmp/fz-c0ffee02
+list /tmp/fz-c0ffee02
+rename 84/../84/qh/g8a ./84/qh/ft/h
+mkdirat 9178 s
+opendir 84/qh/ft/v/p13/6
+unlink /tmp/fz-c0ffee02/84/qh/4s6s
+openat 6 cugy 100100
+bind /tmp/fz-c0ffee02/84/qh/ft/v/p13/6/s/2
+read 4 16
+close 5
+list ./84/qh/ft/v
+open /var/../tmp/fz-c0ffee02/84/qh/ft/5 101100
+bind 84/../84/qh/u

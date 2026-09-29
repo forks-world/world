@@ -1,0 +1,14 @@
+# profile linux
+# seed 22
+# run-id fz-c0ffee06
+# allow-escaping-links 0
+mkdir /tmp/fz-c0ffee06 755
+mkdir /var/tmp/fz-c0ffee06 755
+chdir /tmp/fz-c0ffee06
+mkdir /tmp/fz-c0ffee06/d 755
+symlink lb /tmp/fz-c0ffee06/la
+symlink la /tmp/fz-c0ffee06/lb
+rename /tmp/fz-c0ffee06/la/ /tmp/fz-c0ffee06/y
+rmdir /tmp/fz-c0ffee06/la/
+rename /tmp/fz-c0ffee06/d /tmp/fz-c0ffee06/la/
+mkdir /tmp/fz-c0ffee06/lb/ 755

@@ -1,0 +1,22 @@
+# profile linux
+# seed 7
+# run-id fz-c0ffee08
+# allow-escaping-links 0
+mkdir /tmp/fz-c0ffee08 755
+mkdir /var/tmp/fz-c0ffee08 755
+chdir /tmp/fz-c0ffee08
+mkdir /tmp/fz-c0ffee08/d 755
+open /tmp/fz-c0ffee08/f 100100
+write 3 hello
+close 3
+open /tmp/fz-c0ffee08/f 001000
+read 4 8
+write 4 x
+close 4
+open /tmp/fz-c0ffee08/d 001000
+symlink  /tmp/fz-c0ffee08/emptylink
+readlink /tmp/fz-c0ffee08/emptylink
+stat /tmp/fz-c0ffee08/emptylink
+mkstemp aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+mkdir /tmp/fz-c0ffee08/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 755
+list /tmp/fz-c0ffee08

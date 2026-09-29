@@ -1,0 +1,18 @@
+# profile linux
+# seed 21
+# run-id fz-c0ffee05
+# allow-escaping-links 0
+mkdir /tmp/fz-c0ffee05 755
+mkdir /var/tmp/fz-c0ffee05 755
+chdir /tmp/fz-c0ffee05
+open /var/tmp/fz-c0ffee05/f 100100
+write 3 hello
+mkdir /var/tmp/fz-c0ffee05/d 755
+symlink f /var/tmp/fz-c0ffee05/l
+symlink /tmp/fz-c0ffee05/d /var/tmp/fz-c0ffee05/abs
+open /tmp/fz-c0ffee05/g 100100
+mkdir /tmp/fz-c0ffee05/m 755
+rename /var/tmp/fz-c0ffee05/f /tmp/fz-c0ffee05/f2
+rename /tmp/fz-c0ffee05/g /var/tmp/fz-c0ffee05/d/g2
+rename /var/tmp/fz-c0ffee05/d /tmp/fz-c0ffee05/d2
+rename /tmp/fz-c0ffee05/m /var/tmp/fz-c0ffee05/m2

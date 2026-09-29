@@ -104,7 +104,7 @@ WORLD_STRESS=1 WORLD_STRESS_SCALE=4 python3 -m unittest tests.test_stress -v
 
    直接运行 `fuzz_driver replay <artifact-file>`（不带上述环境或 `world exec`）是原生执行、没有任何重定向，只适合调试 harness 本身或守卫逻辑，不能复现 shim 或 namespace 里的分歧。
 3. Layer 1 的 proptest 失败会在 `crates/world-tmp-path/proptest-regressions/` 生成回归文件，直接提交进仓库即可保证之后不再回归。
-4. 长期有价值的 Layer 2 失败序列可以整理进 `tests/fuzz-corpus/`，作为固定回归语料，每次运行都会重放，不依赖随机种子命中。
+4. 长期有价值的 Layer 2 失败序列可以整理进固定回归语料，每次运行都会重放，不依赖随机种子命中。语料按 profile 分开：`tests/fuzz-corpus/*.ops` 是 `# profile mac`，由 `ShimFuzz` 经 shim 重放；`tests/fuzz-corpus/linux/*.ops` 是 `# profile linux`，由 `LinuxFuzz` 经 `world exec` 在 namespace 后端重放。文件头的 profile 必须与所在目录一致（`CorpusLayout` 检查）。Linux 语料是同一批场景去掉 `/private` 拼写、并把 `connect`/`bind` 名字长度改为跨越 Linux 的 `sun_path` 上限（108 字节）；生成器不产生的失败用例（如 `connect` 的各种 errno）靠这两份语料覆盖。
 
 ## CI
 

@@ -35,6 +35,9 @@ FUZZ_DRIVER = ROOT / "target/debug/examples/fuzz_driver"
 MACOS = sys.platform == "darwin"
 LINUX = sys.platform.startswith("linux")
 CORPUS = pathlib.Path(__file__).resolve().parent / "fuzz-corpus"
+# Replay seeds per profile: macOS seeds at the top level, Linux seeds (the
+# same scenarios with Linux spellings and sun_path limits) under linux/.
+CORPUS_DIRS = {"mac": CORPUS, "linux": CORPUS / "linux"}
 DEFAULT_SEEDS = [1, 2, 3, 4, 5, 6, 7, 8]
 RUN_TIMEOUT = 30
 
@@ -303,6 +306,17 @@ def env_prefix(env):
     return " ".join(f"{k}={env[k]}" for k in keys if env.get(k))
 
 
+def corpus_files(profile):
+    """The replay seeds for `profile`, each checked to declare that profile
+    in its header (the driver replays with the header's profile)."""
+    files = sorted(CORPUS_DIRS[profile].glob("*.ops"))
+    for f in files:
+        first = f.read_text().splitlines()[0]
+        if first != f"# profile {profile}":
+            raise AssertionError(f"{f}: expected '# profile {profile}' header, got {first!r}")
+    return files
+
+
 def report_failure(env, profile, seed, run_id, ops_file, result, phase, replay_prefix=None, note=None):
     """Save ops file, a minimized version, stdout/stderr under
     WORLD_FUZZ_ARTIFACTS; return a message with a copy-pasteable replay."""
@@ -557,6 +571,20 @@ class GuardProbes(unittest.TestCase):
             self.assertFalse(os.path.lexists(os.path.join(base, victim + "-link")), base)
 
 
+class CorpusLayout(unittest.TestCase):
+    """Each profile has its own replay seeds, headed with that profile (pure,
+    no driver)."""
+
+    def test_every_profile_has_seeds_with_matching_headers(self):
+        for profile in CORPUS_DIRS:
+            with self.subTest(profile=profile):
+                self.assertTrue(corpus_files(profile), f"no {profile} corpus files")
+
+    def test_linux_seeds_use_no_macos_spellings(self):
+        for f in corpus_files("linux"):
+            self.assertNotIn("/private/", f.read_text(), f.name)
+
+
 class CheckTrees(unittest.TestCase):
     """`check_trees` compares *both* sandbox roots (pure, no driver)."""
 
@@ -645,7 +673,7 @@ class ShimFuzz(HostTempGuard, unittest.TestCase):
         self.assertGreater(tried, 0)
 
     def test_corpus_replay(self):
-        files = sorted(CORPUS.glob("*.ops"))
+        files = corpus_files("mac")
         if not files:
             self.skipTest("no corpus files")
         for ops_file in files:
@@ -776,6 +804,24 @@ class LinuxFuzz(ExecFuzzMixin, unittest.TestCase):
 
     def test_linux_matches_model_across_seeds(self):
         self.fuzz_loop("linux")
+
+    def test_corpus_replay(self):
+        """Replay the fixed Linux seeds through the namespace backend: they
+        carry the failure cases (connect/bind errnos, trailing slashes, dead
+        cwd, edge names) the generator does not emit."""
+        files = corpus_files("linux")
+        self.assertTrue(files, "the Linux corpus must not be empty")
+        troot = self.temp_root()
+        for ops_file in files:
+            with self.subTest(file=ops_file.name):
+                run_id = fresh_run_id()
+                try:
+                    result = run_timeout(self.command("replay", ops_file, "--run-id", run_id, "--keep"), RUN_TIMEOUT + 60)
+                    self.assertEqual(result.returncode, 0, f"{ops_file.name}: {result.stdout} {result.stderr}")
+                    check_trees(troot, run_id, json.loads(result.stdout), False)
+                finally:
+                    owned_rmtree(troot / "tmp" / run_id, troot)
+                    owned_rmtree(troot / "var/tmp" / run_id, troot)
 
 
 @unittest.skipUnless(MACOS and os.environ.get("WORLD_SILO_INTEGRATION") == "1", "requires WORLD_SILO_INTEGRATION=1 (real loopback alias)")

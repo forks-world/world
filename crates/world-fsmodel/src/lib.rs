@@ -2062,19 +2062,28 @@ impl OpenFlags {
         .collect()
     }
 
+    /// Parse exactly six `0`/`1` characters. Any other character rejects
+    /// the whole field, so a malformed replay line never silently runs a
+    /// different open.
     fn from_flag_str(s: &str) -> Option<OpenFlags> {
-        let chars: Vec<char> = s.chars().collect();
-        if chars.len() != 6 {
+        let bits = s
+            .chars()
+            .map(|c| match c {
+                '0' => Some(false),
+                '1' => Some(true),
+                _ => None,
+            })
+            .collect::<Option<Vec<bool>>>()?;
+        let [create, excl, trunc, write, directory, nofollow] = bits[..] else {
             return None;
-        }
-        let f = |c: char| c == '1';
+        };
         Some(OpenFlags {
-            create: f(chars[0]),
-            excl: f(chars[1]),
-            trunc: f(chars[2]),
-            write: f(chars[3]),
-            directory: f(chars[4]),
-            nofollow: f(chars[5]),
+            create,
+            excl,
+            trunc,
+            write,
+            directory,
+            nofollow,
         })
     }
 }
@@ -3638,6 +3647,38 @@ mod tests {
             let back = Op::from_line(&line).unwrap_or_else(|| panic!("failed to parse {line:?}"));
             assert_eq!(back, op, "round trip for {line:?}");
         }
+    }
+
+    #[test]
+    fn open_flag_strings_must_be_six_binary_digits() {
+        let all = OpenFlags {
+            create: true,
+            excl: true,
+            trunc: true,
+            write: true,
+            directory: true,
+            nofollow: true,
+        };
+        assert_eq!(OpenFlags::from_flag_str("111111"), Some(all));
+        assert_eq!(
+            OpenFlags::from_flag_str("000000"),
+            Some(OpenFlags::default())
+        );
+        for bad in [
+            "1x0100", "10010", "1001000", "", "2000000", "10 100", "１00100",
+        ] {
+            assert_eq!(OpenFlags::from_flag_str(bad), None, "{bad:?}");
+        }
+        for line in [
+            "open /tmp/p 1x0100",
+            "open /tmp/p 10010",
+            "openat 3 p 10010a",
+            "openat 3 p 1001001",
+        ] {
+            assert_eq!(Op::from_line(line), None, "{line:?}");
+        }
+        assert!(Op::from_line("open /tmp/p 100100").is_some());
+        assert!(Op::from_line("openat 3 p 100100").is_some());
     }
 
     #[test]

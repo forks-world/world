@@ -1,0 +1,22 @@
+# profile linux
+# seed 1
+# run-id fz-c0ffee09
+# allow-escaping-links 0
+mkdir /tmp/fz-c0ffee09 755
+mkdir /var/tmp/fz-c0ffee09 755
+chdir /tmp/fz-c0ffee09
+mkdir /tmp/fz-c0ffee09/d 755
+open /tmp/fz-c0ffee09/f 100100
+symlink d /tmp/fz-c0ffee09/ld
+symlink f /tmp/fz-c0ffee09/lf
+symlink nowhere /tmp/fz-c0ffee09/dl
+open ld 000011
+open lf 000011
+open dl 000011
+open ld 000111
+open ld 000001
+open new 100010
+open nope/x 100010
+open f/x 100010
+openat 999 x 100010
+openat 3 x 100010

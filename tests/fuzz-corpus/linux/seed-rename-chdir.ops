@@ -1,0 +1,48 @@
+# profile linux
+# seed 12
+# run-id fz-c0ffee03
+# allow-escaping-links 0
+mkdir /tmp/fz-c0ffee03 755
+mkdir /var/tmp/fz-c0ffee03 755
+chdir /tmp/fz-c0ffee03
+mkdir /tmp/fz-c0ffee03/0vw6 755
+mkdir /tmp/fz-c0ffee03/yuq 755
+mkdir /tmp/fz-c0ffee03/d58 755
+mkdir /tmp/fz-c0ffee03/d58/y 755
+mkdir /tmp/fz-c0ffee03/d58/y/0r1 755
+open /tmp/fz-c0ffee03/d58/y/g 100100
+open /tmp/fz-c0ffee03/0vw6/f 100100
+symlink g /tmp/fz-c0ffee03/d58/y/f
+symlink 2o /var/tmp/fz-c0ffee03/vz
+symlink vz /var/tmp/fz-c0ffee03/2o
+mkdir /var/tmp/fz-c0ffee03/w1d 755
+open /tmp/fz-c0ffee03/yuq 000100
+symlink w1d /tmp/../var/tmp/fz-c0ffee03/w7m
+bind /var/tmp/fz-c0ffee03/hoby
+write 3 ab
+stat /tmp/fz-c0ffee03/yuq
+bind /tmp/fz-c0ffee03/yuq/t
+getcwd
+mkdir d58/26iv 755
+mkdir d58/../vz 755
+rmdir d58/y/0r1
+symlink d58 /tmp/fz-c0ffee03/5p
+read 3 17
+stat /tmp/fz-c0ffee03/d58/y/f
+stat /tmp/../var/tmp/fz-c0ffee03/2o
+openat 9869 kvc 100100
+open ./yuq/rm9 110100
+unlinkat 9360 bgx false
+rmdir /tmp/fz-c0ffee03/d58/26iv
+readlink ./5p
+unlink ./5p
+lstat ./d58/y/f
+unlink d58/../yuq/rm9
+rmdir vz/../yuq
+bind /var/tmp/fz-c0ffee03/68e0
+getcwd
+mkdir yuq/f 755
+mkdirat 9620 9
+rmdir /var/tmp/fz-c0ffee03/w1d
+opendir 0vw6
+stat /var/tmp/fz-c0ffee03/vz
