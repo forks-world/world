@@ -61,7 +61,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use world_fsmodel::{Op, OpenFlags, Outcome, Start, at_start};
+use world_fsmodel::{Op, OpenFlags, Outcome, Start, at_start, is_root_operand};
 
 /// A real, open resource kept alive under the *model's* fd number (never the
 /// real OS fd number, which is purely an implementation detail here).
@@ -151,6 +151,12 @@ fn cstr(bytes: &[u8]) -> Result<CString, i32> {
 /// original spelling back (`literal`): a trailing slash changes what
 /// unlink/rmdir/rename/symlink/bind/O_EXCL do (the model implements the
 /// per-profile rules).
+///
+/// A path of only slashes is `EINVAL` here: this is a sentinel for internal
+/// callers (the symlink chase, `check_final_link`), not the answer for an
+/// operand. Operand-level root handling lives in `root_refusal` (layer 1,
+/// `apply_real`) and `guarded_parent` (layer 2): a mutating call on the root
+/// is refused as `Harness`, never run.
 fn split_parent_name(path: &[u8]) -> Result<(Vec<u8>, Vec<u8>, bool), i32> {
     // POSIX: an empty pathname is ENOENT; `/` has no final component to name.
     if path.is_empty() {
@@ -284,6 +290,13 @@ fn guarded_parent(
     start: Start,
     path: &[u8],
 ) -> ExecResult<(OwnedFd, Vec<u8>, bool)> {
+    // Layer 2 (layer 1 is `root_refusal` in `apply_real`): the root has no
+    // parent inside the sandbox, so a mutating call on it is never run.
+    if is_root_operand(path) {
+        return Err(ExecError::Harness(
+            "refusing a mutating call on the root directory: outside the sandbox".to_string(),
+        ));
+    }
     // An invalid start fd can never resolve to anything: that is an
     // ordinary EBADF/ENOTDIR outcome, not a safety refusal.
     // The kernel rejects a whole path of PATH_MAX bytes or more; the
@@ -755,6 +768,9 @@ pub fn apply_real(state: &mut RealState, op: &Op) -> ExecResult<Applied> {
     if op.path_operands().iter().any(|p| p.contains(&0)) {
         return Err(ExecError::Harness("operand contains NUL".to_string()));
     }
+    if let Some(why) = root_refusal(op) {
+        return Err(ExecError::Harness(why));
+    }
     match op {
         Op::Mkdir { path, mode } => mkdir_like(state, Start::Cwd, path, *mode),
         Op::MkdirAt { dirfd, path } => mkdir_like(state, at_start(*dirfd, path), path, 0o755),
@@ -791,6 +807,34 @@ pub fn apply_real(state: &mut RealState, op: &Op) -> ExecResult<Applied> {
         Op::MkstempAdopt { name } => mkstemp_like(state, name),
         Op::List { path } => Ok(plain(list_like(state, path)?)),
     }
+}
+
+/// Layer 1 of the root-operand guard: `Some(reason)` when `op` would mutate
+/// (or, on non-macOS, connect to) the root directory, which is outside the
+/// sandbox. Pure: it inspects the op only, so it can be tested without any
+/// syscall. macOS `connect` on the root is allowed: it always fails
+/// ENOTSOCK and mutates nothing (`connect_like` runs it from `root_fd`);
+/// on Linux the answer depends on privileges the model cannot predict.
+fn root_refusal(op: &Op) -> Option<String> {
+    let (cmd, hit) = match op {
+        Op::Mkdir { path, .. } => ("mkdir", is_root_operand(path)),
+        Op::MkdirAt { path, .. } => ("mkdirat", is_root_operand(path)),
+        Op::Open { path, flags } => ("open", open_mutates(flags) && is_root_operand(path)),
+        Op::OpenAt { path, flags, .. } => ("openat", open_mutates(flags) && is_root_operand(path)),
+        // Only the link path is written; the target is just data.
+        Op::Symlink { path, .. } => ("symlink", is_root_operand(path)),
+        Op::Rename { from, to } => ("rename", is_root_operand(from) || is_root_operand(to)),
+        Op::Unlink { path } => ("unlink", is_root_operand(path)),
+        Op::Rmdir { path } => ("rmdir", is_root_operand(path)),
+        Op::UnlinkAt { path, .. } => ("unlinkat", is_root_operand(path)),
+        Op::Bind { path } => ("bind", is_root_operand(path)),
+        Op::Connect { path } => (
+            "connect",
+            cfg!(not(target_os = "macos")) && is_root_operand(path),
+        ),
+        _ => return None,
+    };
+    hit.then(|| format!("refusing {cmd} on the root directory: outside the sandbox"))
 }
 
 fn mkdir_like(state: &mut RealState, start: Start, path: &[u8], mode: u32) -> ExecResult<Applied> {
@@ -1350,6 +1394,16 @@ fn connect_like(state: &mut RealState, path: &[u8]) -> ExecResult<Outcome> {
     // listener outside the sandbox, so it gets the same guard as `bind`: the
     // parent must be inside the sandbox and the final link chain is walked.
     // The child then `fchdir`s into the checked fd and uses the bare name.
+    if is_root_operand(path) {
+        // Only reachable on macOS (`root_refusal` refuses it elsewhere): `/`
+        // is never a socket, so this fails ENOTSOCK and changes nothing.
+        if cfg!(target_os = "macos") {
+            return in_virtual_cwd(state.root_fd.as_raw_fd(), &CwdQuery::Connect(path.to_vec()));
+        }
+        return Err(ExecError::Harness(
+            "refusing connect on the root directory: outside the sandbox".to_string(),
+        ));
+    }
     let (parent, name, trailing) = guarded_parent(state, Start::Cwd, path)?;
     check_final_link(state, parent.as_raw_fd(), &name)?;
     in_virtual_cwd(
@@ -2205,6 +2259,221 @@ mod trailing_slash_guard_tests {
         };
         let a = open_like(&mut f.state, Start::Cwd, &p, &n).map(|a| a.outcome);
         assert_eq!(errno_of(a), libc::ELOOP);
+        victim_untouched(&f);
+    }
+
+    // ---- root operands -------------------------------------------------
+    //
+    // SAFETY OF THESE TESTS: they must never be able to run a mutating
+    // syscall on "/" even if the refusal were broken. Every test asserts on
+    // the pure predicate (`root_refusal`) or on `guarded_parent` (which
+    // returns before any syscall) FIRST, and only calls `apply_real` for an
+    // op whose `root_refusal` is `Some` (otherwise it panics instead).
+
+    const ROOTS: [&[u8]; 3] = [b"/", b"//", b"///"];
+
+    fn mutating_root_ops(root: &[u8]) -> Vec<Op> {
+        let r = || root.to_vec();
+        let flags = |create, excl, write, trunc| OpenFlags {
+            create,
+            excl,
+            write,
+            trunc,
+            ..OpenFlags::default()
+        };
+        vec![
+            Op::Mkdir {
+                path: r(),
+                mode: 0o755,
+            },
+            Op::MkdirAt {
+                dirfd: 3,
+                path: r(),
+            },
+            Op::Open {
+                path: r(),
+                flags: flags(true, false, false, false),
+            },
+            Op::Open {
+                path: r(),
+                flags: flags(true, true, true, false),
+            },
+            Op::Open {
+                path: r(),
+                flags: flags(false, false, true, false),
+            },
+            Op::Open {
+                path: r(),
+                flags: flags(false, false, false, true),
+            },
+            Op::OpenAt {
+                dirfd: 3,
+                path: r(),
+                flags: flags(true, false, false, false),
+            },
+            Op::Symlink {
+                target: b"t".to_vec(),
+                path: r(),
+            },
+            Op::Rename {
+                from: r(),
+                to: b"x".to_vec(),
+            },
+            Op::Rename {
+                from: b"x".to_vec(),
+                to: r(),
+            },
+            Op::Unlink { path: r() },
+            Op::Rmdir { path: r() },
+            Op::UnlinkAt {
+                dirfd: 3,
+                path: r(),
+                rmdir: false,
+            },
+            Op::UnlinkAt {
+                dirfd: 3,
+                path: r(),
+                rmdir: true,
+            },
+            Op::Bind { path: r() },
+        ]
+    }
+
+    #[test]
+    fn root_refusal_table() {
+        for root in ROOTS {
+            for op in mutating_root_ops(root) {
+                assert!(root_refusal(&op).is_some(), "{op:?}");
+            }
+            // Connect: refused everywhere but macOS.
+            assert_eq!(
+                root_refusal(&Op::Connect {
+                    path: root.to_vec()
+                })
+                .is_some(),
+                cfg!(not(target_os = "macos"))
+            );
+            // Negatives: read-only ops, read-only opens, and a root symlink
+            // *target* (just data) never trip it.
+            let ro = OpenFlags::default();
+            for op in [
+                Op::Stat {
+                    path: root.to_vec(),
+                },
+                Op::Lstat {
+                    path: root.to_vec(),
+                },
+                Op::Readlink {
+                    path: root.to_vec(),
+                },
+                Op::Realpath {
+                    path: root.to_vec(),
+                },
+                Op::OpenDir {
+                    path: root.to_vec(),
+                },
+                Op::List {
+                    path: root.to_vec(),
+                },
+                Op::Chdir {
+                    path: root.to_vec(),
+                },
+                Op::Open {
+                    path: root.to_vec(),
+                    flags: ro,
+                },
+                Op::OpenAt {
+                    dirfd: 3,
+                    path: root.to_vec(),
+                    flags: ro,
+                },
+                Op::Symlink {
+                    target: root.to_vec(),
+                    path: b"l".to_vec(),
+                },
+            ] {
+                assert!(root_refusal(&op).is_none(), "{op:?}");
+            }
+        }
+        // Non-root operands, including ones that merely contain slashes.
+        for p in [&b"a"[..], b"/a", b"/a/", b"a//", b"", b"/."] {
+            assert!(
+                root_refusal(&Op::Mkdir {
+                    path: p.to_vec(),
+                    mode: 0o755
+                })
+                .is_none()
+            );
+            assert!(
+                root_refusal(&Op::Rename {
+                    from: p.to_vec(),
+                    to: p.to_vec()
+                })
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_parent_refuses_the_root_before_any_syscall() {
+        let f = fixture();
+        for root in ROOTS {
+            assert!(
+                refused(guarded_parent(&f.state, Start::Cwd, root)),
+                "{root:?}"
+            );
+            assert!(refused(guarded_parent(&f.state, Start::Root, root)));
+        }
+    }
+
+    fn sandbox_listing(f: &Fixture) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = std::fs::read_dir(&f.sandbox)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn mutating_ops_on_a_root_operand_are_refused_and_change_nothing() {
+        let mut f = fixture();
+        // Pure checks first, for every root spelling: nothing below may run
+        // unless the predicate and the parent guard both refuse.
+        for root in ROOTS {
+            assert!(refused(guarded_parent(&f.state, Start::Cwd, root)));
+        }
+        let before = sandbox_listing(&f);
+        for root in ROOTS {
+            for op in mutating_root_ops(root) {
+                assert!(
+                    root_refusal(&op).is_some(),
+                    "root_refusal must refuse {op:?}; not running it"
+                );
+                assert!(refused(apply_real(&mut f.state, &op)), "{op:?}");
+            }
+        }
+        victim_untouched(&f);
+        assert_eq!(sandbox_listing(&f), before);
+    }
+
+    #[test]
+    fn connect_on_a_root_operand() {
+        let mut f = fixture();
+        for root in ROOTS {
+            let op = Op::Connect {
+                path: root.to_vec(),
+            };
+            if cfg!(target_os = "macos") {
+                // Not refused: "/" is never a socket, nothing is mutated.
+                assert!(root_refusal(&op).is_none());
+                let r = connect_like(&mut f.state, root);
+                assert_eq!(errno_of(r), libc::ENOTSOCK, "{root:?}");
+            } else {
+                assert!(root_refusal(&op).is_some());
+                assert!(refused(apply_real(&mut f.state, &op)));
+            }
+        }
         victim_untouched(&f);
     }
 }

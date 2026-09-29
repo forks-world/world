@@ -273,6 +273,14 @@ fn dataout(ret: i64, data: Vec<u8>) -> Outcome {
     }
 }
 
+/// True for a non-empty operand made only of slashes (`/`, `//`, ...): it
+/// names the root directory itself, which has no parent and no final
+/// component. Shared by the model and the executor so both classify the
+/// operand identically.
+pub fn is_root_operand(p: &[u8]) -> bool {
+    !p.is_empty() && p.iter().all(|&b| b == b'/')
+}
+
 /// Split an absolute or relative path into (parent-directory-text, final
 /// component, trailing). The parent text is `"."` for a bare relative name
 /// and `"/"` for a top-level absolute one. `trailing` is true when the path
@@ -759,6 +767,22 @@ impl Model {
         matches!(self.profile, Profile::MacShim { .. })
     }
 
+    /// The errno of a mutating call whose operand is the root directory.
+    /// Linux answers per operation (`linux`, from fs/namei.c). macOS
+    /// (`lookup_handle_emptyname`) gives EISDIR for every mutating lookup of
+    /// an empty final name.
+    ///
+    /// Never compared: the executor refuses such operands before any
+    /// syscall (they would act on the real root).
+    fn root_mutation_errno(&self, linux: Errno) -> Errno {
+        if self.is_mac() {
+            // XNU source, unmeasured; never compared: the executor refuses.
+            libc::EISDIR
+        } else {
+            linux
+        }
+    }
+
     /// macOS trailing-slash lookup of `key` in `parent` (see [`Trail`]).
     /// `path` is the original path text, used to find where a dangling
     /// symlink chain would create its target.
@@ -839,6 +863,10 @@ impl Model {
     }
 
     fn do_mkdir(&mut self, start: Start, path: &[u8]) -> Outcome {
+        if is_root_operand(path) {
+            // Linux `filename_create` (LAST_ROOT): EEXIST.
+            return errout(self.root_mutation_errno(libc::EEXIST));
+        }
         match self.resolve_parent(start, path) {
             Ok((parent, name, trailing)) => {
                 match &self.nodes[parent].kind {
@@ -879,6 +907,16 @@ impl Model {
             // O_EXCL): measured on macOS 27, and Linux >= 6.4 ("open: return
             // EINVAL for O_DIRECTORY | O_CREAT") does the same.
             return errout(libc::EINVAL);
+        }
+        if flags.create && is_root_operand(path) {
+            // Checked before the trailing-slash branch below (`//` would
+            // fall into it). Linux: O_EXCL is EEXIST, otherwise EISDIR.
+            // Never creates.
+            return errout(self.root_mutation_errno(if flags.excl {
+                libc::EEXIST
+            } else {
+                libc::EISDIR
+            }));
         }
         if flags.create && path.len() > 1 && path.ends_with(b"/") {
             // O_CREAT with a trailing slash never creates. Linux: EISDIR
@@ -1226,6 +1264,9 @@ impl Model {
         if target.is_empty() && !self.is_mac() {
             return errout(libc::ENOENT);
         }
+        if is_root_operand(path) {
+            return errout(self.root_mutation_errno(libc::EEXIST));
+        }
         match self.resolve_parent(Start::Cwd, path) {
             Ok((parent, name, trailing)) => {
                 match &self.nodes[parent].kind {
@@ -1291,6 +1332,20 @@ impl Model {
     }
 
     fn do_rename(&mut self, from: &[u8], to: &[u8]) -> Outcome {
+        if is_root_operand(from) || is_root_operand(to) {
+            // Linux: both parents are resolved first (so a bad parent on the
+            // other operand wins), then the root is EBUSY.
+            if !self.is_mac() {
+                for p in [from, to] {
+                    if !is_root_operand(p)
+                        && let Err(e) = self.resolve_parent(Start::Cwd, p)
+                    {
+                        return errout(e);
+                    }
+                }
+            }
+            return errout(self.root_mutation_errno(libc::EBUSY));
+        }
         let (from_parent, from_name, from_trailing) = match self.resolve_parent(Start::Cwd, from) {
             Ok(v) => v,
             Err(e) => return errout(e),
@@ -1400,6 +1455,14 @@ impl Model {
     }
 
     fn unlink_impl(&mut self, start: Start, path: &[u8], is_rmdir: bool) -> Outcome {
+        if is_root_operand(path) {
+            // Linux `do_unlinkat`: EISDIR; `do_rmdir` (LAST_ROOT): EBUSY.
+            return errout(self.root_mutation_errno(if is_rmdir {
+                libc::EBUSY
+            } else {
+                libc::EISDIR
+            }));
+        }
         match self.resolve_parent(start, path) {
             Ok((parent, name, trailing)) => {
                 let key = self.key(&name);
@@ -1496,6 +1559,16 @@ impl Model {
     }
 
     fn do_bind(&mut self, path: &[u8]) -> Outcome {
+        if is_root_operand(path) {
+            // Linux: `kern_path_create`'s EEXIST is remapped to EADDRINUSE
+            // by `unix_bind_bsd`.
+            return errout(if self.is_mac() {
+                // XNU source, unmeasured; never compared: the executor refuses.
+                libc::EISDIR
+            } else {
+                libc::EADDRINUSE
+            });
+        }
         match self.resolve_parent(Start::Cwd, path) {
             Ok((parent, name, trailing)) => {
                 match &self.nodes[parent].kind {
@@ -1537,10 +1610,20 @@ impl Model {
     /// lookup (following links) and kind, sockaddr_un length of the literal
     /// name plus a trailing `/`, then the full lookup. A non-socket target is
     /// `ENOTSOCK` on macOS and `ECONNREFUSED` on Linux. Like the executor
-    /// (and unlike the real kernel) `""` is `ENOENT` and `"/"` is `EINVAL`.
+    /// (and unlike the real kernel) `""` is `ENOENT`. A root operand is
+    /// ENOTSOCK on macOS (measured) and EACCES on Linux for an unprivileged
+    /// user (`unix_find_bsd` wants write permission on `/`; ECONNREFUSED as
+    /// root). The Linux value is never compared: the executor refuses it.
     fn do_connect(&mut self, path: &[u8]) -> Outcome {
         if path.len() >= self.path_max() {
             return errout(libc::ENAMETOOLONG);
+        }
+        if is_root_operand(path) {
+            return errout(if self.is_mac() {
+                libc::ENOTSOCK
+            } else {
+                libc::EACCES
+            });
         }
         let (dir, name, trailing) = match parent_and_name(path) {
             Ok(t) => t,
@@ -2312,7 +2395,7 @@ mod tests {
                 flags: OpenFlags::default(),
             });
             assert_eq!(at.errno, libc::ENOENT);
-            // "/" is still EINVAL for a creating call.
+            // "/" names the root: mkdir is EEXIST on Linux, EISDIR on macOS.
             assert_eq!(
                 e(
                     &mut m,
@@ -2321,7 +2404,11 @@ mod tests {
                         mode: 0o755
                     }
                 ),
-                libc::EINVAL
+                if matches!(m.profile, Profile::MacShim { .. }) {
+                    libc::EISDIR
+                } else {
+                    libc::EEXIST
+                }
             );
         }
     }
@@ -3030,6 +3117,9 @@ mod tests {
             } else {
                 libc::ECONNREFUSED
             };
+            // Never compared against a kernel on Linux: the executor
+            // refuses a Linux connect on the root.
+            let root = if mac { libc::ENOTSOCK } else { libc::EACCES };
             let mut m = Model::new(profile);
             m.add_fixture_dir(View::Virtual, b"/tmp/d");
             m.add_fixture_file(View::Virtual, b"/tmp/f", b"x".to_vec());
@@ -3059,8 +3149,8 @@ mod tests {
                 (b"/tmp/lp", libc::ELOOP),
                 (b"/tmp/s/", libc::ENOTDIR),
                 (b"", libc::ENOENT),
-                (b"/", libc::EINVAL),
-                (b"//", libc::EINVAL),
+                (b"/", root),
+                (b"//", root),
             ];
             for (path, want) in rows {
                 let got = m
@@ -3069,6 +3159,236 @@ mod tests {
                     })
                     .errno;
                 assert_eq!(got, want, "mac={mac} {:?}", String::from_utf8_lossy(path));
+            }
+        }
+    }
+
+    #[test]
+    fn root_operand_per_op() {
+        let rw = |create, excl, write| OpenFlags {
+            create,
+            excl,
+            write,
+            ..Default::default()
+        };
+        for mac in [true, false] {
+            let profile = if mac {
+                Profile::MacShim { root: mac_root() }
+            } else {
+                Profile::LinuxMount { root: linux_root() }
+            };
+            let mut m = Model::new(profile);
+            m.add_fixture_dir(View::Virtual, b"/tmp/d");
+            let x = |mac_e: i32, lin_e: i32| if mac { mac_e } else { lin_e };
+            for root in [&b"/"[..], b"//", b"///"] {
+                let r = || root.to_vec();
+                let mut chk = |op: Op, want: i32| {
+                    let got = m.apply(&op).errno;
+                    assert_eq!(got, want, "mac={mac} {op:?}");
+                };
+                chk(
+                    Op::Mkdir {
+                        path: r(),
+                        mode: 0o755,
+                    },
+                    x(libc::EISDIR, libc::EEXIST),
+                );
+                chk(
+                    Op::MkdirAt {
+                        dirfd: 3,
+                        path: r(),
+                    },
+                    x(libc::EISDIR, libc::EEXIST),
+                );
+                chk(
+                    Op::Symlink {
+                        target: b"t".to_vec(),
+                        path: r(),
+                    },
+                    x(libc::EISDIR, libc::EEXIST),
+                );
+                // The target checks still come first.
+                chk(
+                    Op::Symlink {
+                        target: vec![b'a'; 5000],
+                        path: r(),
+                    },
+                    libc::ENAMETOOLONG,
+                );
+                chk(
+                    Op::Symlink {
+                        target: Vec::new(),
+                        path: r(),
+                    },
+                    x(libc::EISDIR, libc::ENOENT),
+                );
+                chk(Op::Bind { path: r() }, x(libc::EISDIR, libc::EADDRINUSE));
+                chk(Op::Unlink { path: r() }, libc::EISDIR);
+                chk(
+                    Op::UnlinkAt {
+                        dirfd: 3,
+                        path: r(),
+                        rmdir: false,
+                    },
+                    libc::EISDIR,
+                );
+                chk(Op::Rmdir { path: r() }, x(libc::EISDIR, libc::EBUSY));
+                chk(
+                    Op::UnlinkAt {
+                        dirfd: 3,
+                        path: r(),
+                        rmdir: true,
+                    },
+                    x(libc::EISDIR, libc::EBUSY),
+                );
+                chk(
+                    Op::Rename {
+                        from: r(),
+                        to: b"/tmp/x".to_vec(),
+                    },
+                    x(libc::EISDIR, libc::EBUSY),
+                );
+                chk(
+                    Op::Rename {
+                        from: b"/tmp/d".to_vec(),
+                        to: r(),
+                    },
+                    x(libc::EISDIR, libc::EBUSY),
+                );
+                chk(
+                    Op::Rename {
+                        from: b"/tmp/missing".to_vec(),
+                        to: r(),
+                    },
+                    x(libc::EISDIR, libc::EBUSY),
+                );
+                chk(
+                    Op::Rename {
+                        from: r(),
+                        to: b"/nope/x".to_vec(),
+                    },
+                    x(libc::EISDIR, libc::ENOENT),
+                );
+                chk(
+                    Op::Rename { from: r(), to: r() },
+                    x(libc::EISDIR, libc::EBUSY),
+                );
+                // open with create: never succeeds.
+                chk(
+                    Op::Open {
+                        path: r(),
+                        flags: rw(true, false, false),
+                    },
+                    libc::EISDIR,
+                );
+                chk(
+                    Op::Open {
+                        path: r(),
+                        flags: rw(true, false, true),
+                    },
+                    libc::EISDIR,
+                );
+                chk(
+                    Op::OpenAt {
+                        dirfd: 3,
+                        path: r(),
+                        flags: rw(true, false, false),
+                    },
+                    libc::EISDIR,
+                );
+                chk(
+                    Op::Open {
+                        path: r(),
+                        flags: rw(true, true, true),
+                    },
+                    x(libc::EISDIR, libc::EEXIST),
+                );
+                let dir_create = OpenFlags {
+                    create: true,
+                    directory: true,
+                    ..Default::default()
+                };
+                chk(
+                    Op::Open {
+                        path: r(),
+                        flags: dir_create,
+                    },
+                    libc::EINVAL,
+                );
+                // Write or truncate without create.
+                chk(
+                    Op::Open {
+                        path: r(),
+                        flags: rw(false, false, true),
+                    },
+                    libc::EISDIR,
+                );
+                chk(
+                    Op::Open {
+                        path: r(),
+                        flags: OpenFlags {
+                            trunc: true,
+                            ..Default::default()
+                        },
+                    },
+                    libc::EISDIR,
+                );
+                chk(Op::Connect { path: r() }, x(libc::ENOTSOCK, libc::EACCES));
+            }
+            // The model tree is untouched by all of the above.
+            assert_eq!(
+                m.apply(&Op::Stat {
+                    path: b"/tmp/d".to_vec()
+                })
+                .errno,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn root_operand_read_only() {
+        let flag_sets = [
+            OpenFlags::default(),
+            OpenFlags {
+                directory: true,
+                ..Default::default()
+            },
+            OpenFlags {
+                nofollow: true,
+                ..Default::default()
+            },
+            OpenFlags {
+                directory: true,
+                nofollow: true,
+                ..Default::default()
+            },
+        ];
+        for mac in [true, false] {
+            let profile = if mac {
+                Profile::MacShim { root: mac_root() }
+            } else {
+                Profile::LinuxMount { root: linux_root() }
+            };
+            let mut m = Model::new(profile);
+            for root in [&b"/"[..], b"//", b"///"] {
+                let r = || root.to_vec();
+                let mut errno = |op: Op| m.apply(&op).errno;
+                assert_eq!(errno(Op::Stat { path: r() }), 0, "mac={mac}");
+                assert_eq!(errno(Op::Lstat { path: r() }), 0, "mac={mac}");
+                assert_eq!(errno(Op::Readlink { path: r() }), libc::EINVAL, "mac={mac}");
+                assert_eq!(errno(Op::Realpath { path: r() }), 0, "mac={mac}");
+                assert_eq!(errno(Op::OpenDir { path: r() }), 0, "mac={mac}");
+                for f in &flag_sets {
+                    assert_eq!(
+                        errno(Op::Open {
+                            path: r(),
+                            flags: *f
+                        }),
+                        0,
+                        "mac={mac} {f:?}"
+                    );
+                }
             }
         }
     }
