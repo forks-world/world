@@ -873,6 +873,13 @@ impl Model {
     }
 
     fn do_open(&mut self, start: Start, path: &[u8], flags: &OpenFlags) -> Outcome {
+        if flags.create && flags.directory {
+            // O_CREAT|O_DIRECTORY is EINVAL whatever the target (new name,
+            // file, dir, link, dangling, trailing slash, with or without
+            // O_EXCL): measured on macOS 27, and Linux >= 6.4 ("open: return
+            // EINVAL for O_DIRECTORY | O_CREAT") does the same.
+            return errout(libc::EINVAL);
+        }
         if flags.create && path.len() > 1 && path.ends_with(b"/") {
             // O_CREAT with a trailing slash never creates. Linux: EISDIR
             // once the parent resolves. macOS looks the name up through
@@ -945,7 +952,16 @@ impl Model {
                     let fd = self.alloc_fd(FdEntry::Dir { node });
                     okout(fd as i64)
                 }
-                NodeKind::Symlink(_) => errout(libc::ELOOP),
+                // A final symlink that is not followed (O_NOFOLLOW): Linux
+                // `do_open` checks LOOKUP_DIRECTORY (`!d_can_lookup` ->
+                // ENOTDIR) before `may_open` turns S_IFLNK into ELOOP; macOS
+                // measured the same (ENOTDIR for links to a dir, a file and
+                // dangling ones, ELOOP without O_DIRECTORY).
+                NodeKind::Symlink(_) => errout(if flags.directory {
+                    libc::ENOTDIR
+                } else {
+                    libc::ELOOP
+                }),
                 // open(2) on a socket node: Linux ENXIO, macOS EOPNOTSUPP.
                 NodeKind::Socket => errout(if self.is_mac() {
                     libc::EOPNOTSUPP
@@ -2804,6 +2820,57 @@ mod tests {
             assert_eq!(m.apply(&Op::Bind { path: over }).errno, libc::ENAMETOOLONG);
             assert_eq!(m.apply(&Op::Bind { path: fits.clone() }).errno, 0);
             assert_eq!(m.apply(&Op::Bind { path: fits }).errno, libc::EADDRINUSE);
+        }
+    }
+
+    #[test]
+    fn nofollow_directory_on_final_symlink_is_enotdir_and_create_directory_einval() {
+        for profile in [
+            Profile::MacShim { root: mac_root() },
+            Profile::LinuxMount { root: linux_root() },
+        ] {
+            let mut m = Model::new(profile);
+            m.add_fixture_dir(View::Virtual, b"/tmp/d");
+            m.add_fixture_file(View::Virtual, b"/tmp/f", b"x".to_vec());
+            m.add_fixture_symlink(View::Virtual, b"/tmp/ld", b"d".to_vec());
+            m.add_fixture_symlink(View::Virtual, b"/tmp/lf", b"f".to_vec());
+            m.add_fixture_symlink(View::Virtual, b"/tmp/dl", b"nowhere".to_vec());
+            let mut open = |path: &[u8], flags: OpenFlags| {
+                m.apply(&Op::Open {
+                    path: path.to_vec(),
+                    flags,
+                })
+                .errno
+            };
+            for link in [&b"/tmp/ld"[..], b"/tmp/lf", b"/tmp/dl"] {
+                let dn = OpenFlags {
+                    directory: true,
+                    nofollow: true,
+                    ..Default::default()
+                };
+                assert_eq!(open(link, dn), libc::ENOTDIR);
+                assert_eq!(open(link, OpenFlags { write: true, ..dn }), libc::ENOTDIR);
+                let n = OpenFlags {
+                    nofollow: true,
+                    ..Default::default()
+                };
+                assert_eq!(open(link, n), libc::ELOOP);
+            }
+            let cd = OpenFlags {
+                create: true,
+                directory: true,
+                ..Default::default()
+            };
+            for p in [
+                &b"/tmp/new"[..],
+                b"/tmp/f",
+                b"/tmp/d",
+                b"/tmp/ld",
+                b"/tmp/d/",
+            ] {
+                assert_eq!(open(p, cd), libc::EINVAL);
+                assert_eq!(open(p, OpenFlags { excl: true, ..cd }), libc::EINVAL);
+            }
         }
     }
 

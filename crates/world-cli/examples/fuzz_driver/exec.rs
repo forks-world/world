@@ -2149,4 +2149,24 @@ mod trailing_slash_guard_tests {
         assert!(!target.exists());
         victim_untouched(&f);
     }
+
+    #[test]
+    fn nofollow_directory_on_a_final_symlink_is_enotdir_in_the_real_kernel() {
+        let mut f = fixture();
+        let p = abs(&f, "in");
+        let dn = OpenFlags {
+            directory: true,
+            nofollow: true,
+            ..OpenFlags::default()
+        };
+        let a = open_like(&mut f.state, Start::Cwd, &p, &dn).map(|a| a.outcome);
+        assert_eq!(errno_of(a), libc::ENOTDIR);
+        let n = OpenFlags {
+            nofollow: true,
+            ..OpenFlags::default()
+        };
+        let a = open_like(&mut f.state, Start::Cwd, &p, &n).map(|a| a.outcome);
+        assert_eq!(errno_of(a), libc::ELOOP);
+        victim_untouched(&f);
+    }
 }
