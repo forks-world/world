@@ -169,6 +169,77 @@ def normalize_tree(entries, roots):
     return out
 
 
+def check_trees(phys_root, run_id, data):
+    """Compare the physical `/tmp/<run>` and `/var/tmp/<run>` trees under a
+    workspace's physical root with the model's trees from the driver's JSON
+    (`model_tree`, and `model_var_tree` when present). Raises
+    AssertionError naming the root that differs."""
+    phys_root = pathlib.Path(phys_root)
+    roots = [(str(phys_root / "tmp"), "/tmp"), (str(phys_root / "var/tmp"), "/var/tmp")]
+    pairs = [("tmp", "model_tree")]
+    if "model_var_tree" in data:
+        pairs.append(("var/tmp", "model_var_tree"))
+    for sub, key in pairs:
+        real = normalize_tree(physical_tree(phys_root / sub / run_id), roots)
+        model = normalize_tree(data[key], roots)
+        if real != model:
+            raise AssertionError(f"/{sub}/{run_id} tree differs: physical={real!r} model={model!r}")
+
+
+def escape_op_path(path):
+    """The `.ops` text escaping: %XX for anything outside [A-Za-z0-9._/-]."""
+    out = []
+    for b in os.fsencode(str(path)):
+        c = chr(b)
+        out.append(c if (c.isascii() and (c.isalnum() or c in "._/-")) else f"%{b:02x}")
+    return "".join(out)
+
+
+class HostTempGuard:
+    """Shared by every class that runs the driver: a sentinel dir plus a
+    before/after listing of the *host* temp dirs, so a run that escaped its
+    redirection (created host `fz-*` entries or touched the sentinel) fails
+    the class instead of silently polluting the machine."""
+
+    host_bases = ("/private/tmp", "/private/var/tmp") if MACOS else ("/tmp", "/var/tmp")
+
+    @staticmethod
+    def host_fz(base):
+        try:
+            return {n for n in os.listdir(base) if n.startswith("fz-")}
+        except FileNotFoundError:
+            return set()
+
+    @classmethod
+    def guard_start(cls):
+        cls.guard_sentinel = pathlib.Path(cls.host_bases[0]) / f"fz-sentinel-{uuid.uuid4().hex[:8]}"
+        cls.guard_sentinel.mkdir()
+        (cls.guard_sentinel / "file").write_text("sentinel")
+        cls.guard_before = {b: cls.host_fz(b) for b in cls.host_bases}
+
+    @classmethod
+    def guard_finish(cls):
+        """Clean up and report; call last in tearDownClass. Tolerates a
+        guard_start that never ran."""
+        sentinel = getattr(cls, "guard_sentinel", None)
+        if sentinel is None:
+            return
+        cls.guard_sentinel = None
+        leaked = {}
+        for base in cls.host_bases:
+            new = cls.host_fz(base) - cls.guard_before.get(base, set())
+            new.discard(sentinel.name)
+            if new:
+                leaked[base] = sorted(new)
+        try:
+            sentinel_ok = (sentinel / "file").read_text() == "sentinel"
+        except OSError:
+            sentinel_ok = False
+        owned_rmtree(sentinel, sentinel)
+        if leaked or not sentinel_ok:
+            raise AssertionError(f"host temp dirs were touched: new fz-* entries={leaked} sentinel_ok={sentinel_ok}")
+
+
 def env_prefix(env):
     keys = ["DYLD_INSERT_LIBRARIES", "SILO_IP", "WORLD_SILO_ACTIVE", "WORLD_SILO_ACK", "WORLD_TMP"]
     return " ".join(f"{k}={env[k]}" for k in keys if env.get(k))
@@ -227,6 +298,57 @@ class GuardProbes(unittest.TestCase):
                 self.assertEqual(r.stdout, "")
                 self.assertIn("invalid run id", r.stderr)
 
+    @staticmethod
+    def remove_roots(rid):
+        """Remove the two sandbox roots of a run (exact, freshly-random single
+        components) after an abort that skipped the run's own cleanup."""
+        for base in ["/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"]:
+            p = os.path.join(base, rid)
+            if os.path.basename(p) == rid and rid.startswith("fz-") and len(rid) == 35:
+                shutil.rmtree(p, ignore_errors=True)
+
+    def test_opens_that_could_write_outside_the_sandbox_are_refused(self):
+        """Every mutating open form aimed (directly, through a dirfd, or via
+        a symlink in the final component) at a host file is refused before
+        the syscall: the victim is never truncated, written or created."""
+        with tempfile.TemporaryDirectory() as scratch:
+            victim = pathlib.Path(scratch) / "victim"
+            victim.write_text("precious")
+            os.utime(victim, (1_000_000_000, 1_000_000_000))
+            before = (victim.read_bytes(), victim.stat().st_mtime_ns)
+            new = pathlib.Path(scratch) / "new"
+            v = escape_op_path(victim)
+            vrel = escape_op_path(str(victim).lstrip("/"))
+            n = escape_op_path(new)
+
+            def cases(rid):
+                return {
+                    "write-trunc": [f"open {v} 001100", "write 3 x"],
+                    "write-only": [f"open {v} 000100"],
+                    "dirfd-openat": ["opendir /", f"openat 3 {vrel} 001100"],
+                    "symlink-to-file": [f"symlink {v} /tmp/{rid}/l", f"open /tmp/{rid}/l 001100"],
+                    "dangling-symlink-create": [f"symlink {n} /tmp/{rid}/d", f"open /tmp/{rid}/d 100100"],
+                }
+
+            for name in cases("fz-00000000"):
+                with self.subTest(case=name):
+                    rid = fresh_run_id()
+                    text = (
+                        f"# profile mac\n# seed 1\n# run-id {rid}\n# allow-escaping-links 0\n"
+                        f"mkdir /tmp/{rid} 755\nmkdir /var/tmp/{rid} 755\nchdir /tmp/{rid}\n"
+                        + "".join(line + "\n" for line in cases(rid)[name])
+                    )
+                    ops = pathlib.Path(scratch) / f"{name}.ops"
+                    ops.write_text(text)
+                    try:
+                        r = run_timeout([FUZZ_DRIVER, "replay", ops, "--run-id", rid], 20)
+                    finally:
+                        self.remove_roots(rid)
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertIn("outside the sandbox", r.stderr)
+                    self.assertEqual((victim.read_bytes(), victim.stat().st_mtime_ns), before)
+                    self.assertFalse(os.path.lexists(new))
+
     def test_op_with_parent_outside_the_sandbox_is_refused_before_any_syscall(self):
         rid = fresh_run_id()
         victim = f"should-never-exist-{rid}"
@@ -244,12 +366,8 @@ class GuardProbes(unittest.TestCase):
             try:
                 r = run_timeout([FUZZ_DRIVER, "replay", ops, "--run-id", rid], 20)
             finally:
-                # The abort happens before the run's own cleanup: remove the
-                # two sandbox roots (exact, freshly-random single components).
-                for base in ["/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"]:
-                    p = os.path.join(base, rid)
-                    if os.path.basename(p) == rid and rid.startswith("fz-") and len(rid) == 35:
-                        shutil.rmtree(p, ignore_errors=True)
+                # The abort happens before the run's own cleanup.
+                self.remove_roots(rid)
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertIn("outside the sandbox", r.stderr)
         for base in ["/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"]:
@@ -257,8 +375,29 @@ class GuardProbes(unittest.TestCase):
             self.assertFalse(os.path.lexists(os.path.join(base, victim + "-link")), base)
 
 
+class CheckTrees(unittest.TestCase):
+    """`check_trees` compares *both* sandbox roots (pure, no driver)."""
+
+    def test_var_tmp_tree_is_compared(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            rid = "fz-00000000"
+            (root / "tmp" / rid).mkdir(parents=True)
+            (root / "var/tmp" / rid).mkdir(parents=True)
+            data = {"model_tree": [], "model_var_tree": []}
+            check_trees(root, rid, data)
+            (root / "var/tmp" / rid / "extra").write_text("x")
+            with self.assertRaises(AssertionError):
+                check_trees(root, rid, data)
+            # An old driver without `model_var_tree` still compares /tmp only.
+            check_trees(root, rid, {"model_tree": []})
+            (root / "tmp" / rid / "extra").write_text("x")
+            with self.assertRaises(AssertionError):
+                check_trees(root, rid, {"model_tree": []})
+
+
 @unittest.skipUnless(MACOS, "the silo shim is macOS-only")
-class ShimFuzz(unittest.TestCase):
+class ShimFuzz(HostTempGuard, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.home = short_dir(".wt-fuzz-")
@@ -268,46 +407,39 @@ class ShimFuzz(unittest.TestCase):
         cls.ack = pathlib.Path(cls.home.name) / "ack"
         cls.ack.touch()
         cls.env = shim_env(cls.root, cls.ack)
-        cls.sentinel = pathlib.Path(f"/private/tmp/fz-sentinel-{uuid.uuid4().hex[:8]}")
-        cls.sentinel.mkdir()
-        (cls.sentinel / "file").write_text("sentinel")
-        cls.tmp_before = cls.host_fz("/private/tmp")
-        cls.var_before = cls.host_fz("/private/var/tmp")
-
-    @staticmethod
-    def host_fz(base):
-        try:
-            return {n for n in os.listdir(base) if n.startswith("fz-")}
-        except FileNotFoundError:
-            return set()
+        cls.guard_start()
 
     @classmethod
     def tearDownClass(cls):
-        leaked_tmp = cls.host_fz("/private/tmp") - cls.tmp_before - {cls.sentinel.name}
-        leaked_var = cls.host_fz("/private/var/tmp") - cls.var_before
         try:
-            sentinel_ok = (cls.sentinel / "file").read_text() == "sentinel"
-        except OSError:
-            sentinel_ok = False
-        owned_rmtree(cls.sentinel, cls.sentinel)
-        cls.home.cleanup()
-        if leaked_tmp or leaked_var or not sentinel_ok:
-            raise AssertionError(
-                f"host temp dirs were touched: new /private/tmp/fz-*={sorted(leaked_tmp)} "
-                f"new /private/var/tmp/fz-*={sorted(leaked_var)} sentinel_ok={sentinel_ok}"
-            )
+            cls.home.cleanup()
+        finally:
+            cls.guard_finish()
 
     def cleanup_run(self, run_id):
         owned_rmtree(self.root / "tmp" / run_id, self.root)
         owned_rmtree(self.root / "var/tmp" / run_id, self.root)
 
     def check_tree(self, run_id, data):
-        roots = [(str(self.root / "tmp"), "/tmp"), (str(self.root / "var/tmp"), "/var/tmp")]
-        self.assertEqual(
-            normalize_tree(physical_tree(self.root / "tmp" / run_id), roots),
-            normalize_tree(data["model_tree"], roots),
-            run_id,
-        )
+        check_trees(self.root, run_id, data)
+
+    def test_var_tmp_mismatch_is_detected(self):
+        """A stray physical file under /var/tmp/<run> must fail the tree
+        comparison even though /tmp/<run> still agrees."""
+        ops_file = CORPUS / "seed-var-tmp.ops"
+        run_id = fresh_run_id()
+        try:
+            result = run_timeout([FUZZ_DRIVER, "replay", ops_file, "--run-id", run_id, "--keep"], RUN_TIMEOUT, env=self.env)
+            self.assertEqual(result.returncode, 0, f"{result.stdout} {result.stderr}")
+            data = json.loads(result.stdout)
+            self.assertIn("model_var_tree", data)
+            self.assertTrue(data["model_var_tree"], "the corpus file must populate /var/tmp")
+            self.check_tree(run_id, data)
+            (self.root / "var/tmp" / run_id / "stray").write_text("x")
+            with self.assertRaises(AssertionError):
+                self.check_tree(run_id, data)
+        finally:
+            self.cleanup_run(run_id)
 
     def test_shim_matches_model_across_seeds(self):
         deadline = time.monotonic() + budget()
@@ -356,11 +488,14 @@ class ShimFuzz(unittest.TestCase):
                     self.cleanup_run(run_id)
 
 
-class ExecFuzzMixin:
-    """Shared loop for the two `world exec` based classes."""
+class ExecFuzzMixin(HostTempGuard):
+    """Shared loop for the two `world exec` based classes (also carries the
+    host-temp leak/sentinel guard: call `guard_start()` first in setUpClass
+    and `guard_finish()` last in tearDownClass)."""
 
     profile = None
     world_name = "F"
+    child_env = None  # environment for the world/driver children (None: inherit)
 
     def command(self, *args):
         return [WORLD, "exec", self.world_name, "--state-dir", self.state, "--timeout", "60s", "--", FUZZ_DRIVER, *args]
@@ -383,7 +518,7 @@ class ExecFuzzMixin:
                 run_id = fresh_run_id()
                 ops_file = pathlib.Path(scratch) / f"{run_id}.ops"
                 try:
-                    result = run_timeout(self.command(*run_args(self.profile, seed, run_id, ops_file)), RUN_TIMEOUT + 60)
+                    result = run_timeout(self.command(*run_args(self.profile, seed, run_id, ops_file)), RUN_TIMEOUT + 60, env=self.child_env)
                 except subprocess.TimeoutExpired as e:
                     self.fail(f"fuzz_driver via world exec (seed={seed}) timed out: {e}")
                 try:
@@ -392,12 +527,7 @@ class ExecFuzzMixin:
                         self.fail(report_failure({}, self.profile, seed, run_id, ops_file, result, phase, replay_prefix=prefix))
                     data = json.loads(result.stdout)
                     self.assertEqual(data["result"], "pass")
-                    roots = [(str(troot / "tmp"), "/tmp"), (str(troot / "var/tmp"), "/var/tmp")]
-                    self.assertEqual(
-                        normalize_tree(physical_tree(troot / "tmp" / run_id), roots),
-                        normalize_tree(data["model_tree"], roots),
-                        run_id,
-                    )
+                    check_trees(troot, run_id, data)
                 finally:
                     owned_rmtree(troot / "tmp" / run_id, troot)
                     owned_rmtree(troot / "var/tmp" / run_id, troot)
@@ -410,6 +540,7 @@ class LinuxFuzz(ExecFuzzMixin, unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        cls.guard_start()
         # Workspaces refuse workdirs under /tmp and record their private /tmp
         # under HOME: keep both inside the build tree (LinuxWorkspace pattern).
         (ROOT / "target").mkdir(exist_ok=True)
@@ -439,7 +570,10 @@ class LinuxFuzz(ExecFuzzMixin, unittest.TestCase):
                 os.environ.pop("HOME", None)
             else:
                 os.environ["HOME"] = cls.home
-            cls.temp.cleanup()
+            try:
+                cls.temp.cleanup()
+            finally:
+                cls.guard_finish()
 
     def temp_root(self):
         result = run_timeout([WORLD, "workspace", "--state-dir", self.state, "show", "F"], 15)
@@ -456,14 +590,25 @@ class PrivilegedExecFuzz(ExecFuzzMixin, unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        cls.guard_start()
         cls.temp = tempfile.TemporaryDirectory(prefix="world-fuzz-silo-")
         cls.root = pathlib.Path(cls.temp.name)
         cls.state = cls.root / "state"
+        # A dedicated HOME (short, under the real HOME, never /tmp): the
+        # workspace's temp root (~/.world/tmp/<ip>) must land in a
+        # test-owned dir, never under the real developer/CI HOME.
+        cls.home_dir = short_dir(".wt-fuzz-silo-")
+        cls.home = pathlib.Path(cls.home_dir.name)
+        cls.child_env = dict(os.environ, HOME=str(cls.home))
         work = cls.root / "F"
         work.mkdir()
-        result = run_timeout([WORLD, "workspace", "--state-dir", cls.state, "create", "F", "--workdir", work], 15)
+        result = run_timeout(
+            [WORLD, "workspace", "--state-dir", cls.state, "create", "F", "--workdir", work], 15, env=cls.child_env
+        )
         if result.returncode:
             cls.temp.cleanup()
+            cls.home_dir.cleanup()
+            cls.guard_finish()
             raise AssertionError(result.stderr)
         cls.info = json.loads(result.stdout)
         # CI runner has passwordless sudo. Never alter sudoers or /etc/hosts.
@@ -475,7 +620,7 @@ class PrivilegedExecFuzz(ExecFuzzMixin, unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         try:
-            shutil.rmtree(pathlib.Path(cls.info["temp_root"]), ignore_errors=True)
+            owned_rmtree(pathlib.Path(cls.info["temp_root"]), cls.home)
         finally:
             try:
                 subprocess.run(
@@ -483,7 +628,11 @@ class PrivilegedExecFuzz(ExecFuzzMixin, unittest.TestCase):
                     check=True, timeout=10, stdin=subprocess.DEVNULL,
                 )
             finally:
-                cls.temp.cleanup()
+                try:
+                    cls.temp.cleanup()
+                    cls.home_dir.cleanup()
+                finally:
+                    cls.guard_finish()
 
     def temp_root(self):
         return pathlib.Path(self.info["temp_root"])

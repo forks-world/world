@@ -265,11 +265,11 @@ fn dataout(ret: i64, data: Vec<u8>) -> Outcome {
 
 /// Split an absolute or relative path into (parent-directory-text, final
 /// component). The parent text is `"."` for a bare relative name and `"/"`
-/// for a top-level absolute one. `Err(EINVAL)` for `""` or `"/"` (nothing to
-/// name).
+/// for a top-level absolute one. `Err(ENOENT)` for `""` (POSIX: an empty
+/// pathname never names anything), `Err(EINVAL)` for `"/"` (nothing to name).
 fn parent_and_name(path: &[u8]) -> Result<(&[u8], &[u8]), Errno> {
     if path.is_empty() {
-        return Err(libc::EINVAL);
+        return Err(libc::ENOENT);
     }
     let trimmed = if path.len() > 1 && path.ends_with(b"/") {
         &path[..path.len() - 1]
@@ -452,8 +452,11 @@ impl Model {
         if path.len() > self.path_max() {
             return Err(libc::ENAMETOOLONG);
         }
+        // POSIX: an empty pathname is ENOENT (Linux and macOS alike; only
+        // `AT_EMPTY_PATH` / `*at` with an fd gives it a meaning, which this
+        // model does not offer).
         if path.is_empty() {
-            return Ok(self.enter(view, cur));
+            return Err(libc::ENOENT);
         }
         if path[0] == b'/' {
             cur = self.root_node;
@@ -1199,6 +1202,10 @@ impl Model {
     }
 
     fn do_mkstemp(&mut self, name: &[u8]) -> Outcome {
+        // The name is a single literal component of the cwd.
+        if name.is_empty() || name.contains(&b'/') {
+            return errout(libc::EINVAL);
+        }
         match &self.nodes[self.cwd].kind {
             NodeKind::Dir | NodeKind::Opaque => {}
             _ => return errout(libc::ENOTDIR),
@@ -1730,6 +1737,114 @@ mod tests {
         let node = resolve_ok(&m, View::Virtual, b"/tmp/..");
         let root = resolve_ok(&m, View::Virtual, b"/");
         assert_eq!(node, root);
+    }
+
+    /// POSIX: an empty pathname is ENOENT for every path-taking call, on
+    /// both profiles (it used to resolve to the cwd / be EINVAL).
+    #[test]
+    fn empty_path_is_enoent() {
+        for profile in [
+            Profile::MacShim { root: mac_root() },
+            Profile::LinuxMount { root: linux_root() },
+        ] {
+            let mut m = Model::new(profile);
+            let e = |m: &mut Model, op: Op| m.apply(&op).errno;
+            let empty = || Vec::new();
+            let create = OpenFlags {
+                create: true,
+                write: true,
+                ..Default::default()
+            };
+            let excl = OpenFlags {
+                create: true,
+                excl: true,
+                write: true,
+                ..Default::default()
+            };
+            let cases = vec![
+                Op::Stat { path: empty() },
+                Op::Lstat { path: empty() },
+                Op::Chdir { path: empty() },
+                Op::Realpath { path: empty() },
+                Op::OpenDir { path: empty() },
+                Op::List { path: empty() },
+                Op::Readlink { path: empty() },
+                Op::Open {
+                    path: empty(),
+                    flags: OpenFlags::default(),
+                },
+                Op::Open {
+                    path: empty(),
+                    flags: create,
+                },
+                Op::Open {
+                    path: empty(),
+                    flags: excl,
+                },
+                Op::Mkdir {
+                    path: empty(),
+                    mode: 0o755,
+                },
+                Op::Unlink { path: empty() },
+                Op::Rename {
+                    from: empty(),
+                    to: b"/tmp/x".to_vec(),
+                },
+                Op::Symlink {
+                    target: b"/tmp".to_vec(),
+                    path: empty(),
+                },
+            ];
+            for op in cases {
+                let line = op.to_line();
+                assert_eq!(e(&mut m, op), libc::ENOENT, "{line}");
+            }
+            // OpenAt with a real dirfd and an empty name.
+            let out = m.apply(&Op::OpenDir {
+                path: b"/tmp".to_vec(),
+            });
+            assert_eq!(out.errno, 0);
+            let fd = out.ret as u32;
+            let at = m.apply(&Op::OpenAt {
+                dirfd: fd,
+                path: Vec::new(),
+                flags: OpenFlags::default(),
+            });
+            assert_eq!(at.errno, libc::ENOENT);
+            // "/" is still EINVAL for a creating call.
+            assert_eq!(
+                e(
+                    &mut m,
+                    Op::Mkdir {
+                        path: b"/".to_vec(),
+                        mode: 0o755
+                    }
+                ),
+                libc::EINVAL
+            );
+        }
+    }
+
+    #[test]
+    fn mkstemp_rejects_empty_or_slashed_names() {
+        let mut m = Model::new(Profile::LinuxMount { root: linux_root() });
+        for name in [&b""[..], b"a/b", b"/x"] {
+            let out = m.apply(&Op::MkstempAdopt {
+                name: name.to_vec(),
+            });
+            assert_ne!(out.errno, 0, "{name:?}");
+        }
+        assert_eq!(
+            m.apply(&Op::Chdir {
+                path: b"/tmp".to_vec()
+            })
+            .errno,
+            0
+        );
+        let ok = m.apply(&Op::MkstempAdopt {
+            name: b"okname".to_vec(),
+        });
+        assert_eq!(ok.errno, 0);
     }
 
     #[test]

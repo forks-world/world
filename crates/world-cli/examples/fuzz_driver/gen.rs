@@ -544,11 +544,16 @@ impl Generator {
         let name = self.biased_name();
         let canonical = join(&dir, &name);
         let path = self.spell_for_mutation(&canonical);
+        // `biased_name` may pick an existing sibling name: never let a
+        // writable/creating open *follow* an escaping link (the real side
+        // would refuse it as outside the sandbox, aborting the run).
+        let escaping = self.escaping_links.contains(&canonical);
         let flags = OpenFlags {
             create: true,
             excl: self.rng.chance(1, 3),
             trunc: self.rng.chance(1, 4),
             write: true,
+            nofollow: escaping,
             ..Default::default()
         };
         plain(Op::Open { path, flags }, Effect::CreateFile(canonical))
@@ -563,10 +568,12 @@ impl Generator {
             .nodes
             .iter()
             .any(|n| n.path == target && n.kind == Kind::Symlink);
+        // An escaping link is never followed (see `exec.rs`'s open guard).
+        let escaping = self.escaping_links.contains(&target);
         let spelled = self.spell(&target);
         let flags = OpenFlags {
             write: !is_symlink && self.rng.chance(1, 2),
-            nofollow: is_symlink && self.rng.chance(2, 3),
+            nofollow: escaping || (is_symlink && self.rng.chance(2, 3)),
             ..Default::default()
         };
         plain(

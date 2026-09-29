@@ -679,53 +679,80 @@ fn cleanup(scratch: &Path) {
 // macOS sandbox-exec wrapper.
 // ---------------------------------------------------------------------
 
+/// How [`ensure_sandboxed_or_reexec`] resolved. (`Delegated`/`Unavailable`
+/// are only ever built on macOS.)
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+enum Sandbox {
+    /// Already inside the sandbox (`SANDBOX_MARKER` set), or on a platform
+    /// whose safety net is the in-process guard: run the cases right here.
+    Here,
+    /// The whole test was run in a sandboxed child; its captured output is
+    /// for the caller to assert on (the caller must not run the cases too).
+    Delegated(std::process::Output),
+    /// No sandbox is available: skip rather than run unsandboxed.
+    Unavailable(String),
+}
+
 /// If not already running inside the sandbox (`SANDBOX_MARKER` unset) and on
 /// macOS, re-exec this same test binary (with the same arguments) under
-/// `sandbox-exec`, wait for it, and exit with its status -- so the *outer*
-/// `cargo test` invocation never itself touches the filesystem beyond
-/// spawning that child. Returns `Err` (meaning "skip the test, do not run
-/// unsandboxed") when `sandbox-exec` is unavailable. On non-macOS, returns
-/// `Ok(())` immediately: guards in `run_real`/`guard` are the safety net
-/// there.
-fn ensure_sandboxed_or_reexec(test_name: &str) -> Result<(), String> {
+/// `sandbox-exec` and hand its output back as [`Sandbox::Delegated`] -- so
+/// the *outer* `cargo test` invocation never itself touches the filesystem
+/// beyond spawning that child. This never exits the process (a
+/// exiting the process from a test thread would tear down every other test and
+/// hide its own result from the harness); the caller asserts on the child's
+/// status instead. [`Sandbox::Unavailable`] means "skip the test, do not run
+/// unsandboxed". On non-macOS, [`Sandbox::Here`] immediately: guards in
+/// `run_real`/`guard` are the safety net there.
+fn ensure_sandboxed_or_reexec(test_name: &str) -> Sandbox {
     // Only used on macOS, to filter the re-exec'd child down to this one
     // test; unused (but still accepted, for a uniform call site) elsewhere.
     let _ = test_name;
     if std::env::var_os(SANDBOX_MARKER).is_some() {
-        return Ok(());
+        return Sandbox::Here;
     }
     if cfg!(not(target_os = "macos")) {
-        return Ok(());
+        return Sandbox::Here;
     }
     #[cfg(target_os = "macos")]
     {
         let sandbox_exec = Path::new("/usr/bin/sandbox-exec");
         if !sandbox_exec.exists() {
-            return Err("sandbox-exec not found at /usr/bin/sandbox-exec".to_string());
+            return Sandbox::Unavailable(
+                "sandbox-exec not found at /usr/bin/sandbox-exec".to_string(),
+            );
         }
         let base = base_dir();
-        std::fs::create_dir_all(&base).map_err(|e| format!("create base dir: {e}"))?;
-        let canonical_base =
-            std::fs::canonicalize(&base).map_err(|e| format!("canonicalize base dir: {e}"))?;
+        if let Err(e) = std::fs::create_dir_all(&base) {
+            return Sandbox::Unavailable(format!("create base dir: {e}"));
+        }
+        let canonical_base = match std::fs::canonicalize(&base) {
+            Ok(p) => p,
+            Err(e) => return Sandbox::Unavailable(format!("canonicalize base dir: {e}")),
+        };
         let profile = format!(
             "(version 1)(allow default)(deny file-write* (require-not (require-any (subpath \"{}\") (subpath \"/private/var/folders\") (subpath \"/dev\"))))",
             canonical_base.display()
         );
-        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => return Sandbox::Unavailable(format!("current_exe: {e}")),
+        };
         // Re-run only this one test in the child: the outer (unsandboxed)
         // process's own test threads for everything else keep running
         // normally, and the child's `--exact` selection means it does not
         // redundantly repeat the other tests in this file.
-        let status = std::process::Command::new(sandbox_exec)
+        match std::process::Command::new(sandbox_exec)
             .arg("-p")
             .arg(&profile)
             .arg(&exe)
             .arg(test_name)
             .arg("--exact")
             .env(SANDBOX_MARKER, "1")
-            .status()
-            .map_err(|e| format!("spawn sandbox-exec: {e}"))?;
-        std::process::exit(status.code().unwrap_or(1));
+            .output()
+        {
+            Ok(out) => Sandbox::Delegated(out),
+            Err(e) => Sandbox::Unavailable(format!("spawn sandbox-exec: {e}")),
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -821,17 +848,30 @@ fn run_case(seed: u64) {
 
 #[test]
 fn model_agrees_with_the_real_kernel_on_random_op_sequences() {
-    if let Err(msg) =
-        ensure_sandboxed_or_reexec("model_agrees_with_the_real_kernel_on_random_op_sequences")
-    {
-        eprintln!(
-            "SKIPPING model_agrees_with_the_real_kernel_on_random_op_sequences: {msg} \
-             (refusing to run real, mutating filesystem ops unsandboxed)"
-        );
-        return;
-    }
-    for case in 0..case_count() {
-        run_case(0xC0FF_EE00 + case as u64);
+    const NAME: &str = "model_agrees_with_the_real_kernel_on_random_op_sequences";
+    match ensure_sandboxed_or_reexec(NAME) {
+        Sandbox::Unavailable(msg) => {
+            eprintln!(
+                "SKIPPING {NAME}: {msg} \
+                 (refusing to run real, mutating filesystem ops unsandboxed)"
+            );
+        }
+        Sandbox::Delegated(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // "1 passed" also catches a mistyped `--exact` name, which would
+            // otherwise run zero tests and still exit 0.
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "sandboxed child failed ({}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                out.status
+            );
+        }
+        Sandbox::Here => {
+            for case in 0..case_count() {
+                run_case(0xC0FF_EE00 + case as u64);
+            }
+        }
     }
 }
 

@@ -8,6 +8,13 @@ rust-version.workspace = true
 name = "world"
 path = "src/main.rs"
 
+# The differential fuzz driver: `test = true` so its unit tests (child
+# timeouts, sandbox guard predicates) run under `cargo test --workspace`.
+[[example]]
+name = "fuzz_driver"
+path = "examples/fuzz_driver/main.rs"
+test = true
+
 [dependencies]
 anyhow.workspace = true
 libc.workspace = true

@@ -31,6 +31,16 @@
 //!    second, independent layer under the generator's own rule of never
 //!    generating a mutating op whose parent doesn't resolve inside the
 //!    sandbox in the model (see `gen.rs`).
+//!    Every `open` whose flags can change anything (`O_CREAT`, `O_TRUNC`, or
+//!    a writable access mode -- `open_mutates`) gets the same guard, *and*
+//!    the final component is chased by hand: a symlink there is read with
+//!    `readlinkat` and its own parent is guarded in turn (`open_mutating`),
+//!    since `openat` alone would follow the link wherever it points. The
+//!    fd that comes back is finally re-checked against the sandbox as a
+//!    backstop. Read-only opens (`Open`, `OpenAt`, `OpenDir`, `List`) refuse
+//!    FIFOs and devices up front (an outside FIFO would block forever) and
+//!    only keep an fd that is inside the sandbox or a directory that is an
+//!    ancestor of a sandbox root (`/`, `/tmp`, ...): `open_readonly_guarded`.
 //! 3. `bind`/`connect` have no `*at` form (and a `sockaddr_un` path is at most
 //!    ~104 bytes, less than a shimmed physical path): they run in a
 //!    short-lived forked child that `fchdir`s to the already-guarded parent
@@ -44,7 +54,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -75,6 +85,10 @@ pub struct RealState {
     /// "any `Socket` node is connect-able" simplification. Closed
     /// implicitly when the process exits.
     pub listeners: Vec<OwnedFd>,
+    /// The modelled kernel's `MAXSYMLINKS` (`Model::max_symlinks`: 32 on the
+    /// macOS shim, 40 on Linux): the hop limit for chasing a final symlink
+    /// by hand in `open_mutating`.
+    pub max_symlinks: u32,
 }
 
 /// Distinguishes a legitimate POSIX outcome (compared against the model like
@@ -129,8 +143,9 @@ fn cstr(bytes: &[u8]) -> Result<CString, i32> {
 // ---------------------------------------------------------------------
 
 fn split_parent_name(path: &[u8]) -> Result<(Vec<u8>, Vec<u8>), i32> {
+    // POSIX: an empty pathname is ENOENT; `/` has no final component to name.
     if path.is_empty() {
-        return Err(libc::EINVAL);
+        return Err(libc::ENOENT);
     }
     let trimmed = if path.len() > 1 && path.ends_with(b"/") {
         &path[..path.len() - 1]
@@ -245,10 +260,21 @@ fn start_fd(state: &RealState, start: Start) -> Result<RawFd, i32> {
 /// Never returns a parent that failed the guard: that case is always
 /// `Err(ExecError::Harness(..))`, and the caller must not run any syscall.
 fn guarded_parent(state: &RealState, start: Start, path: &[u8]) -> ExecResult<(OwnedFd, Vec<u8>)> {
-    let (dir, name) = split_parent_name(path).map_err(ExecError::Errno)?;
     // An invalid start fd can never resolve to anything: that is an
     // ordinary EBADF/ENOTDIR outcome, not a safety refusal.
     let base = start_fd(state, start).map_err(ExecError::Errno)?;
+    guarded_parent_at(state, base, path)
+}
+
+/// `guarded_parent` against an explicit base directory fd (used to chase a
+/// symlink target, which is relative to the link's own directory or, when
+/// absolute, to the real root).
+fn guarded_parent_at(
+    state: &RealState,
+    base: RawFd,
+    path: &[u8],
+) -> ExecResult<(OwnedFd, Vec<u8>)> {
+    let (dir, name) = split_parent_name(path).map_err(ExecError::Errno)?;
     let parent_fd = if dir == b"." {
         let dup = unsafe { libc::fcntl(base, libc::F_DUPFD_CLOEXEC, 0) };
         if dup < 0 {
@@ -333,25 +359,7 @@ fn in_virtual_cwd(cwd_fd: RawFd, query: &CwdQuery) -> ExecResult<Outcome> {
         unsafe { libc::_exit(0) };
     }
     unsafe { libc::close(write_fd) };
-    let mut f = unsafe { File::from_raw_fd(read_fd) };
-    let mut buf = Vec::new();
-    let read_result = f.read_to_end(&mut buf);
-    drop(f);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut status = 0;
-    loop {
-        let w = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if w == pid {
-            break;
-        }
-        if Instant::now() >= deadline {
-            return Err(ExecError::Harness(format!(
-                "child {pid} for a cwd query did not exit in time"
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    read_result.map_err(|e| ExecError::Harness(format!("read from cwd-query child: {e}")))?;
+    let buf = collect_child_result(read_fd, pid, CHILD_TIMEOUT)?;
     if buf.len() < 16 {
         return Err(ExecError::Harness(
             "cwd-query child reported a truncated result".to_string(),
@@ -366,6 +374,92 @@ fn in_virtual_cwd(cwd_fd: RawFd, query: &CwdQuery) -> ExecResult<Outcome> {
     } else {
         Ok(data_ok(ret, data))
     }
+}
+
+/// Wall-clock budget for one forked helper child (read its result, then
+/// reap it).
+const CHILD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// SIGKILL `pid` and reap it with a bounded (2 s) wait, so a hung child is
+/// neither leaked nor waited on forever.
+fn kill_and_reap(pid: libc::pid_t) {
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut status = 0;
+    loop {
+        let w = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if w == pid || (w < 0 && io_errno() != libc::EINTR) || Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Block until `fd` is readable (data or EOF/hangup), polling in 50 ms
+/// slices. Past `deadline` the child `pid` is killed and reaped and this
+/// returns `Harness("child timed out")`: the IPC read must never hang the
+/// whole run just because the child did.
+fn wait_readable(fd: RawFd, pid: libc::pid_t, deadline: Instant) -> ExecResult<()> {
+    loop {
+        let mut p = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        let r = unsafe { libc::poll(&mut p, 1, 50) };
+        if r > 0 {
+            return Ok(());
+        }
+        if r < 0 && io_errno() != libc::EINTR {
+            let e = io::Error::last_os_error();
+            kill_and_reap(pid);
+            return Err(ExecError::Harness(format!("poll on child pipe: {e}")));
+        }
+        if Instant::now() >= deadline {
+            kill_and_reap(pid);
+            return Err(ExecError::Harness(format!("child {pid} timed out")));
+        }
+    }
+}
+
+/// Read a forked child's whole result from `read_fd` (which this takes
+/// ownership of and closes) until EOF, then reap the child, all under one
+/// shared `timeout`. A child that hangs is killed and reaped and reported as
+/// `Harness`, never waited on forever.
+fn collect_child_result(
+    read_fd: RawFd,
+    pid: libc::pid_t,
+    timeout: Duration,
+) -> ExecResult<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
+    let mut f = unsafe { File::from_raw_fd(read_fd) };
+    unsafe {
+        let fl = libc::fcntl(read_fd, libc::F_GETFL);
+        libc::fcntl(read_fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        wait_readable(read_fd, pid, deadline)?;
+        match f.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
+            Err(e) => {
+                kill_and_reap(pid);
+                return Err(ExecError::Harness(format!(
+                    "read from cwd-query child: {e}"
+                )));
+            }
+        }
+    }
+    drop(f);
+    reap_until(pid, deadline)?;
+    Ok(buf)
 }
 
 /// Runs only in the forked child: never touches `state`/heap-shared data,
@@ -524,37 +618,199 @@ fn mkdir_like(state: &mut RealState, start: Start, path: &[u8], mode: u32) -> Ex
     Ok(plain(if r == 0 { ok(0) } else { err(io_errno()) }))
 }
 
+/// Whether an `open` with these flags can change the filesystem (create,
+/// truncate, or open for writing): only those need the mutation guard.
+fn open_mutates(f: &OpenFlags) -> bool {
+    f.write || f.trunc || f.create
+}
+
 fn open_like(
     state: &mut RealState,
     start: Start,
     path: &[u8],
     flags: &OpenFlags,
 ) -> ExecResult<Applied> {
-    if flags.create {
-        let (parent, name) = guarded_parent(state, start, path)?;
-        let c = cstr(&name).map_err(ExecError::Errno)?;
-        let osflags = translate_flags(flags);
-        let fd = unsafe { libc::openat(parent.as_raw_fd(), c.as_ptr(), osflags, 0o644) };
-        if fd < 0 {
-            return Ok(plain(err(io_errno())));
+    let osflags = translate_flags(flags);
+    let fd = if open_mutates(flags) {
+        match open_mutating(state, start, path, flags, osflags)? {
+            Ok(fd) => fd,
+            Err(e) => return Ok(plain(err(e))),
         }
-        let file = unsafe { File::from_raw_fd(fd) };
-        Ok(Applied {
-            outcome: ok(0),
-            pending: Some(Pending(RealFd::File(file))),
-        })
     } else {
         let base = start_fd(state, start).map_err(ExecError::Errno)?;
-        let c = cstr(path).map_err(ExecError::Errno)?;
-        let osflags = translate_flags(flags);
-        let fd = unsafe { libc::openat(base, c.as_ptr(), osflags, 0o644) };
-        if fd < 0 {
-            return Ok(plain(err(io_errno())));
+        match open_readonly_guarded(state, base, path, osflags)? {
+            Ok(fd) => fd,
+            Err(e) => return Ok(plain(err(e))),
         }
-        Ok(Applied {
-            outcome: ok(0),
-            pending: Some(Pending(classify_fd(fd))),
-        })
+    };
+    Ok(Applied {
+        outcome: ok(0),
+        pending: Some(Pending(classify_fd(fd.into_raw_fd()))),
+    })
+}
+
+/// A creating/truncating/writable open. The parent directory is guarded
+/// exactly like any other mutation, and -- because `openat` would otherwise
+/// follow a symlink in the *final* component to wherever it points -- that
+/// component is chased by hand: every hop's own parent is guarded too, up to
+/// the modelled kernel's `MAXSYMLINKS`. `O_NOFOLLOW` and `O_CREAT|O_EXCL`
+/// never dereference the final component, so they skip the chase. The
+/// canonical path of the fd that comes back is a last backstop.
+///
+/// `Ok(Err(errno))` is an ordinary POSIX failure (compared with the model).
+fn open_mutating(
+    state: &RealState,
+    start: Start,
+    path: &[u8],
+    flags: &OpenFlags,
+    osflags: libc::c_int,
+) -> ExecResult<Result<OwnedFd, i32>> {
+    let mut trailing = path.len() > 1 && path.ends_with(b"/");
+    let (mut parent, mut name) = guarded_parent(state, start, path)?;
+    if !flags.nofollow && !(flags.create && flags.excl) {
+        let mut hops = 0u32;
+        loop {
+            let c = cstr(&name).map_err(ExecError::Errno)?;
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let r = unsafe {
+                libc::fstatat(
+                    parent.as_raw_fd(),
+                    c.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if r != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFLNK {
+                break;
+            }
+            hops += 1;
+            if hops > state.max_symlinks {
+                return Err(ExecError::Errno(libc::ELOOP));
+            }
+            let mut buf = vec![0u8; libc::PATH_MAX as usize];
+            let n = unsafe {
+                libc::readlinkat(
+                    parent.as_raw_fd(),
+                    c.as_ptr(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                )
+            };
+            if n < 0 {
+                // Raced away: let the open below report whatever it finds.
+                break;
+            }
+            buf.truncate(n as usize);
+            if buf.is_empty() {
+                return Err(ExecError::Errno(libc::ENOENT));
+            }
+            trailing |= buf.len() > 1 && buf.ends_with(b"/");
+            let base = if buf[0] == b'/' {
+                state.root_fd.as_raw_fd()
+            } else {
+                parent.as_raw_fd()
+            };
+            let (p, n) = match guarded_parent_at(state, base, &buf) {
+                Ok(v) => v,
+                // A target that names nothing (`/`): opening it for writing
+                // is EISDIR, as the kernel reports.
+                Err(ExecError::Errno(libc::EINVAL)) => {
+                    return Err(ExecError::Errno(libc::EISDIR));
+                }
+                Err(e) => return Err(e),
+            };
+            parent = p;
+            name = n;
+        }
+    }
+    let mut literal = name.clone();
+    if trailing {
+        literal.push(b'/');
+    }
+    let c = cstr(&literal).map_err(ExecError::Errno)?;
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), c.as_ptr(), osflags, 0o644) };
+    if fd < 0 {
+        return Ok(Err(io_errno()));
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let real = dirfd_realpath(owned.as_raw_fd()).map_err(|e| {
+        ExecError::Harness(format!(
+            "could not resolve opened file's canonical path: {e}"
+        ))
+    })?;
+    if !target_allowed(&real, &state.run_id, state.physical_root.as_deref()) {
+        return Err(ExecError::Harness(format!(
+            "opened {} (run {}): outside the sandbox",
+            real.display(),
+            state.run_id
+        )));
+    }
+    Ok(Ok(owned))
+}
+
+/// Whether directory `p` is a bare ancestor of one of the run's sandbox
+/// roots (`/`, `/tmp`, `/private`, `/var/tmp`, the shim's physical `tmp`,
+/// ...): opening it read-only is harmless and the model allows it.
+fn ancestor_of_root(p: &Path, run_id: &str, phys: Option<&[u8]>) -> bool {
+    let p = p.to_string_lossy();
+    let p = p.trim_end_matches('/');
+    sandbox_roots(run_id, phys)
+        .iter()
+        .any(|base| p.is_empty() || base == p || base.starts_with(&format!("{p}/")))
+}
+
+/// A read-only open (`Open`, `OpenAt`, `OpenDir`, `List`): refuse a FIFO or
+/// device before opening it (an outside FIFO would block `openat` forever),
+/// and afterwards keep the fd only if it is inside the sandbox or a
+/// directory that is an ancestor of a sandbox root.
+///
+/// `Ok(Err(errno))` is an ordinary POSIX failure (compared with the model).
+fn open_readonly_guarded(
+    state: &RealState,
+    base: RawFd,
+    path: &[u8],
+    osflags: libc::c_int,
+) -> ExecResult<Result<OwnedFd, i32>> {
+    let c = cstr(path).map_err(ExecError::Errno)?;
+    let stat_flag = if osflags & libc::O_NOFOLLOW != 0 {
+        libc::AT_SYMLINK_NOFOLLOW
+    } else {
+        0
+    };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatat(base, c.as_ptr(), &mut st, stat_flag) } == 0 {
+        let kind = st.st_mode & libc::S_IFMT;
+        if matches!(kind, libc::S_IFIFO | libc::S_IFCHR | libc::S_IFBLK) {
+            return Err(ExecError::Harness(format!(
+                "refusing to open {:?}: a FIFO or device (outside the sandbox)",
+                String::from_utf8_lossy(path)
+            )));
+        }
+    }
+    let fd = unsafe { libc::openat(base, c.as_ptr(), osflags, 0o644) };
+    if fd < 0 {
+        return Ok(Err(io_errno()));
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let real = dirfd_realpath(owned.as_raw_fd()).map_err(|e| {
+        ExecError::Harness(format!(
+            "could not resolve opened path's canonical path: {e}"
+        ))
+    })?;
+    let phys = state.physical_root.as_deref();
+    let mut fst: libc::stat = unsafe { std::mem::zeroed() };
+    let is_dir = unsafe { libc::fstat(owned.as_raw_fd(), &mut fst) } == 0
+        && (fst.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+    if target_allowed(&real, &state.run_id, phys)
+        || (is_dir && ancestor_of_root(&real, &state.run_id, phys))
+    {
+        Ok(Ok(owned))
+    } else {
+        Err(ExecError::Harness(format!(
+            "opened {} (run {}): outside the sandbox",
+            real.display(),
+            state.run_id
+        )))
     }
 }
 
@@ -569,21 +825,14 @@ fn classify_fd(fd: RawFd) -> RealFd {
 
 fn opendir_like(state: &mut RealState, start: Start, path: &[u8]) -> ExecResult<Applied> {
     let base = start_fd(state, start).map_err(ExecError::Errno)?;
-    let c = cstr(path).map_err(ExecError::Errno)?;
-    let fd = unsafe {
-        libc::openat(
-            base,
-            c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Ok(plain(err(io_errno())));
+    let osflags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    match open_readonly_guarded(state, base, path, osflags)? {
+        Ok(fd) => Ok(Applied {
+            outcome: ok(0),
+            pending: Some(Pending(RealFd::Dir(fd))),
+        }),
+        Err(e) => Ok(plain(err(e))),
     }
-    Ok(Applied {
-        outcome: ok(0),
-        pending: Some(Pending(RealFd::Dir(unsafe { OwnedFd::from_raw_fd(fd) }))),
-    })
 }
 
 fn write_fd(state: &mut RealState, fd: u32, data: &[u8]) -> Outcome {
@@ -758,9 +1007,16 @@ fn bind_like(state: &mut RealState, path: &[u8]) -> ExecResult<Outcome> {
         unsafe { libc::_exit(0) };
     }
     unsafe { libc::close(sv[1]) };
-    let received = recv_status(sv[0]);
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    let ready = wait_readable(sv[0], pid, deadline);
+    let received = if ready.is_ok() {
+        recv_status(sv[0])
+    } else {
+        Err("child produced no status".to_string())
+    };
     unsafe { libc::close(sv[0]) };
-    reap(pid)?;
+    ready?;
+    reap_until(pid, deadline)?;
     let (errno, fd) = received.map_err(|e| ExecError::Harness(format!("bind child: {e}")))?;
     if errno != 0 {
         return Ok(err(errno));
@@ -862,15 +1118,16 @@ fn recv_status(chan: RawFd) -> Result<(i32, Option<OwnedFd>), String> {
     }
 }
 
-/// Bounded wait for a forked child.
-fn reap(pid: libc::pid_t) -> ExecResult<()> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+/// Bounded wait for a forked child; on timeout the child is killed and
+/// reaped rather than leaked.
+fn reap_until(pid: libc::pid_t, deadline: Instant) -> ExecResult<()> {
     let mut status = 0;
     loop {
         if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid {
             return Ok(());
         }
         if Instant::now() >= deadline {
+            kill_and_reap(pid);
             return Err(ExecError::Harness(format!(
                 "child {pid} did not exit in time"
             )));
@@ -902,6 +1159,10 @@ fn mkstemp_like(state: &mut RealState, name: &[u8]) -> ExecResult<Applied> {
     // seed-controlled, which would make `replay` irreproducible -- the
     // *name itself* is what exercises the tmp-path redirection under test,
     // not how it was picked; `gen.rs` picks a fresh name up front instead).
+    // The model's `do_mkstemp` rejects an empty name or one with a `/`.
+    if name.is_empty() || name.contains(&b'/') {
+        return Ok(plain(err(libc::EINVAL)));
+    }
     let (parent, literal) = guarded_parent(state, Start::Cwd, name)?;
     let c = cstr(&literal).map_err(ExecError::Errno)?;
     let fd = unsafe {
@@ -924,17 +1185,11 @@ fn mkstemp_like(state: &mut RealState, name: &[u8]) -> ExecResult<Applied> {
 
 fn list_like(state: &RealState, path: &[u8]) -> ExecResult<Outcome> {
     let base = start_fd(state, Start::Cwd).map_err(ExecError::Errno)?;
-    let c = cstr(path).map_err(ExecError::Errno)?;
-    let fd = unsafe {
-        libc::openat(
-            base,
-            c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
+    let osflags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let fd = match open_readonly_guarded(state, base, path, osflags)? {
+        Ok(fd) => fd.into_raw_fd(),
+        Err(e) => return Ok(err(e)),
     };
-    if fd < 0 {
-        return Ok(err(io_errno()));
-    }
     let mut names = match read_dir_names(fd) {
         Ok(n) => n,
         Err(e) => return Ok(err(e)),
@@ -1219,4 +1474,139 @@ fn walk_real_tree(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure unit tests: none of these touches the filesystem (the child
+    //! test only forks a process that calls `pause()`).
+    use super::*;
+
+    #[test]
+    fn hung_child_times_out_and_is_reaped() {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // Holds the write end open and never answers.
+            unsafe {
+                libc::close(r);
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+        unsafe { libc::close(w) };
+        let started = Instant::now();
+        let res = collect_child_result(r, pid, Duration::from_secs(1));
+        assert!(matches!(res, Err(ExecError::Harness(_))));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        // Already killed and reaped: nothing left to wait for.
+        let mut status = 0;
+        let w = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        assert_eq!(w, -1);
+        assert_eq!(io_errno(), libc::ECHILD);
+    }
+
+    #[test]
+    fn split_parent_name_cases() {
+        assert_eq!(split_parent_name(b""), Err(libc::ENOENT));
+        assert_eq!(split_parent_name(b"/"), Err(libc::EINVAL));
+        assert_eq!(
+            split_parent_name(b"/a/b/"),
+            Ok((b"/a".to_vec(), b"b".to_vec()))
+        );
+        assert_eq!(split_parent_name(b"x"), Ok((b".".to_vec(), b"x".to_vec())));
+        assert_eq!(split_parent_name(b"/x"), Ok((b"/".to_vec(), b"x".to_vec())));
+    }
+
+    #[test]
+    fn parent_and_target_allowed() {
+        let run = "fz-0123456789";
+        assert!(parent_allowed(
+            Path::new("/tmp/fz-0123456789/a"),
+            b"x",
+            run,
+            None
+        ));
+        assert!(parent_allowed(
+            Path::new("/private/var/tmp/fz-0123456789"),
+            b"x",
+            run,
+            None
+        ));
+        // A sibling run and the bare tmp root are not allowed...
+        assert!(!parent_allowed(
+            Path::new("/tmp/fz-0123456789x"),
+            b"x",
+            run,
+            None
+        ));
+        assert!(!parent_allowed(Path::new("/tmp"), b"x", run, None));
+        // ...except to create the run's own root.
+        assert!(parent_allowed(Path::new("/tmp"), run.as_bytes(), run, None));
+        assert!(!parent_allowed(
+            Path::new("/etc"),
+            run.as_bytes(),
+            run,
+            None
+        ));
+        let phys = Some(&b"/home/u/.world/tmp/127.0.0.1/"[..]);
+        assert!(parent_allowed(
+            Path::new("/home/u/.world/tmp/127.0.0.1/tmp/fz-0123456789/d"),
+            b"x",
+            run,
+            phys
+        ));
+        assert!(target_allowed(Path::new("/tmp/fz-0123456789"), run, None));
+        assert!(target_allowed(
+            Path::new("/tmp/fz-0123456789/a/b"),
+            run,
+            None
+        ));
+        assert!(!target_allowed(Path::new("/tmp"), run, None));
+        assert!(!target_allowed(Path::new("/tmp/other"), run, None));
+        assert!(!target_allowed(Path::new("/etc/passwd"), run, None));
+    }
+
+    #[test]
+    fn ancestors_of_a_sandbox_root() {
+        let run = "fz-0123456789";
+        for ok in [
+            "/",
+            "/tmp",
+            "/private",
+            "/private/tmp",
+            "/var/tmp",
+            "/tmp/fz-0123456789",
+        ] {
+            assert!(ancestor_of_root(Path::new(ok), run, None), "{ok}");
+        }
+        for bad in ["/etc", "/tmp/other", "/Users", "/private/etc"] {
+            assert!(!ancestor_of_root(Path::new(bad), run, None), "{bad}");
+        }
+    }
+
+    #[test]
+    fn open_mutates_covers_write_trunc_create() {
+        let ro = OpenFlags::default();
+        assert!(!open_mutates(&ro));
+        for f in [
+            OpenFlags {
+                write: true,
+                ..Default::default()
+            },
+            OpenFlags {
+                trunc: true,
+                ..Default::default()
+            },
+            OpenFlags {
+                create: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(open_mutates(&f));
+        }
+    }
 }

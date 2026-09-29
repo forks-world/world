@@ -31,6 +31,20 @@ fn signature(stdout: &str) -> Option<String> {
     Some(format!("{op}|{}", head.join(" ")))
 }
 
+/// Best-effort removal of a (killed) replay's sandbox roots, through the same
+/// guarded, `O_NOFOLLOW`-only walk the driver uses for its own cleanup. A
+/// missing root is not an error; any other failure is ignored (a leftover
+/// under a unique `fz-*` id is harmless to later attempts).
+fn cleanup_roots(run_id: &str) {
+    let phys = std::env::var_os("WORLD_TMP").map(|v| {
+        use std::os::unix::ffi::OsStrExt;
+        v.as_bytes().to_vec()
+    });
+    for root in [format!("/tmp/{run_id}"), format!("/var/tmp/{run_id}")] {
+        let _ = crate::exec::remove_sandbox_tree(run_id, phys.as_deref(), root.as_bytes());
+    }
+}
+
 /// Run `current_exe() replay <candidate> --run-id <fresh>` (stdout to a file,
 /// so a large tree dump can never block the child), waited on with a bounded
 /// timeout (never backgrounded, never awaited unboundedly). Returns the
@@ -53,6 +67,11 @@ fn reproduces(exe: &Path, candidate_file: &Path, timeout: Duration) -> Option<St
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
+            if !matches!(status.code(), Some(0) | Some(1)) {
+                // Killed by a signal / harness abort: the replay may not
+                // have reached its own cleanup.
+                cleanup_roots(&run_id);
+            }
             if status.code() != Some(1) {
                 return None;
             }
@@ -62,6 +81,9 @@ fn reproduces(exe: &Path, candidate_file: &Path, timeout: Duration) -> Option<St
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            // The killed replay never reached its own cleanup: remove the
+            // sandbox roots it may have left behind (best effort).
+            cleanup_roots(&run_id);
             return None;
         }
         std::thread::sleep(Duration::from_millis(20));

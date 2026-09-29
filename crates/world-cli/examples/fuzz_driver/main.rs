@@ -385,6 +385,8 @@ struct RunOutcome {
     /// `Model::tree_json` of the virtual sandbox tmp root, captured before
     /// cleanup (which -- unless `--keep` -- removes it from disk).
     model_tree_json: String,
+    /// Same, for the `/var/tmp/<run-id>` sandbox root.
+    model_var_tree_json: String,
 }
 
 /// Execute `steps` against a fresh model and the real filesystem, in
@@ -506,6 +508,7 @@ fn execute(
             v.as_bytes().to_vec()
         }),
         listeners: Vec::new(),
+        max_symlinks: if profile.is_mac() { 32 } else { 40 },
     };
 
     let linux = !profile.is_mac();
@@ -585,6 +588,8 @@ fn execute(
         None
     };
     let model_tree_json = model.tree_json(View::Virtual, &format!("/tmp/{run_id}").into_bytes());
+    let model_var_tree_json =
+        model.tree_json(View::Virtual, &format!("/var/tmp/{run_id}").into_bytes());
 
     if !keep {
         for root in [g.tmp_root(), g.var_root()] {
@@ -604,6 +609,7 @@ fn execute(
         known_divergences,
         tree_mismatch,
         model_tree_json,
+        model_var_tree_json,
     }
 }
 
@@ -658,8 +664,21 @@ fn entries_agree(model: &Model, a: &Entry, b: &Entry) -> bool {
     false
 }
 
+/// Compare the model's tree against the real one under *both* sandbox roots
+/// (`/tmp/<run-id>` and `/var/tmp/<run-id>`), joining the mismatch messages.
 fn check_final_tree(model: &Model, run_id: &str) -> Option<String> {
-    let tmp_root = format!("/tmp/{run_id}").into_bytes();
+    let msgs: Vec<String> = [format!("/tmp/{run_id}"), format!("/var/tmp/{run_id}")]
+        .into_iter()
+        .filter_map(|root| check_tree_at(model, root.into_bytes()))
+        .collect();
+    if msgs.is_empty() {
+        None
+    } else {
+        Some(msgs.join("; "))
+    }
+}
+
+fn check_tree_at(model: &Model, tmp_root: Vec<u8>) -> Option<String> {
     let model_entries = model.tree(View::Virtual, &tmp_root);
     let real_entries: Vec<Entry> = match exec::real_tree(&tmp_root) {
         Ok(e) => e,
@@ -829,6 +848,9 @@ fn finish(seed: u64, ops: usize, run_id: &str, outcome: RunOutcome) -> i32 {
     // should), falling back to the raw string otherwise.
     let model_tree = serde_json::from_str(&outcome.model_tree_json)
         .unwrap_or(serde_json::Value::String(outcome.model_tree_json.clone()));
+    let model_var_tree = serde_json::from_str(&outcome.model_var_tree_json).unwrap_or(
+        serde_json::Value::String(outcome.model_var_tree_json.clone()),
+    );
     let json = serde_json::json!({
         "seed": seed,
         "ops": ops,
@@ -837,6 +859,7 @@ fn finish(seed: u64, ops: usize, run_id: &str, outcome: RunOutcome) -> i32 {
         "first_divergence": first_divergence_json,
         "known_divergences": known,
         "model_tree": model_tree,
+        "model_var_tree": model_var_tree,
     });
     println!("{json}");
     if result == "diverge" { 1 } else { 0 }
