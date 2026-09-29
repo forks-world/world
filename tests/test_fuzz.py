@@ -556,10 +556,16 @@ class ShimFuzz(HostTempGuard, unittest.TestCase):
             self.skipTest("no corpus files")
         for ops_file in files:
             with self.subTest(file=ops_file.name):
-                if ops_file.name == "seed-trailing-slash-symlinks.ops" and sys.platform == "darwin":
-                    # Whether the kernel follows `link/` differs by macOS
-                    # version (`unlink lf/` removed the link on 15, ENOTDIR
-                    # on 27); only 27 has been measured.
+                if (
+                    ops_file.name.startswith("seed-trailing-slash")
+                    and ops_file.name != "seed-trailing-slash.ops"
+                    and sys.platform == "darwin"
+                ):
+                    # The symlink-operand seeds (-symlinks, -loop) depend on
+                    # whether the kernel follows `link/`, which differs by
+                    # macOS version (`unlink lf/` removed the link on 15,
+                    # ELOOP/ENOTDIR on 27); only 27 has been measured. The
+                    # plain seed has no symlink operands and ran fine on 15.
                     major = int((platform.mac_ver()[0] or "0").split(".")[0] or 0)
                     if major < 27:
                         self.skipTest(f"trailing-slash symlink semantics unmeasured on macOS {major}")

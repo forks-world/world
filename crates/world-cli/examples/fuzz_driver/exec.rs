@@ -1954,36 +1954,57 @@ mod trailing_slash_guard_tests {
 
     #[test]
     fn trailing_slash_use_of_an_inside_symlink_loop_is_not_refused() {
-        let mut f = fixture();
-        std::os::unix::fs::symlink("lb", f.sandbox.join("la")).unwrap();
-        std::os::unix::fs::symlink("la", f.sandbox.join("lb")).unwrap();
-        for i in 0..42 {
-            let next = if i == 41 {
-                "d".to_string()
-            } else {
-                format!("c{}", i + 1)
-            };
-            std::os::unix::fs::symlink(next, f.sandbox.join(format!("c{i}"))).unwrap();
+        fn loop_fixture() -> Fixture {
+            let f = fixture();
+            std::os::unix::fs::symlink("lb", f.sandbox.join("la")).unwrap();
+            std::os::unix::fs::symlink("la", f.sandbox.join("lb")).unwrap();
+            for i in 0..42 {
+                let next = if i == 41 {
+                    "d".to_string()
+                } else {
+                    format!("c{}", i + 1)
+                };
+                std::os::unix::fs::symlink(next, f.sandbox.join(format!("c{i}"))).unwrap();
+            }
+            f
         }
+        let f = loop_fixture();
         let cwd = f.state.cwd_fd.as_raw_fd();
         assert!(check_trailing(&f.state, cwd, b"la", true).is_ok());
         assert!(check_trailing(&f.state, cwd, b"c0", true).is_ok());
+        // Each op runs on a fresh fixture so one op cannot change the tree
+        // the next sees. The core guarantee is that the Harness never
+        // refuses (errno_of panics on a refusal) and the victim is
+        // untouched. macOS 15 acts on the link itself (`unlink lf/` -> 0)
+        // where macOS 27 follows it (ELOOP), so a non-zero errno is only
+        // asserted for ops that fail on every version, or on Linux.
+        let ops: [(&str, bool); 5] = [
+            ("rename L/ y", false),
+            ("rename d L/", true),
+            ("unlink L/", false),
+            ("rmdir L/", true),
+            ("mkdir L/", true),
+        ];
         for link in ["la/", "c0/"] {
-            let l = abs(&f, link);
-            let y = abs(&f, "y");
-            let d = abs(&f, "d");
-            let outs = [
-                rename_like(&mut f.state, &l, &y),
-                rename_like(&mut f.state, &d, &l),
-                unlink_like(&mut f.state, Start::Cwd, &l, false),
-                unlink_like(&mut f.state, Start::Cwd, &l, true),
-                mkdir_like(&mut f.state, Start::Cwd, &l, 0o755).map(|a| a.outcome),
-            ];
-            for o in outs {
-                assert_ne!(errno_of(o), 0, "{link}");
+            for (op, stable) in ops {
+                let mut f = loop_fixture();
+                let l = abs(&f, link);
+                let y = abs(&f, "y");
+                let d = abs(&f, "d");
+                let outcome = match op {
+                    "rename L/ y" => rename_like(&mut f.state, &l, &y),
+                    "rename d L/" => rename_like(&mut f.state, &d, &l),
+                    "unlink L/" => unlink_like(&mut f.state, Start::Cwd, &l, false),
+                    "rmdir L/" => unlink_like(&mut f.state, Start::Cwd, &l, true),
+                    _ => mkdir_like(&mut f.state, Start::Cwd, &l, 0o755).map(|a| a.outcome),
+                };
+                let e = errno_of(outcome);
+                if stable || cfg!(target_os = "linux") {
+                    assert_ne!(e, 0, "{link} {op}");
+                }
+                victim_untouched(&f);
             }
         }
-        victim_untouched(&f);
     }
 
     #[test]
