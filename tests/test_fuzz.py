@@ -370,7 +370,10 @@ class ExecFuzzMixin:
         seeds = seed_sequence()
         troot = self.temp_root()
         tried = 0
-        with tempfile.TemporaryDirectory() as scratch:
+        # The driver writes its op log from inside the workspace, where /tmp
+        # is private, so the scratch dir must live outside host /tmp.
+        (ROOT / "target").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="world-fuzz-ops-", dir=ROOT / "target") as scratch:
             while time.monotonic() < deadline:
                 seed = next(seeds)
                 tried += 1

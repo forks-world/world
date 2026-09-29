@@ -633,14 +633,12 @@ class TempRootSymlinkRace(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # 5. macOS shim storms
 #
-# These intentionally never run under `sandbox-exec`: empirically (see
-# `SandboxExecConfinement.test_sandbox_exec_strips_dyld_insert_libraries`
-# below), sandbox-exec strips DYLD_INSERT_LIBRARIES from its child's
-# environment -- it treats the target like a shell, the same SIP-adjacent
-# hardening that keeps an injected library out of /bin/sh. Wrapping a storm
-# in sandbox-exec would therefore silently run it *unshimmed*, writing
-# straight at the real host /tmp/R instead of the redirected one -- worse,
-# not better. These tests rely instead on stress_probe's own `--dir`
+# These intentionally never run under `sandbox-exec`: how it treats
+# DYLD_INSERT_LIBRARIES depends on the host's SIP configuration (locally it
+# strips the variable, so the child would run *unshimmed* against the real
+# host /tmp/R; on CI runners dyld instead tries to load the library into
+# sandbox-exec itself). Either way the storm would not reliably run through
+# the shim, which is worse, not better. These tests rely instead on stress_probe's own `--dir`
 # allowlist (`check_dir_allowed` in stress_probe/main.rs) plus the shim's
 # WORLD_TMP redirection itself.
 
@@ -772,18 +770,6 @@ class SandboxExecConfinement(unittest.TestCase):
             f"(deny file-write* (require-not (require-any {clauses} "
             '(subpath "/private/var/folders") (subpath "/dev"))))'
         )
-
-    def test_sandbox_exec_strips_dyld_insert_libraries(self):
-        # Documents (and pins, so a future OS change can't silently change
-        # the safety story here) why the shim storms above never run under
-        # sandbox-exec: it never even sees the shim's injection env.
-        result = run_timeout(
-            ["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/env"],
-            timeout=15,
-            env=dict(os.environ, DYLD_INSERT_LIBRARIES="/tmp/does-not-matter.dylib"),
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("DYLD_INSERT_LIBRARIES", result.stdout)
 
     def test_sandbox_exec_confines_writes_to_the_allowed_subpath(self):
         profile = self.profile(str(self.allowed))

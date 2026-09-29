@@ -1013,6 +1013,33 @@ impl Model {
         }
     }
 
+    /// On Linux the private `/tmp` and `/var/tmp` are separate bind mounts:
+    /// 0 = host filesystem, 1 = private tmp mount, 2 = private var/tmp mount.
+    /// macOS redirects both into one filesystem, so everything is mount 0.
+    fn mount_of(&self, mut node: NodeId) -> u8 {
+        let Profile::LinuxMount { root } = &self.profile else {
+            return 0;
+        };
+        let find = |suffix: &[u8]| {
+            let mut path = root.clone();
+            path.extend_from_slice(suffix);
+            self.resolve(View::Physical, Start::Root, &path, true).ok()
+        };
+        let (tmp, var_tmp) = (find(b"/tmp"), find(b"/var/tmp"));
+        loop {
+            if Some(node) == tmp {
+                return 1;
+            }
+            if Some(node) == var_tmp {
+                return 2;
+            }
+            match self.nodes[node].parent {
+                Some(parent) if parent != node => node = parent,
+                _ => return 0,
+            }
+        }
+    }
+
     fn do_rename(&mut self, from: &[u8], to: &[u8]) -> Outcome {
         let (from_parent, from_name) = match self.resolve_parent(Start::Cwd, from) {
             Ok(v) => v,
@@ -1029,6 +1056,10 @@ impl Model {
         match &self.nodes[to_parent].kind {
             NodeKind::Dir | NodeKind::Opaque => {}
             _ => return errout(libc::ENOTDIR),
+        }
+        // Linux checks mount boundaries before the other rename rules.
+        if self.mount_of(from_parent) != self.mount_of(to_parent) {
+            return errout(libc::EXDEV);
         }
         let to_key = self.key(&to_name);
         if to_parent == from_id || self.is_descendant(from_id, to_parent) {
@@ -1691,6 +1722,46 @@ mod tests {
         let node = resolve_ok(&m, View::Virtual, b"/tmp/..");
         let root = resolve_ok(&m, View::Virtual, b"/");
         assert_eq!(node, root);
+    }
+
+    #[test]
+    fn linux_rename_across_private_mounts_is_exdev() {
+        let mut m = Model::new(Profile::LinuxMount { root: linux_root() });
+        for path in [&b"/tmp/a"[..], b"/var/tmp/d"] {
+            let out = m.apply(&Op::Mkdir {
+                path: path.to_vec(),
+                mode: 0o755,
+            });
+            assert_eq!(out.errno, 0, "{}", String::from_utf8_lossy(path));
+        }
+        let cross = m.apply(&Op::Rename {
+            from: b"/tmp/a".to_vec(),
+            to: b"/var/tmp/d/a".to_vec(),
+        });
+        assert_eq!(cross.errno, libc::EXDEV);
+        let within = m.apply(&Op::Rename {
+            from: b"/tmp/a".to_vec(),
+            to: b"/tmp/b".to_vec(),
+        });
+        assert_eq!(within.errno, 0);
+    }
+
+    #[test]
+    fn mac_rename_between_tmp_and_var_tmp_succeeds() {
+        // The shim redirects both into one filesystem under the root.
+        let mut m = Model::new(Profile::MacShim { root: mac_root() });
+        for path in [&b"/tmp/a"[..], b"/var/tmp/d"] {
+            let out = m.apply(&Op::Mkdir {
+                path: path.to_vec(),
+                mode: 0o755,
+            });
+            assert_eq!(out.errno, 0, "{}", String::from_utf8_lossy(path));
+        }
+        let out = m.apply(&Op::Rename {
+            from: b"/tmp/a".to_vec(),
+            to: b"/var/tmp/d/a".to_vec(),
+        });
+        assert_eq!(out.errno, 0);
     }
 
     #[test]
