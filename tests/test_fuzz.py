@@ -672,6 +672,41 @@ class ShimFuzz(HostTempGuard, unittest.TestCase):
                     self.cleanup_run(run_id)
         self.assertGreater(tried, 0)
 
+    def test_escaping_link_probes_are_compared(self):
+        """With --allow-escaping-links the fixture plants links whose target
+        climbs out of the private root. Only non-following ops (lstat,
+        readlink) may touch them, and every mismatch on those fails the run:
+        nothing is suppressed as a "known" divergence."""
+        probes = 0
+        with tempfile.TemporaryDirectory() as scratch:
+            for seed in range(1, 25):
+                run_id = fresh_run_id()
+                ops_file = pathlib.Path(scratch) / f"{run_id}.ops"
+                try:
+                    result = run_timeout(
+                        [FUZZ_DRIVER, *run_args("mac", seed, run_id, ops_file), "--allow-escaping-links"],
+                        RUN_TIMEOUT, env=self.env,
+                    )
+                    self.assertEqual(result.returncode, 0, f"seed={seed}: {result.stdout} {result.stderr}")
+                    data = json.loads(result.stdout)
+                    self.assertEqual(data["result"], "pass")
+                    self.assertNotIn("known_divergences", data)
+                    self.assertEqual(self.ack.read_text(), "world-silo-v1")
+                    self.check_tree(run_id, data)
+                    lines = ops_file.read_text().splitlines()
+                    # The planted links: `symlink ../../../../../../../../../etc <path>`.
+                    escaping = {
+                        line.split(" ")[2].rsplit("/", 1)[-1]
+                        for line in lines if line.startswith("symlink ../../../../")
+                    }
+                    probes += sum(
+                        1 for line in lines
+                        if line.startswith(("lstat ", "readlink ")) and line.rsplit("/", 1)[-1].split(" ")[-1] in escaping
+                    )
+                finally:
+                    self.cleanup_run(run_id)
+        self.assertGreater(probes, 0)
+
     def test_corpus_replay(self):
         files = corpus_files("mac")
         if not files:

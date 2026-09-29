@@ -49,18 +49,10 @@ pub enum Effect {
 pub struct GenStep {
     pub op: Op,
     pub on_success: Effect,
-    /// True for ops that are expected (by construction) to touch an
-    /// escaping symlink: a divergence on one of these is reported as
-    /// "known", never as a fresh finding (see `docs/testing.md`).
-    pub known_gap_candidate: bool,
 }
 
 fn plain(op: Op, on_success: Effect) -> GenStep {
-    GenStep {
-        op,
-        on_success,
-        known_gap_candidate: false,
-    }
+    GenStep { op, on_success }
 }
 
 pub struct Generator {
@@ -230,6 +222,31 @@ impl Generator {
         self.nodes[self.rng.below(self.nodes.len() as u64) as usize]
             .path
             .clone()
+    }
+
+    /// `any_existing`, minus the escaping links: the target of an op that
+    /// *follows* a final symlink (`stat`, `realpath`, an absolute symlink
+    /// target a later op would chase). Resolving through an escaping link is
+    /// the documented shim gap, so only non-following ops touch them.
+    fn any_followable(&mut self) -> Vec<u8> {
+        let nodes: Vec<Vec<u8>> = self
+            .nodes
+            .iter()
+            .map(|n| n.path.clone())
+            .filter(|p| !self.escaping_links.contains(p))
+            .collect();
+        self.pick(&nodes).unwrap_or_else(|| self.tmp_root.clone())
+    }
+
+    /// True if renaming `path` would move an escaping link (it is one, or a
+    /// directory above one): escaping links stay where the fixture put
+    /// them, so no other path can ever come to resolve through one.
+    fn moves_escaping_link(&self, path: &[u8]) -> bool {
+        let mut prefix = path.to_vec();
+        prefix.push(b'/');
+        self.escaping_links
+            .iter()
+            .any(|l| l.as_slice() == path || l.starts_with(&prefix))
     }
 
     /// One of the two sandbox roots, or `dir`'s own siblings, chosen so
@@ -496,15 +513,13 @@ impl Generator {
             let path = join(&dir, &name);
             // Comfortably more `..` than any plausible sandbox depth.
             let target = b"../../../../../../../../../etc".to_vec();
-            let mut step = plain(
+            steps.push(plain(
                 Op::Symlink {
                     target,
                     path: path.clone(),
                 },
                 Effect::AddNode(path.clone(), Kind::Symlink),
-            );
-            step.known_gap_candidate = true;
-            steps.push(step);
+            ));
             self.escaping_links.push(path);
         }
     }
@@ -532,13 +547,14 @@ impl Generator {
         if self.allow_escaping && !self.escaping_links.is_empty() && self.rng.chance(1, 12) {
             let links = self.escaping_links.clone();
             let path = self.pick(&links).unwrap();
-            let mut step = if self.rng.chance(1, 2) {
+            // Neither follows the link, so the documented gap (resolving
+            // *through* an escaping link) cannot apply: any mismatch here is
+            // a real finding and is reported like every other op.
+            return if self.rng.chance(1, 2) {
                 plain(Op::Lstat { path }, Effect::None)
             } else {
                 plain(Op::Readlink { path }, Effect::None)
             };
-            step.known_gap_candidate = true;
-            return step;
         }
         match self.rng.below(23) {
             0 => self.gen_mkdir(),
@@ -694,7 +710,7 @@ impl Generator {
                 None => self.fresh_name(),
             }
         } else {
-            let existing = self.any_existing();
+            let existing = self.any_followable();
             self.spell_absolute(&existing)
         };
         plain(
@@ -712,7 +728,7 @@ impl Generator {
 
     fn gen_rename(&mut self) -> GenStep {
         let from = self.any_existing();
-        if from == self.tmp_root || from == self.var_root {
+        if from == self.tmp_root || from == self.var_root || self.moves_escaping_link(&from) {
             return plain(Op::Getcwd, Effect::None);
         }
         let to_dir = self.any_dir();
@@ -800,13 +816,17 @@ impl Generator {
     }
 
     fn gen_realpath(&mut self) -> GenStep {
-        let target = self.any_existing();
+        let target = self.any_followable();
         let spelled = self.spell(&target);
         plain(Op::Realpath { path: spelled }, Effect::None)
     }
 
     fn gen_stat(&mut self, follow: bool) -> GenStep {
-        let target = self.any_existing();
+        let target = if follow {
+            self.any_followable()
+        } else {
+            self.any_existing()
+        };
         let spelled = self.spell(&target);
         if follow {
             plain(Op::Stat { path: spelled }, Effect::None)
@@ -1032,6 +1052,9 @@ impl Generator {
                 // just like a `self.nodes` one, or a later `Connect` would
                 // target a path this run no longer actually controls.
                 self.sockets.retain(|s| s != to);
+                // `gen_rename` never moves an escaping link, but one can be
+                // replaced by a rename onto it.
+                self.escaping_links.retain(|l| l != to);
                 for n in &mut self.nodes {
                     rebase(&mut n.path, from, to);
                 }
@@ -1163,6 +1186,64 @@ mod tests {
         g.record(&Effect::Remove(s), 0, 0);
         g.record(&Effect::Remove(l), 0, 0);
         assert!(g.sockets.is_empty());
+        assert!(g.escaping_links.is_empty());
+    }
+
+    /// A generator whose only non-root nodes are a directory holding an
+    /// escaping link and one plain file.
+    fn with_escaping_link() -> (Generator, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut g = Generator::new(1, "fz-00000000", true, true);
+        let dir = join(&g.tmp_root, b"d");
+        let link = join(&dir, b"esc");
+        let file = join(&g.tmp_root, b"f");
+        g.record(&Effect::AddNode(dir.clone(), Kind::Dir), 0, 0);
+        g.record(&Effect::AddNode(link.clone(), Kind::Symlink), 0, 0);
+        g.record(&Effect::AddNode(file.clone(), Kind::File), 0, 0);
+        g.escaping_links.push(link.clone());
+        (g, dir, link, file)
+    }
+
+    /// Only `lstat`/`readlink` (never following) may name an escaping link:
+    /// `stat`, `realpath` and a new absolute symlink target never do.
+    #[test]
+    fn following_ops_never_target_an_escaping_link() {
+        let (mut g, _, link, _) = with_escaping_link();
+        let names_link = |p: &[u8]| p.ends_with(b"/esc") || p == b"d/esc" || p == b"esc";
+        let mut lstat_hit = false;
+        for _ in 0..2000 {
+            match g.gen_stat(true).op {
+                Op::Stat { path } => assert!(!names_link(&path), "stat {path:?}"),
+                op => panic!("{op:?}"),
+            }
+            match g.gen_realpath().op {
+                Op::Realpath { path } => assert!(!names_link(&path), "realpath {path:?}"),
+                op => panic!("{op:?}"),
+            }
+            if let Op::Symlink { target, .. } = g.gen_symlink().op {
+                assert!(!names_link(&target), "symlink target {target:?}");
+            }
+            if let Op::Lstat { path } = g.gen_stat(false).op {
+                lstat_hit |= names_link(&path);
+            }
+        }
+        assert!(lstat_hit, "lstat should still probe {link:?}");
+    }
+
+    /// Neither an escaping link nor a directory above it is ever renamed,
+    /// and a rename onto one retires it.
+    #[test]
+    fn escaping_links_never_move() {
+        let (mut g, dir, link, file) = with_escaping_link();
+        assert!(g.moves_escaping_link(&link));
+        assert!(g.moves_escaping_link(&dir));
+        assert!(!g.moves_escaping_link(&file));
+        assert!(!g.moves_escaping_link(&join(&g.tmp_root, b"d2")));
+        for _ in 0..2000 {
+            if let Effect::Rename(from, _) = g.gen_rename().on_success {
+                assert!(from != link && from != dir, "renamed {from:?}");
+            }
+        }
+        g.record(&Effect::Rename(file, link), 0, 0);
         assert!(g.escaping_links.is_empty());
     }
 }

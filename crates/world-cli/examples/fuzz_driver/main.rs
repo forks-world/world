@@ -336,7 +336,6 @@ fn cmd_replay(file: &std::path::Path, run_id_override: Option<String>, keep: boo
         .map(|op| GenStep {
             op,
             on_success: Effect::None,
-            known_gap_candidate: false,
         })
         .collect();
     let mut g = Generator::new(
@@ -388,7 +387,6 @@ impl Divergence {
 struct RunOutcome {
     history: Vec<Op>,
     first_divergence: Option<Divergence>,
-    known_divergences: Vec<Divergence>,
     tree_mismatch: Option<String>,
     /// `Model::tree_json` of the virtual sandbox tmp root, captured before
     /// cleanup (which -- unless `--keep` -- removes it from disk).
@@ -437,7 +435,7 @@ fn operand_snapshot(op_line: &str) -> serde_json::Value {
 }
 
 /// Execute `steps` against a fresh model and the real filesystem, in
-/// lockstep, stopping at the first genuine (non-"known") divergence. Always
+/// lockstep, stopping at the first divergence. Always
 /// returns (never panics on an ordinary POSIX failure): a harness-level
 /// safety refusal is the only thing that aborts the process outright, via
 /// `abort_harness` below.
@@ -459,13 +457,8 @@ fn run_one_step(
     g: &mut Generator,
     linux: bool,
     history: &mut Vec<Op>,
-    known_divergences: &mut Vec<Divergence>,
 ) -> Option<Divergence> {
-    let GenStep {
-        op,
-        on_success,
-        known_gap_candidate,
-    } = step;
+    let GenStep { op, on_success } = step;
     history.push(op.clone());
     let model_out = model.apply(&op);
     let applied = match exec::apply_real(state, &op) {
@@ -491,23 +484,15 @@ fn run_one_step(
     }
     g.record(&on_success, model_out.ret, model_out.errno);
 
-    if let Some(detail) = compare(&op, model, state, linux, &model_out, &real_out) {
-        let d = Divergence {
-            index,
-            op_line: op.to_line(),
-            model_ret: model_out.ret,
-            model_errno: model_out.errno,
-            real_ret: real_out.ret,
-            real_errno: real_out.errno,
-            detail,
-        };
-        if known_gap_candidate {
-            known_divergences.push(d);
-            return None;
-        }
-        return Some(d);
-    }
-    None
+    compare(&op, model, state, linux, &model_out, &real_out).map(|detail| Divergence {
+        index,
+        op_line: op.to_line(),
+        model_ret: model_out.ret,
+        model_errno: model_out.errno,
+        real_ret: real_out.ret,
+        real_errno: real_out.errno,
+        detail,
+    })
 }
 
 /// Execute `prefix` (bootstrap + fixture, already fully generated -- see
@@ -561,20 +546,10 @@ fn execute(
     let linux = !profile.is_mac();
     let mut history = Vec::with_capacity(prefix.len());
     let mut first_divergence = None;
-    let mut known_divergences = Vec::new();
     let mut index = 0usize;
 
     for step in prefix {
-        if let Some(d) = run_one_step(
-            index,
-            step,
-            &mut model,
-            &mut state,
-            g,
-            linux,
-            &mut history,
-            &mut known_divergences,
-        ) {
+        if let Some(d) = run_one_step(index, step, &mut model, &mut state, g, linux, &mut history) {
             first_divergence = Some(d);
         }
         index += 1;
@@ -587,16 +562,9 @@ fn execute(
         match source {
             StepSource::Fixed(steps) => {
                 for step in steps {
-                    if let Some(d) = run_one_step(
-                        index,
-                        step,
-                        &mut model,
-                        &mut state,
-                        g,
-                        linux,
-                        &mut history,
-                        &mut known_divergences,
-                    ) {
+                    if let Some(d) =
+                        run_one_step(index, step, &mut model, &mut state, g, linux, &mut history)
+                    {
                         first_divergence = Some(d);
                     }
                     index += 1;
@@ -608,16 +576,9 @@ fn execute(
             StepSource::Generated(n) => {
                 for _ in 0..n {
                     let step = g.next_op();
-                    if let Some(d) = run_one_step(
-                        index,
-                        step,
-                        &mut model,
-                        &mut state,
-                        g,
-                        linux,
-                        &mut history,
-                        &mut known_divergences,
-                    ) {
+                    if let Some(d) =
+                        run_one_step(index, step, &mut model, &mut state, g, linux, &mut history)
+                    {
                         first_divergence = Some(d);
                     }
                     index += 1;
@@ -657,7 +618,6 @@ fn execute(
     RunOutcome {
         history,
         first_divergence,
-        known_divergences,
         tree_mismatch,
         model_tree_json,
         model_var_tree_json,
@@ -892,11 +852,6 @@ fn finish(seed: u64, ops: usize, run_id: &str, outcome: RunOutcome) -> i32 {
         result = "diverge";
         first_divergence_json = serde_json::json!({ "detail": msg });
     }
-    let known: Vec<serde_json::Value> = outcome
-        .known_divergences
-        .iter()
-        .map(Divergence::to_json)
-        .collect();
     // `Model::tree_json` hand-rolls its own JSON text (no serde dependency in
     // world-fsmodel): embed it as a real value when it parses (it always
     // should), falling back to the raw string otherwise.
@@ -911,7 +866,6 @@ fn finish(seed: u64, ops: usize, run_id: &str, outcome: RunOutcome) -> i32 {
         "run_id": run_id,
         "result": result,
         "first_divergence": first_divergence_json,
-        "known_divergences": known,
         "operand_snapshot": outcome.operand_snapshot,
         "model_tree": model_tree,
         "model_var_tree": model_var_tree,
