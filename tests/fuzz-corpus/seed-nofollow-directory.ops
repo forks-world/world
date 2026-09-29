@@ -16,3 +16,7 @@ open dl 000011
 open ld 000111
 open ld 000001
 open new 100010
+open nope/x 100010
+open f/x 100010
+openat 999 x 100010
+openat 3 x 100010

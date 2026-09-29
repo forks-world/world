@@ -3151,6 +3151,19 @@ mod tests {
                 assert_eq!(open(p, cd), libc::EINVAL);
                 assert_eq!(open(p, OpenFlags { excl: true, ..cd }), libc::EINVAL);
             }
+            // EINVAL wins over every fd, path and lookup error.
+            let long = vec![b'a'; 4096];
+            for p in [&b"nope/x"[..], b"/tmp/f/x", b"x", &long[..]] {
+                assert_eq!(open(p, cd), libc::EINVAL);
+            }
+            for (dirfd, p) in [(99, &b"nope/x"[..]), (99, b"x")] {
+                let out = m.apply(&Op::OpenAt {
+                    dirfd,
+                    path: p.to_vec(),
+                    flags: cd,
+                });
+                assert_eq!(out.errno, libc::EINVAL);
+            }
         }
     }
 

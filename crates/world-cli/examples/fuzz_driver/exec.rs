@@ -879,9 +879,19 @@ fn open_like(
 ) -> ExecResult<Applied> {
     let osflags = translate_flags(flags);
     let fd = if open_mutates(flags) {
-        match open_mutating(state, start, path, flags, osflags)? {
-            Ok(fd) => fd,
-            Err(e) => return Ok(plain(err(e))),
+        match open_mutating(state, start, path, flags, osflags) {
+            Ok(Ok(fd)) => fd,
+            Ok(Err(e)) => return Ok(plain(err(e))),
+            // O_CREAT|O_DIRECTORY is EINVAL before any fd, path or lookup
+            // check (Linux >= 6.4 `build_open_flags` runs before `getname`
+            // and the fd lookup; measured on macOS 27). Any errno the
+            // executor raised itself before the syscall (PATH_MAX, bad
+            // dirfd, missing parent, symlink chase) is therefore EINVAL;
+            // harness refusals stay refusals.
+            Err(ExecError::Errno(_)) if flags.create && flags.directory => {
+                return Ok(plain(err(libc::EINVAL)));
+            }
+            Err(e) => return Err(e),
         }
     } else {
         let base = start_fd(state, start).map_err(ExecError::Errno)?;
@@ -2183,6 +2193,42 @@ mod trailing_slash_guard_tests {
         let ro = OpenFlags::default();
         let a = open_like(&mut f.state, at_start(99, &file), &file, &ro).map(|a| a.outcome);
         assert_eq!(errno_of(a), 0);
+        victim_untouched(&f);
+    }
+
+    #[test]
+    fn create_directory_open_is_einval_before_any_guard_error() {
+        let mut f = fixture();
+        std::fs::write(f.sandbox.join("f"), b"x").unwrap();
+        let cd = OpenFlags {
+            create: true,
+            directory: true,
+            ..OpenFlags::default()
+        };
+        let einval = |f: &mut Fixture, start: Start, path: &[u8]| {
+            let a = open_like(&mut f.state, start, path, &cd).map(|a| a.outcome);
+            assert_eq!(
+                errno_of(a),
+                libc::EINVAL,
+                "{:?}",
+                String::from_utf8_lossy(path)
+            );
+        };
+        einval(&mut f, at_start(99, b"nope/x"), b"nope/x");
+        einval(&mut f, at_start(99, b"x"), b"x");
+        einval(&mut f, Start::Cwd, b"nope/x");
+        einval(&mut f, Start::Cwd, b"f/x");
+        let long = vec![b'a'; libc::PATH_MAX as usize];
+        einval(&mut f, Start::Cwd, &long);
+        // A file fd used as the dirfd.
+        let file = std::fs::File::open(f.sandbox.join("f")).unwrap();
+        f.state.fds.insert(7, RealFd::File(file));
+        einval(&mut f, at_start(7, b"x"), b"x");
+        // A resolvable parent still gets the real kernel's answer, and
+        // nothing is created.
+        let n = abs(&f, "new");
+        einval(&mut f, Start::Cwd, &n);
+        assert!(!f.sandbox.join("new").exists());
         victim_untouched(&f);
     }
 
