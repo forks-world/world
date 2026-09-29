@@ -12,6 +12,11 @@
 //!   pause <marker>   (test-only helper: blocks forever; see STRESS_PROBE_HANG)
 //!   report <marker>
 //!
+//! Test-only environment: `STRESS_PROBE_HANG=<marker>` makes fork-exec-storm
+//! children `pause` instead of `touch`; `STRESS_PROBE_INJECT=<chdir|getcwd|
+//! file_actions_init>` forces that operation to fail with EIO (any other
+//! value exits 2), to prove worker errors fail the probe (exit 1).
+//!
 //! Safety: every mode that touches a directory tree (storm, spawn-storm,
 //! fork-exec-storm) refuses to run unless `--dir` is under a redirected
 //! `/tmp` (see `check_dir_allowed`), so a bug here can never reach outside
@@ -63,7 +68,10 @@ impl Report {
         self.ops.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn error(&self, kind: &str) {
+    /// Count an operational error of `kind`. Private on purpose: callers
+    /// use `fail`, so an error can never be counted without also being a
+    /// violation (which fails the probe).
+    fn count_error(&self, kind: &str) {
         *self
             .errors
             .lock()
@@ -72,12 +80,20 @@ impl Report {
             .or_insert(0) += 1;
     }
 
+    /// Record a pure invariant violation (no operational error involved).
     fn violation(&self, msg: String) {
         self.violations.lock().unwrap().push(msg);
     }
 
-    /// Print the JSON summary and exit: 0 if nothing violated an invariant,
-    /// 1 otherwise. Never returns.
+    /// Record an operational failure: bump `errors_by_kind[kind]` and push
+    /// `msg` as a violation, so no error can go unreported.
+    fn fail(&self, kind: &str, msg: String) {
+        self.count_error(kind);
+        self.violation(msg);
+    }
+
+    /// Print the JSON summary and exit: 0 if nothing violated an invariant
+    /// and no error was counted, 1 otherwise. Never returns.
     fn finish(&self, expected_files: Vec<String>) -> ! {
         let errors = self.errors.lock().unwrap().clone();
         let violations = self.violations.lock().unwrap().clone();
@@ -88,8 +104,31 @@ impl Report {
             "violations": violations,
         });
         println!("{summary}");
-        std::process::exit(if violations.is_empty() { 0 } else { 1 });
+        std::process::exit(if violations.is_empty() && errors.is_empty() {
+            0
+        } else {
+            1
+        });
     }
+}
+
+/// Test-only failure injection (`STRESS_PROBE_INJECT=<kind>`): whether `kind`
+/// (`chdir`, `getcwd`, or `file_actions_init`) should be reported as failed
+/// with EIO at its site. Read once; an unknown kind exits 2 so a typo cannot
+/// pass silently. Injection only turns a success into a failure.
+fn injected(kind: &str) -> bool {
+    static INJECT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let v = INJECT.get_or_init(|| {
+        let v = std::env::var("STRESS_PROBE_INJECT")
+            .ok()
+            .filter(|v| !v.is_empty())?;
+        if !["chdir", "getcwd", "file_actions_init"].contains(&v.as_str()) {
+            eprintln!("stress_probe: unknown STRESS_PROBE_INJECT kind {v:?}");
+            std::process::exit(2);
+        }
+        Some(v)
+    });
+    v.as_deref() == Some(kind)
 }
 
 /// Join every worker; a panicked worker is a violation, never silently
@@ -102,8 +141,7 @@ fn join_workers(handles: Vec<std::thread::JoinHandle<()>>, report: &Report) {
                 .cloned()
                 .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
                 .unwrap_or_else(|| "non-string panic".into());
-            report.error("worker_panic");
-            report.violation(format!("worker {n} panicked: {why}"));
+            report.fail("worker_panic", format!("worker {n} panicked: {why}"));
         }
     }
 }
@@ -197,6 +235,14 @@ fn check_dir_allowed(dir: &Path) -> Result<&'static str, String> {
 /// one of them, "/tmp is redirected to <phys>/tmp" would be tautological.
 const HOST_TEMP_ROOTS: [&str; 4] = ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"];
 
+/// The physical root of the redirected `/tmp`: `STRESS_PROBE_PHYSICAL_ROOT`
+/// first, then `WORLD_TMP`.
+fn physical_root_env() -> Option<std::ffi::OsString> {
+    std::env::var_os("STRESS_PROBE_PHYSICAL_ROOT")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("WORLD_TMP").filter(|v| !v.is_empty()))
+}
+
 /// Prove, without writing anything, that `/tmp` is redirected to a private
 /// tree rather than being the shared host temp dir. The physical root comes
 /// from `STRESS_PROBE_PHYSICAL_ROOT` (the Linux harness passes the workspace
@@ -220,10 +266,7 @@ fn verify_redirected(prefix: &str) -> Result<OwnedFd, String> {
     let fail =
         |why: String| -> Result<OwnedFd, String> { Err(format!("not running redirected: {why}")) };
 
-    let phys = std::env::var_os("STRESS_PROBE_PHYSICAL_ROOT")
-        .filter(|v| !v.is_empty())
-        .or_else(|| std::env::var_os("WORLD_TMP").filter(|v| !v.is_empty()));
-    let Some(phys) = phys else {
+    let Some(phys) = physical_root_env() else {
         return fail("neither STRESS_PROBE_PHYSICAL_ROOT nor WORLD_TMP is set".into());
     };
     let phys = PathBuf::from(phys);
@@ -418,7 +461,8 @@ fn read_nofollow(path: &Path) -> std::io::Result<String> {
 /// doing N iterations of absolute-path open/write/rename/unlink and a
 /// bind+connect(AF_UNIX)+getsockname round under /tmp/R/<thread>/..., plus
 /// one chdir thread repeatedly chdir-ing into /tmp/R/<n> and asserting
-/// getcwd never contains the physical root (WORLD_TMP) as a substring.
+/// getcwd never contains the physical root (`STRESS_PROBE_PHYSICAL_ROOT`,
+/// else `WORLD_TMP`) as a substring.
 fn cmd_storm(flags: &BTreeMap<String, String>) {
     let threads = flag_u64(flags, "threads", 4).max(1) as usize;
     let iters = flag_u64(flags, "iters", 20).max(1) as usize;
@@ -430,7 +474,7 @@ fn cmd_storm(flags: &BTreeMap<String, String>) {
     }
 
     let report = Arc::new(Report::default());
-    let world_tmp = std::env::var("WORLD_TMP").ok().filter(|s| !s.is_empty());
+    let world_tmp = physical_root_env().map(|p| p.to_string_lossy().into_owned());
 
     let mut handles = Vec::new();
     for t in 0..threads {
@@ -483,15 +527,13 @@ fn storm_worker(t: usize, iters: usize, dir: &Path, report: &Report, rng: &mut S
             .open(&file)
             .and_then(|mut f| std::io::Write::write_all(&mut f, b"stress"));
         if let Err(e) = written {
-            report.error("open");
-            report.violation(format!("write {}: {e}", file.display()));
+            report.fail("open", format!("write {}: {e}", file.display()));
             continue;
         }
 
         report.op();
         if let Err(e) = std::fs::rename(&file, &renamed) {
-            report.error("rename");
-            report.violation(format!("rename {}: {e}", file.display()));
+            report.fail("rename", format!("rename {}: {e}", file.display()));
             continue;
         }
 
@@ -501,15 +543,13 @@ fn storm_worker(t: usize, iters: usize, dir: &Path, report: &Report, rng: &mut S
         if i + 1 < iters {
             report.op();
             if let Err(e) = std::fs::remove_file(&renamed) {
-                report.error("unlink");
-                report.violation(format!("unlink {}: {e}", renamed.display()));
+                report.fail("unlink", format!("unlink {}: {e}", renamed.display()));
             }
         }
 
         report.op();
         if let Err(msg) = socket_round(&tdir, i, rng) {
-            report.error("socket");
-            report.violation(msg);
+            report.fail("socket", msg);
         }
     }
 }
@@ -579,16 +619,32 @@ fn chdir_worker(
         report.op();
         // SAFETY: `c` is a NUL-terminated path; chdir reads it and has no
         // other preconditions.
-        if unsafe { libc::chdir(c.as_ptr()) } != 0 {
-            report.error("chdir");
+        let chdir_err = if injected("chdir") {
+            Some(std::io::Error::from_raw_os_error(libc::EIO))
+        } else if unsafe { libc::chdir(c.as_ptr()) } != 0 {
+            Some(std::io::Error::last_os_error())
+        } else {
+            None
+        };
+        if let Some(e) = chdir_err {
+            report.fail("chdir", format!("chdir {}: {e}", target.display()));
             continue;
         }
         let mut buf = vec![0u8; 4096];
         // SAFETY: `buf` is a valid, writable buffer of the given length,
         // outliving the call.
         let cwd = unsafe { libc::getcwd(buf.as_mut_ptr().cast(), buf.len()) };
-        if cwd.is_null() {
-            report.error("getcwd");
+        let getcwd_err = std::io::Error::last_os_error();
+        if injected("getcwd") || cwd.is_null() {
+            let e = if injected("getcwd") {
+                std::io::Error::from_raw_os_error(libc::EIO)
+            } else {
+                getcwd_err
+            };
+            report.fail(
+                "getcwd",
+                format!("getcwd after chdir {}: {e}", target.display()),
+            );
             continue;
         }
         // SAFETY: `getcwd` returned non-null, i.e. `buf`'s own storage,
@@ -680,28 +736,27 @@ fn spawn_worker(t: usize, iters: usize, dir: &Path, exe: &Path, report: &Report)
         match spawn_report(&exe_c, &tdir_c, &out, &marker) {
             Ok(0) => {}
             Ok(status) => {
-                report.error("spawn_exit");
-                report.violation(format!("child exited {status} for {}", out.display()));
+                report.fail(
+                    "spawn_exit",
+                    format!("child exited {status} for {}", out.display()),
+                );
                 continue;
             }
             Err(e) => {
-                report.error("spawn");
-                report.violation(format!("spawn failed for {}: {e}", out.display()));
+                report.fail("spawn", format!("spawn failed for {}: {e}", out.display()));
                 continue;
             }
         }
         match read_nofollow(&out) {
             Ok(content) if content.trim() == marker => {}
             Ok(content) => {
-                report.error("content_mismatch");
-                report.violation(format!(
-                    "{}: expected {marker:?}, got {content:?}",
-                    out.display()
-                ));
+                report.fail(
+                    "content_mismatch",
+                    format!("{}: expected {marker:?}, got {content:?}", out.display()),
+                );
             }
             Err(e) => {
-                report.error("read_output");
-                report.violation(format!("read {}: {e}", out.display()));
+                report.fail("read_output", format!("read {}: {e}", out.display()));
             }
         }
     }
@@ -845,8 +900,18 @@ fn churn_worker(iters: usize, report: &Report) {
         // before it goes out of scope; never spawned or otherwise used.
         unsafe {
             let mut actions = std::mem::MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
-            if libc::posix_spawn_file_actions_init(actions.as_mut_ptr()) != 0 {
-                report.error("file_actions_init");
+            let mut r = libc::posix_spawn_file_actions_init(actions.as_mut_ptr());
+            if injected("file_actions_init") {
+                r = libc::EIO;
+            }
+            if r != 0 {
+                report.fail(
+                    "file_actions_init",
+                    format!(
+                        "posix_spawn_file_actions_init: {}",
+                        std::io::Error::from_raw_os_error(r)
+                    ),
+                );
                 continue;
             }
             let mut actions = actions.assume_init();
@@ -1034,12 +1099,14 @@ fn fork_exec_worker(
         // locking -- `path_c` was already built above).
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            report.error("fork");
-            report.violation(format!(
-                "fork failed for {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            ));
+            report.fail(
+                "fork",
+                format!(
+                    "fork failed for {}: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                ),
+            );
             continue;
         }
         if pid == 0 {
@@ -1087,8 +1154,7 @@ fn fork_exec_worker(
                 if err.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                report.error("waitpid");
-                report.violation(format!("waitpid failed for pid {pid}: {err}"));
+                report.fail("waitpid", format!("waitpid failed for pid {pid}: {err}"));
                 break;
             }
             if stop.load(Ordering::SeqCst) || Instant::now() >= deadline {
@@ -1103,33 +1169,31 @@ fn fork_exec_worker(
         if libc::WIFEXITED(status) {
             let code = libc::WEXITSTATUS(status);
             if code == 127 && exec {
-                report.error("exec_failed");
-                report.violation(format!("exec failed for {}", path.display()));
+                report.fail("exec_failed", format!("exec failed for {}", path.display()));
             } else if code != 0 {
-                report.error("child_exit");
-                report.violation(format!("child for {} exited {code}", path.display()));
+                report.fail(
+                    "child_exit",
+                    format!("child for {} exited {code}", path.display()),
+                );
             } else {
                 match read_nofollow(&path) {
                     Ok(content) if content == marker => {}
                     Ok(content) => {
-                        report.error("content_mismatch");
-                        report.violation(format!(
-                            "{}: expected {marker:?}, got {content:?}",
-                            path.display()
-                        ));
+                        report.fail(
+                            "content_mismatch",
+                            format!("{}: expected {marker:?}, got {content:?}", path.display()),
+                        );
                     }
                     Err(e) => {
-                        report.error("read_output");
-                        report.violation(format!("read {}: {e}", path.display()));
+                        report.fail("read_output", format!("read {}: {e}", path.display()));
                     }
                 }
             }
         } else {
-            report.error("child_signal");
-            report.violation(format!(
-                "child for {} did not exit normally",
-                path.display()
-            ));
+            report.fail(
+                "child_signal",
+                format!("child for {} did not exit normally", path.display()),
+            );
         }
     }
 }
@@ -1195,6 +1259,8 @@ fn cmd_touch(args: &[String]) {
 }
 
 fn main() {
+    // Validate STRESS_PROBE_INJECT up front (unknown kind exits 2).
+    injected("");
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("usage: stress_probe <storm|spawn-storm|fork-exec-storm|touch|report> ...");
