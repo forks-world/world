@@ -1267,14 +1267,19 @@ class LinuxHolderRace(unittest.TestCase):
 class NetworkSoak(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # Everything is registered with addClassCleanup the moment it exists:
+        # unittest runs those (LIFO) even when setUpClass itself raises, so a
+        # failed create/ifconfig cannot leak aliases, temp roots or dirs.
         cls.temp = tempfile.TemporaryDirectory(prefix="world-stress-soak-")
+        cls.addClassCleanup(cls.temp.cleanup)
         cls.root = pathlib.Path(cls.temp.name)
         cls.state = cls.root / "state"
         # A dedicated HOME under our own scratch root: workspace temp roots
         # (~/.world/tmp/<ip>) must never land under the real developer/CI
-        # HOME (see `assert_owned` in tearDownClass, and the same rule every
+        # HOME (see `assert_owned` in `owned_rmtree`, and the same rule every
         # other test in this file follows via `short_dir`).
         cls.home_dir = tempfile.TemporaryDirectory(prefix=".wt-soak-", dir=str(pathlib.Path.home()))
+        cls.addClassCleanup(cls.home_dir.cleanup)
         cls.home = pathlib.Path(cls.home_dir.name)
         cls.env = dict(os.environ, HOME=str(cls.home))
         cls.worlds = {}
@@ -1290,22 +1295,20 @@ class NetworkSoak(unittest.TestCase):
             if result.returncode:
                 raise AssertionError(result.stderr)
             info = json.loads(result.stdout)
+            # assert_owned (inside owned_rmtree) keeps this under the
+            # dedicated HOME.
+            cls.addClassCleanup(owned_rmtree, pathlib.Path(info["temp_root"]), cls.home)
             subprocess.run(
                 ["sudo", "-n", "/sbin/ifconfig", "lo0", "alias", info["ip"], "netmask", "255.0.0.0"],
                 check=True,
                 timeout=10,
             )
+            cls.addClassCleanup(cls._remove_alias, info["ip"])
             cls.worlds[name] = info
 
-    @classmethod
-    def tearDownClass(cls):
-        for world in getattr(cls, "worlds", {}).values():
-            owned_rmtree(pathlib.Path(world["temp_root"]), cls.home)
-            subprocess.run(
-                ["sudo", "-n", "/sbin/ifconfig", "lo0", "-alias", world["ip"]], check=True, timeout=10
-            )
-        cls.temp.cleanup()
-        cls.home_dir.cleanup()
+    @staticmethod
+    def _remove_alias(ip):
+        subprocess.run(["sudo", "-n", "/sbin/ifconfig", "lo0", "-alias", ip], check=True, timeout=10)
 
     def command(self, world, *args):
         return [WORLD, "exec", world, "--state-dir", self.state, "--timeout", "90s", "--", PROBE, *args]
