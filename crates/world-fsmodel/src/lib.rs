@@ -77,6 +77,16 @@ pub enum Start {
     Root,
 }
 
+/// The starting point for an `*at` call: an absolute path ignores `dirfd`
+/// entirely (the kernel never looks at it), a relative one starts at it.
+pub fn at_start(dirfd: u32, path: &[u8]) -> Start {
+    if path.starts_with(b"/") {
+        Start::Root
+    } else {
+        Start::Fd(dirfd)
+    }
+}
+
 /// The result of [`Model::apply`]ing an [`Op`]: `ret`/`errno` mirror a libc
 /// call's return value and `errno`; `data` carries any bytes the call would
 /// also produce (a `read`'s bytes, a `readlink`'s target, `getcwd`'s string,
@@ -499,7 +509,7 @@ impl Model {
         link_count: &mut u32,
         mut trace: Option<&mut Vec<NodeId>>,
     ) -> Result<NodeId, Errno> {
-        if path.len() > self.path_max() {
+        if path.len() >= self.path_max() {
             return Err(libc::ENAMETOOLONG);
         }
         // POSIX: an empty pathname is ENOENT (Linux and macOS alike; only
@@ -718,9 +728,9 @@ impl Model {
     pub fn apply(&mut self, op: &Op) -> Outcome {
         match op {
             Op::Mkdir { path, mode: _ } => self.do_mkdir(Start::Cwd, path),
-            Op::MkdirAt { dirfd, path } => self.do_mkdir(Start::Fd(*dirfd), path),
+            Op::MkdirAt { dirfd, path } => self.do_mkdir(at_start(*dirfd, path), path),
             Op::Open { path, flags } => self.do_open(Start::Cwd, path, flags),
-            Op::OpenAt { dirfd, path, flags } => self.do_open(Start::Fd(*dirfd), path, flags),
+            Op::OpenAt { dirfd, path, flags } => self.do_open(at_start(*dirfd, path), path, flags),
             Op::OpenDir { path } => self.do_opendir(Start::Cwd, path),
             Op::Write { fd, data } => self.do_write(*fd, data),
             Op::Read { fd, len } => self.do_read(*fd, *len),
@@ -730,7 +740,7 @@ impl Model {
             Op::Unlink { path } => self.unlink_impl(Start::Cwd, path, false),
             Op::Rmdir { path } => self.unlink_impl(Start::Cwd, path, true),
             Op::UnlinkAt { dirfd, path, rmdir } => {
-                self.unlink_impl(Start::Fd(*dirfd), path, *rmdir)
+                self.unlink_impl(at_start(*dirfd, path), path, *rmdir)
             }
             Op::Chdir { path } => self.do_chdir(path),
             Op::Getcwd => self.do_getcwd(),
@@ -1019,7 +1029,7 @@ impl Model {
         link_count: &mut u32,
     ) -> Result<(NodeId, Vec<u8>), Errno> {
         let view = View::Virtual;
-        if path.len() > self.path_max() {
+        if path.len() >= self.path_max() {
             return Err(libc::ENAMETOOLONG);
         }
         if path.is_empty() {
@@ -1180,6 +1190,11 @@ impl Model {
     }
 
     fn do_symlink(&mut self, target: &[u8], path: &[u8]) -> Outcome {
+        // Both kernels copy the target in first and reject one that does
+        // not fit before looking at the link path at all.
+        if target.len() >= self.path_max() {
+            return errout(libc::ENAMETOOLONG);
+        }
         match self.resolve_parent(Start::Cwd, path) {
             Ok((parent, name, trailing)) => {
                 match &self.nodes[parent].kind {
@@ -1546,6 +1561,10 @@ impl Model {
     }
 
     fn resolve_parent(&self, start: Start, path: &[u8]) -> Result<(NodeId, Vec<u8>, bool), Errno> {
+        // The kernel sees the whole text, not just the directory part.
+        if path.len() >= self.path_max() {
+            return Err(libc::ENAMETOOLONG);
+        }
         let (dir, name, trailing) = parent_and_name(path)?;
         if name == b"." || name == b".." {
             return Err(libc::EINVAL);
@@ -1755,6 +1774,13 @@ fn unescape(s: &str) -> Vec<u8> {
     out
 }
 
+/// [`unescape`] for a path-like operand: `None` if the decoded bytes contain
+/// a NUL, which no real syscall can carry (the C string would be truncated).
+fn unescape_path(s: &str) -> Option<Vec<u8>> {
+    let v = unescape(s);
+    if v.contains(&0) { None } else { Some(v) }
+}
+
 fn flag_char(v: bool) -> char {
     if v { '1' } else { '0' }
 }
@@ -1792,6 +1818,33 @@ impl OpenFlags {
 }
 
 impl Op {
+    /// Every path-like byte string this op hands to a syscall (`write`
+    /// data is not one).
+    pub fn path_operands(&self) -> Vec<&[u8]> {
+        match self {
+            Op::Mkdir { path, .. }
+            | Op::Open { path, .. }
+            | Op::Readlink { path }
+            | Op::Unlink { path }
+            | Op::Rmdir { path }
+            | Op::Chdir { path }
+            | Op::Realpath { path }
+            | Op::Stat { path }
+            | Op::Lstat { path }
+            | Op::OpenDir { path }
+            | Op::OpenAt { path, .. }
+            | Op::MkdirAt { path, .. }
+            | Op::UnlinkAt { path, .. }
+            | Op::Bind { path }
+            | Op::Connect { path }
+            | Op::List { path } => vec![path],
+            Op::Symlink { target, path } => vec![target, path],
+            Op::Rename { from, to } => vec![from, to],
+            Op::MkstempAdopt { name } => vec![name],
+            Op::Write { .. } | Op::Read { .. } | Op::Getcwd | Op::CloseFd { .. } => vec![],
+        }
+    }
+
     /// Render as a single stable, round-trippable text line (no embedded
     /// newlines: path/data bytes are hex-escaped).
     pub fn to_line(&self) -> String {
@@ -1834,11 +1887,11 @@ impl Op {
         let cmd = it.next()?;
         match cmd {
             "mkdir" => Some(Op::Mkdir {
-                path: unescape(it.next()?),
+                path: unescape_path(it.next()?)?,
                 mode: u32::from_str_radix(it.next()?, 8).ok()?,
             }),
             "open" => Some(Op::Open {
-                path: unescape(it.next()?),
+                path: unescape_path(it.next()?)?,
                 flags: OpenFlags::from_flag_str(it.next()?)?,
             }),
             "write" => Some(Op::Write {
@@ -1850,63 +1903,63 @@ impl Op {
                 len: it.next()?.parse().ok()?,
             }),
             "symlink" => Some(Op::Symlink {
-                target: unescape(it.next()?),
-                path: unescape(it.next()?),
+                target: unescape_path(it.next()?)?,
+                path: unescape_path(it.next()?)?,
             }),
             "readlink" => Some(Op::Readlink {
-                path: unescape(it.next()?),
+                path: unescape_path(it.next()?)?,
             }),
             "rename" => Some(Op::Rename {
-                from: unescape(it.next()?),
-                to: unescape(it.next()?),
+                from: unescape_path(it.next()?)?,
+                to: unescape_path(it.next()?)?,
             }),
             "unlink" => Some(Op::Unlink {
-                path: unescape(it.next()?),
+                path: unescape_path(it.next()?)?,
             }),
             "rmdir" => Some(Op::Rmdir {
-                path: unescape(it.next()?),
+                path: unescape_path(it.next()?)?,
             }),
             "chdir" => Some(Op::Chdir {
-                path: unescape(it.next()?),
+                path: unescape_path(it.next()?)?,
             }),
             "getcwd" => Some(Op::Getcwd),
             "realpath" => Some(Op::Realpath {
-                path: unescape(it.next()?),
+                path: unescape_path(it.next()?)?,
             }),
             "stat" => Some(Op::Stat {
-                path: unescape(it.next()?),
+                path: unescape_path(it.next()?)?,
             }),
             "lstat" => Some(Op::Lstat {
-                path: unescape(it.next()?),
+                path: unescape_path(it.next()?)?,
             }),
             "opendir" => Some(Op::OpenDir {
-                path: unescape(it.next()?),
+                path: unescape_path(it.next()?)?,
             }),
             "openat" => Some(Op::OpenAt {
                 dirfd: it.next()?.parse().ok()?,
-                path: unescape(it.next()?),
+                path: unescape_path(it.next()?)?,
                 flags: OpenFlags::from_flag_str(it.next()?)?,
             }),
             "mkdirat" => Some(Op::MkdirAt {
                 dirfd: it.next()?.parse().ok()?,
-                path: unescape(it.next()?),
+                path: unescape_path(it.next()?)?,
             }),
             "unlinkat" => Some(Op::UnlinkAt {
                 dirfd: it.next()?.parse().ok()?,
-                path: unescape(it.next()?),
+                path: unescape_path(it.next()?)?,
                 rmdir: it.next()?.parse().ok()?,
             }),
             "bind" => Some(Op::Bind {
-                path: unescape(it.next()?),
+                path: unescape_path(it.next()?)?,
             }),
             "connect" => Some(Op::Connect {
-                path: unescape(it.next()?),
+                path: unescape_path(it.next()?)?,
             }),
             "mkstemp" => Some(Op::MkstempAdopt {
-                name: unescape(it.next()?),
+                name: unescape_path(it.next()?)?,
             }),
             "list" => Some(Op::List {
-                path: unescape(it.next()?),
+                path: unescape_path(it.next()?)?,
             }),
             "close" => Some(Op::CloseFd {
                 fd: it.next()?.parse().ok()?,
@@ -2926,6 +2979,176 @@ mod tests {
                 },
             });
             assert_eq!(out.errno, want);
+        }
+    }
+
+    #[test]
+    fn nul_in_a_path_operand_is_rejected_at_parse_time() {
+        for line in [
+            "mkdir a%00b 755",
+            "open a%00b 0000",
+            "symlink t%00x a",
+            "symlink t a%00b",
+            "readlink a%00b",
+            "rename a%00b c",
+            "rename a c%00d",
+            "unlink a%00b",
+            "rmdir a%00b",
+            "chdir a%00b",
+            "realpath a%00b",
+            "stat a%00b",
+            "lstat a%00b",
+            "opendir a%00b",
+            "openat 3 a%00b 0000",
+            "mkdirat 3 a%00b",
+            "unlinkat 3 a%00b false",
+            "bind a%00b",
+            "connect a%00b",
+            "mkstemp a%00b",
+            "list a%00b",
+        ] {
+            assert_eq!(Op::from_line(line), None, "{line}");
+        }
+        let w = Op::Write {
+            fd: 3,
+            data: b"a\0b".to_vec(),
+        };
+        assert_eq!(Op::from_line(&w.to_line()), Some(w));
+    }
+
+    #[test]
+    fn absolute_at_paths_ignore_the_dirfd() {
+        let create = OpenFlags {
+            create: true,
+            write: true,
+            ..OpenFlags::default()
+        };
+        for profile in [
+            Profile::MacShim { root: mac_root() },
+            Profile::LinuxMount { root: linux_root() },
+        ] {
+            let mut m = Model::new(profile);
+            // A bogus fd: relative fails, absolute does not care.
+            let rel = m.apply(&Op::OpenAt {
+                dirfd: 99,
+                path: b"f".to_vec(),
+                flags: create,
+            });
+            assert_eq!(rel.errno, libc::EBADF);
+            let abs = m.apply(&Op::OpenAt {
+                dirfd: 99,
+                path: b"/tmp/f".to_vec(),
+                flags: create,
+            });
+            assert_eq!(abs.errno, 0);
+            // A file fd: relative is ENOTDIR, absolute still works.
+            let fd = abs.ret as u32;
+            let rel = m.apply(&Op::MkdirAt {
+                dirfd: fd,
+                path: b"n".to_vec(),
+            });
+            assert_eq!(rel.errno, libc::ENOTDIR);
+            let out = m.apply(&Op::MkdirAt {
+                dirfd: fd,
+                path: b"/tmp/n".to_vec(),
+            });
+            assert_eq!(out.errno, 0);
+            let out = m.apply(&Op::UnlinkAt {
+                dirfd: 99,
+                path: b"/tmp/n".to_vec(),
+                rmdir: true,
+            });
+            assert_eq!(out.errno, 0);
+            let out = m.apply(&Op::UnlinkAt {
+                dirfd: 99,
+                path: b"n".to_vec(),
+                rmdir: true,
+            });
+            assert_eq!(out.errno, libc::EBADF);
+        }
+        assert_eq!(at_start(5, b"/x"), Start::Root);
+        assert_eq!(at_start(5, b"x"), Start::Fd(5));
+    }
+
+    #[test]
+    fn path_max_boundary_per_profile() {
+        for (profile, max) in [
+            (Profile::MacShim { root: mac_root() }, 1024usize),
+            (Profile::LinuxMount { root: linux_root() }, 4096usize),
+        ] {
+            let mut m = Model::new(profile);
+            let long = |n: usize| {
+                // Components stay under NAME_MAX so only the total matters.
+                let mut p = b"/tmp/".to_vec();
+                while p.len() < n {
+                    let i = p.len() - 4;
+                    p.push(if i % 100 == 99 && p.len() + 1 < n {
+                        b'/'
+                    } else {
+                        b'a'
+                    });
+                }
+                p
+            };
+            for op in [
+                Op::Stat { path: long(max) },
+                Op::Mkdir {
+                    path: long(max),
+                    mode: 0o755,
+                },
+                Op::Rmdir { path: long(max) },
+                Op::Unlink { path: long(max) },
+            ] {
+                assert_eq!(m.apply(&op).errno, libc::ENAMETOOLONG, "{op:?}");
+            }
+            // One byte shorter is a normal lookup miss, not ENAMETOOLONG.
+            assert_eq!(
+                m.apply(&Op::Stat {
+                    path: long(max - 1)
+                })
+                .errno,
+                libc::ENOENT
+            );
+            assert_eq!(
+                m.apply(&Op::Unlink {
+                    path: long(max - 1)
+                })
+                .errno,
+                libc::ENOENT
+            );
+            // Symlink target of PATH_MAX bytes is rejected before anything
+            // else; one shorter is fine.
+            let out = m.apply(&Op::Symlink {
+                target: vec![b'a'; max],
+                path: b"/tmp/l".to_vec(),
+            });
+            assert_eq!(out.errno, libc::ENAMETOOLONG);
+            let out = m.apply(&Op::Symlink {
+                target: vec![b'a'; max - 1],
+                path: b"/tmp/l".to_vec(),
+            });
+            assert_eq!(out.errno, 0);
+        }
+    }
+
+    #[test]
+    fn trailing_slash_on_a_symlink_loop_matches_each_kernel() {
+        for (profile, want) in [
+            (Profile::LinuxMount { root: linux_root() }, libc::ENOTDIR),
+            (Profile::MacShim { root: mac_root() }, libc::ELOOP),
+        ] {
+            let mut m = Model::new(profile);
+            m.add_fixture_symlink(View::Virtual, b"/tmp/la", b"/tmp/lb".to_vec());
+            m.add_fixture_symlink(View::Virtual, b"/tmp/lb", b"/tmp/la".to_vec());
+            let out = m.apply(&Op::Rename {
+                from: b"/tmp/la/".to_vec(),
+                to: b"/tmp/y".to_vec(),
+            });
+            assert_eq!(out.errno, want, "rename");
+            let out = m.apply(&Op::Rmdir {
+                path: b"/tmp/la/".to_vec(),
+            });
+            assert_eq!(out.errno, want, "rmdir");
         }
     }
 }

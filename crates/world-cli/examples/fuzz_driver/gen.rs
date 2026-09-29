@@ -516,6 +516,18 @@ impl Generator {
     // -------------------------------------------------------------
 
     pub fn next_op(&mut self) -> GenStep {
+        let step = self.next_op_inner();
+        // The whole-path limits (PATH_MAX, the shim's own, macOS's combined
+        // link length) are not modelled; stay far below them by construction.
+        debug_assert!(
+            step.op.path_operands().iter().all(|p| p.len() < 512),
+            "generated path too long: {:?}",
+            step.op
+        );
+        step
+    }
+
+    fn next_op_inner(&mut self) -> GenStep {
         // Occasionally probe a read-only op directly on an escaping link
         // (never as a path *component* of anything else -- see module docs
         // and `docs/testing.md`).

@@ -58,7 +58,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use world_fsmodel::{Op, OpenFlags, Outcome, Start};
+use world_fsmodel::{Op, OpenFlags, Outcome, Start, at_start};
 
 /// A real, open resource kept alive under the *model's* fd number (never the
 /// real OS fd number, which is purely an implementation detail here).
@@ -283,6 +283,11 @@ fn guarded_parent(
 ) -> ExecResult<(OwnedFd, Vec<u8>, bool)> {
     // An invalid start fd can never resolve to anything: that is an
     // ordinary EBADF/ENOTDIR outcome, not a safety refusal.
+    // The kernel rejects a whole path of PATH_MAX bytes or more; the
+    // syscalls below only ever see the split-up pieces.
+    if path.len() >= libc::PATH_MAX as usize {
+        return Err(ExecError::Errno(libc::ENAMETOOLONG));
+    }
     let base = start_fd(state, start).map_err(ExecError::Errno)?;
     guarded_parent_at(state, base, path)
 }
@@ -336,13 +341,21 @@ fn guarded_parent_at(
 /// and a target that is a plain file can still be reached. So the guard does
 /// not depend on any of that: when `trailing` is set and `name` in `parent`
 /// is a symlink, whatever the operation and whatever the target's type, the
-/// whole link chain is walked (bounded by MAXSYMLINKS) with `readlinkat`,
+/// whole link chain is walked (bounded by the kernel's MAXSYMLINKS) with
+/// `readlinkat`,
 /// requiring every hop's parent (`guarded_parent_at`) and the final target to
 /// be inside the sandbox; otherwise the call is refused with a harness error
 /// before any syscall. A link ending in `.`, `..` or naming `/` has no
 /// bare final name: it is opened `O_DIRECTORY` and its resolved path must be
 /// a sandbox node with an allowed parent. An hop that fails with
 /// ENOENT/ENOTDIR/ELOOP/ENAMETOOLONG stays `Ok`: the kernel fails there too.
+/// So does a chain (or loop) that stays inside the sandbox for more hops than
+/// the kernel will ever follow: every hop's parent was verified, and the
+/// kernel gives up with ELOOP (or ENOTDIR on Linux, which rejects the
+/// trailing slash on a non-directory first) before reaching anything the
+/// walk did not check.
+const KERNEL_MAXSYMLINKS: u32 = if cfg!(target_os = "linux") { 40 } else { 32 };
+
 fn check_trailing(state: &RealState, parent: RawFd, name: &[u8], trailing: bool) -> ExecResult<()> {
     if !trailing {
         return Ok(());
@@ -366,7 +379,7 @@ fn check_trailing(state: &RealState, parent: RawFd, name: &[u8], trailing: bool)
     let mut hold: Option<OwnedFd> = None;
     let mut hop_parent = parent;
     let mut hop_name = name.to_vec();
-    for _ in 0..=state.max_symlinks {
+    for _ in 0..=state.max_symlinks.max(KERNEL_MAXSYMLINKS) {
         if !is_link(hop_parent, &hop_name)? {
             // The end of the chain: the parent was already checked.
             return Ok(());
@@ -376,7 +389,11 @@ fn check_trailing(state: &RealState, parent: RawFd, name: &[u8], trailing: bool)
         let n = unsafe {
             libc::readlinkat(hop_parent, hc.as_ptr(), buf.as_mut_ptr().cast(), buf.len())
         };
-        if n <= 0 {
+        if n == 0 {
+            // An empty link: the kernel fails it with ENOENT.
+            return Ok(());
+        }
+        if n < 0 || n as usize >= buf.len() {
             return refuse("cannot read a link in the chain".to_string());
         }
         buf.truncate(n as usize);
@@ -404,8 +421,10 @@ fn check_trailing(state: &RealState, parent: RawFd, name: &[u8], trailing: bool)
             Err(e) => return Err(e),
         }
     }
+    // Every hop's parent was verified and the walk exceeded the kernel's own
+    // link limit: the kernel fails with ELOOP/ENOTDIR here.
     drop(hold);
-    refuse("too many links".to_string())
+    Ok(())
 }
 
 /// End of a link chain that names a directory without a bare final name
@@ -719,11 +738,16 @@ fn plain(outcome: Outcome) -> Applied {
 /// inner helper, which every op below propagates with `?` rather than
 /// executing anything further).
 pub fn apply_real(state: &mut RealState, op: &Op) -> ExecResult<Applied> {
+    // Replay files cannot carry a NUL (rejected at parse time); this is the
+    // backstop so e.g. a bind/connect name can never be silently truncated.
+    if op.path_operands().iter().any(|p| p.contains(&0)) {
+        return Err(ExecError::Harness("operand contains NUL".to_string()));
+    }
     match op {
         Op::Mkdir { path, mode } => mkdir_like(state, Start::Cwd, path, *mode),
-        Op::MkdirAt { dirfd, path } => mkdir_like(state, Start::Fd(*dirfd), path, 0o755),
+        Op::MkdirAt { dirfd, path } => mkdir_like(state, at_start(*dirfd, path), path, 0o755),
         Op::Open { path, flags } => open_like(state, Start::Cwd, path, flags),
-        Op::OpenAt { dirfd, path, flags } => open_like(state, Start::Fd(*dirfd), path, flags),
+        Op::OpenAt { dirfd, path, flags } => open_like(state, at_start(*dirfd, path), path, flags),
         Op::OpenDir { path } => opendir_like(state, Start::Cwd, path),
         Op::Write { fd, data } => Ok(plain(write_fd(state, *fd, data))),
         Op::Read { fd, len } => Ok(plain(read_fd(state, *fd, *len))),
@@ -733,9 +757,12 @@ pub fn apply_real(state: &mut RealState, op: &Op) -> ExecResult<Applied> {
         Op::Rename { from, to } => Ok(plain(rename_like(state, from, to)?)),
         Op::Unlink { path } => Ok(plain(unlink_like(state, Start::Cwd, path, false)?)),
         Op::Rmdir { path } => Ok(plain(unlink_like(state, Start::Cwd, path, true)?)),
-        Op::UnlinkAt { dirfd, path, rmdir } => {
-            Ok(plain(unlink_like(state, Start::Fd(*dirfd), path, *rmdir)?))
-        }
+        Op::UnlinkAt { dirfd, path, rmdir } => Ok(plain(unlink_like(
+            state,
+            at_start(*dirfd, path),
+            path,
+            *rmdir,
+        )?)),
         Op::Chdir { path } => chdir_like(state, path),
         Op::Getcwd => Ok(plain(in_virtual_cwd(
             state.cwd_fd.as_raw_fd(),
@@ -1914,5 +1941,87 @@ mod trailing_slash_guard_tests {
             let r = check_trailing(&f.state, f.state.cwd_fd.as_raw_fd(), name, true);
             assert!(r.is_ok());
         }
+    }
+
+    /// The errno a real call ends with; a harness refusal fails the test.
+    fn errno_of(r: ExecResult<Outcome>) -> i32 {
+        match r {
+            Ok(o) => o.errno,
+            Err(ExecError::Errno(e)) => e,
+            Err(ExecError::Harness(m)) => panic!("harness refusal: {m}"),
+        }
+    }
+
+    #[test]
+    fn trailing_slash_use_of_an_inside_symlink_loop_is_not_refused() {
+        let mut f = fixture();
+        std::os::unix::fs::symlink("lb", f.sandbox.join("la")).unwrap();
+        std::os::unix::fs::symlink("la", f.sandbox.join("lb")).unwrap();
+        for i in 0..42 {
+            let next = if i == 41 {
+                "d".to_string()
+            } else {
+                format!("c{}", i + 1)
+            };
+            std::os::unix::fs::symlink(next, f.sandbox.join(format!("c{i}"))).unwrap();
+        }
+        let cwd = f.state.cwd_fd.as_raw_fd();
+        assert!(check_trailing(&f.state, cwd, b"la", true).is_ok());
+        assert!(check_trailing(&f.state, cwd, b"c0", true).is_ok());
+        for link in ["la/", "c0/"] {
+            let l = abs(&f, link);
+            let y = abs(&f, "y");
+            let d = abs(&f, "d");
+            let outs = [
+                rename_like(&mut f.state, &l, &y),
+                rename_like(&mut f.state, &d, &l),
+                unlink_like(&mut f.state, Start::Cwd, &l, false),
+                unlink_like(&mut f.state, Start::Cwd, &l, true),
+                mkdir_like(&mut f.state, Start::Cwd, &l, 0o755).map(|a| a.outcome),
+            ];
+            for o in outs {
+                assert_ne!(errno_of(o), 0, "{link}");
+            }
+        }
+        victim_untouched(&f);
+    }
+
+    #[test]
+    fn absolute_at_paths_ignore_the_dirfd() {
+        let mut f = fixture();
+        let n = abs(&f, "n");
+        let a = mkdir_like(&mut f.state, at_start(99, &n), &n, 0o755).map(|a| a.outcome);
+        assert_eq!(errno_of(a), 0);
+        assert!(f.sandbox.join("n").is_dir());
+        let file = abs(&f, "d/f");
+        let flags = OpenFlags {
+            create: true,
+            write: true,
+            ..OpenFlags::default()
+        };
+        let a = open_like(&mut f.state, at_start(99, &file), &file, &flags).map(|a| a.outcome);
+        assert_eq!(errno_of(a), 0);
+        // A relative path with the same bogus fd is still EBADF.
+        let a = mkdir_like(&mut f.state, at_start(99, b"m"), b"m", 0o755).map(|a| a.outcome);
+        assert_eq!(errno_of(a), libc::EBADF);
+        // Read-only open too.
+        let ro = OpenFlags::default();
+        let a = open_like(&mut f.state, at_start(99, &file), &file, &ro).map(|a| a.outcome);
+        assert_eq!(errno_of(a), 0);
+        victim_untouched(&f);
+    }
+
+    #[test]
+    fn nul_operand_and_path_max_are_refused_or_enametoolong() {
+        let mut f = fixture();
+        let op = Op::Bind {
+            path: b"a\0b".to_vec(),
+        };
+        assert!(refused(apply_real(&mut f.state, &op)));
+        let mut long = abs(&f, "");
+        long.resize(libc::PATH_MAX as usize, b'a');
+        let a = mkdir_like(&mut f.state, Start::Root, &long, 0o755).map(|a| a.outcome);
+        assert_eq!(errno_of(a), libc::ENAMETOOLONG);
+        victim_untouched(&f);
     }
 }
