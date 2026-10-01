@@ -1,0 +1,202 @@
+name: fuzz
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: WORLD_FUZZ_SEED override (default derives from the run id)
+        required: false
+        type: string
+      budget:
+        description: >-
+          WORLD_FUZZ_BUDGET in seconds per fuzz class. Leave empty for the
+          per-job defaults (macOS 1200 / 900, Linux 1800). The macOS shim-diff
+          job runs two classes, so keep this at or below (timeout - 25 min) / 2
+          = 1500 s there.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  props:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - name: Allow unprivileged user namespaces (Ubuntu AppArmor)
+        if: runner.os == 'Linux'
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Install pasta for workspace networking
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y passt
+      - run: cargo build --workspace --locked && cargo build --workspace --examples --locked
+      - name: Layer-1 property tests (world-tmp-path, world-fsmodel)
+        env:
+          PROPTEST_CASES: "100000"
+        run: cargo test -p world-tmp-path -p world-fsmodel --locked --release
+      - name: world-fsmodel conformance
+        env:
+          WORLD_FSMODEL_CASES: "2000"
+        run: cargo test -p world-fsmodel --release --locked --test conformance
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-failures-props-${{ matrix.os }}
+          path: |
+            target/fuzz-artifacts
+            **/proptest-regressions
+          if-no-files-found: ignore
+          retention-days: 30
+
+  shim-diff:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    # Two fuzz classes run back to back (ShimFuzz, then PrivilegedExecFuzz),
+    # each for its own WORLD_FUZZ_BUDGET, plus a cold build, corpus replay,
+    # minimize and setup/cleanup (~25 min). Budget cap per class is
+    # (timeout - 25 min) / 2 = 25 min.
+    timeout-minutes: 75
+    env:
+      WORLD_FUZZ_SEED: ${{ inputs.seed || github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - run: cargo build --workspace --locked && cargo build --workspace --examples --locked
+      - name: Shim differential fuzz
+        env:
+          WORLD_FUZZ_BUDGET: ${{ inputs.budget || '1200' }}
+        run: python3 -m unittest tests.test_fuzz -v
+      # Only the privileged class: ShimFuzz already ran with its own budget
+      # above, and re-running it here would double its time.
+      - name: Shim differential fuzz (privileged silo integration)
+        env:
+          WORLD_SILO_INTEGRATION: "1"
+          WORLD_FUZZ_BUDGET: ${{ inputs.budget || '900' }}
+        run: python3 -m unittest tests.test_fuzz.PrivilegedExecFuzz -v
+      - name: Remove leftover loopback aliases
+        if: always()
+        run: ifconfig lo0 | awk '/inet 127\.77\./{print $2}' | xargs -n1 -I{} sudo -n /sbin/ifconfig lo0 -alias {} || true
+      - name: Remove leftover test temp dirs
+        if: always()
+        run: rm -rf /private/tmp/wt-* || true
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-failures-shim-diff-${{ matrix.os }}
+          path: |
+            target/fuzz-artifacts
+            **/proptest-regressions
+          if-no-files-found: ignore
+          retention-days: 30
+
+  linux-diff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      WORLD_FUZZ_BUDGET: ${{ inputs.budget || '1800' }}
+      WORLD_FUZZ_SEED: ${{ inputs.seed || github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - name: Allow unprivileged user namespaces (Ubuntu AppArmor)
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Install pasta for workspace networking
+        run: sudo apt-get update && sudo apt-get install -y passt
+      - run: cargo build --workspace --locked && cargo build --workspace --examples --locked
+      - name: Linux differential fuzz
+        run: python3 -m unittest tests.test_fuzz -v
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-failures-linux-diff-ubuntu-latest
+          path: |
+            target/fuzz-artifacts
+            **/proptest-regressions
+          if-no-files-found: ignore
+          retention-days: 30
+
+  stress:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      WORLD_STRESS: "1"
+      WORLD_STRESS_SCALE: "4"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - name: Allow unprivileged user namespaces (Ubuntu AppArmor)
+        if: runner.os == 'Linux'
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Install pasta for workspace networking
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y passt
+      - run: cargo build --workspace --locked && cargo build --workspace --examples --locked
+      - name: Stress and concurrency tests
+        run: python3 -m unittest tests.test_stress -v
+      # Only the privileged class: the step above already ran every other
+      # stress test at this scale, and re-running them would double its time.
+      - name: Privileged network soak (silo integration)
+        if: runner.os == 'macOS'
+        env:
+          WORLD_SILO_INTEGRATION: "1"
+        run: python3 -m unittest tests.test_stress.NetworkSoak -v
+      - name: Remove leftover loopback aliases
+        if: always() && runner.os == 'macOS'
+        run: ifconfig lo0 | awk '/inet 127\.77\./{print $2}' | xargs -n1 -I{} sudo -n /sbin/ifconfig lo0 -alias {} || true
+      - name: Remove leftover test temp dirs
+        if: always() && runner.os == 'macOS'
+        run: rm -rf /private/tmp/wt-* || true
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-failures-stress-${{ matrix.os }}
+          path: |
+            target/fuzz-artifacts
+            **/proptest-regressions
+          if-no-files-found: ignore
+          retention-days: 30

@@ -1,0 +1,30 @@
+# profile linux
+# seed 21
+# run-id fz-c0ffee04
+# allow-escaping-links 0
+mkdir /tmp/fz-c0ffee04 755
+mkdir /var/tmp/fz-c0ffee04 755
+chdir /tmp/fz-c0ffee04
+open /tmp/fz-c0ffee04/f 100100
+mkdir /tmp/fz-c0ffee04/d 755
+mkdir /tmp/fz-c0ffee04/t 755
+open /tmp/fz-c0ffee04/t/in 100100
+mkdir /tmp/fz-c0ffee04/e 755
+symlink t /tmp/fz-c0ffee04/ld
+symlink f /tmp/fz-c0ffee04/lf
+symlink e /tmp/fz-c0ffee04/le
+symlink nowhere /tmp/fz-c0ffee04/dl
+bind /tmp/fz-c0ffee04/s
+unlink /tmp/fz-c0ffee04/ld/
+unlink /tmp/fz-c0ffee04/lf/
+unlink /tmp/fz-c0ffee04/dl/
+rmdir /tmp/fz-c0ffee04/lf/
+rmdir /tmp/fz-c0ffee04/ld/
+rmdir /tmp/fz-c0ffee04/dl/
+rmdir /tmp/fz-c0ffee04/le/
+rename /tmp/fz-c0ffee04/f /tmp/fz-c0ffee04/ld/
+rename /tmp/fz-c0ffee04/f /tmp/fz-c0ffee04/lf/
+rename /tmp/fz-c0ffee04/d /tmp/fz-c0ffee04/ld/
+rename /tmp/fz-c0ffee04/ld/ /tmp/fz-c0ffee04/y
+mkdir /tmp/fz-c0ffee04/dl/ 755
+open /tmp/fz-c0ffee04/lf/ 100100

@@ -1,0 +1,125 @@
+# Fuzz / 压力测试
+
+World 的 `world exec` silo 透明重写受支持程序对 `/tmp`、`/var/tmp` 的访问，把宿主临时目录替换成按 Workspace 隔离的私有目录。这一层改写面广、边界情况多，仅靠手写用例难以覆盖，因此在单元测试之外补充四层自动化测试。
+
+## 概览
+
+| 层 | 内容 | 位置 |
+| --- | --- | --- |
+| 1. 纯函数属性 / 模型对拍 | `world-tmp-path` 路径改写的 proptest 属性测试；`world-fsmodel` 内存文件系统模型与其自身不变量的对拍 | `crates/world-tmp-path/src/model_props.rs`、`crates/world-fsmodel/` |
+| 2. shim 差分 fuzz | 随机文件系统操作序列，比较经 silo 的物理执行结果与 `world-fsmodel` 虚拟视图 | `crates/world-cli/examples/fuzz_driver/`、`tests/test_fuzz.py` |
+| 3. 压力与并发 | 多 Workspace/多进程并发下的资源竞争、锁存活性、长时间 soak | `crates/world-cli/examples/stress_probe/`、`tests/test_stress.py` |
+| 4. CI | PR 上跑小预算冒烟，夜间跑大预算 fuzz/stress 并保留失败现场 | `.github/workflows/test.yml`、`.github/workflows/fuzz.yml` |
+
+## 核心判据
+
+差分 fuzz 和压力测试共用同一个等价判据：
+
+> 经 silo 重写后，对私有临时目录执行一系列文件系统操作得到的**物理结果**，必须等于把 `/tmp`（以及 `/var/tmp`）替换为该私有目录后、直接对同一目录树执行同一操作序列得到的**虚拟视图**（`world-fsmodel`）；且整个过程中**宿主真实 `/tmp` 不发生任何变化**。
+
+任何一次不等价、或宿主 `/tmp` 被意外写入，都判定为失败并保留现场（种子、操作序列、双方文件树快照）。
+
+## 如何本地运行
+
+### Layer 1：属性测试与模型对拍
+
+```sh
+cargo test -p world-tmp-path
+cargo test -p world-fsmodel --test conformance
+```
+
+环境变量：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PROPTEST_CASES` | proptest 默认（256） | `world-tmp-path` 每条属性生成的用例数；CI 夜间设为 `100000` |
+| `WORLD_FSMODEL_CASES` | 未设置时用测试内置的小规模值 | `world-fsmodel` conformance 测试的随机用例数；CI 夜间设为 `2000` |
+| `WORLD_FSMODEL_ESCAPING_LINKS` | 关闭 | 打开后生成器会构造指向私有根之外的符号链接，用于单独验证越界检测（默认关闭以避免掩盖其他失败） |
+
+失败会在 `crates/world-tmp-path/proptest-regressions/` 下落一个回归用例文件；这个文件要提交进仓库，之后每次跑测试都会重放它。
+
+### Layer 2：shim 差分 fuzz
+
+```sh
+python3 -m unittest tests.test_fuzz -v
+```
+
+环境变量：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `WORLD_FUZZ_BUDGET` | `10`（秒） | **每个 fuzz 测试类**各自的时间预算（不是整次运行的总预算）；夜间 CI 在 macOS 上 `ShimFuzz` 用 `1200`、`PrivilegedExecFuzz` 用 `900`，Linux 用 `1800` |
+| `WORLD_FUZZ_SEED` | 随机 | 固定后可复现同一操作序列 |
+| `WORLD_FUZZ_OPS` | `40` | 单个操作序列的步数 |
+| `WORLD_FUZZ_ARTIFACTS` | `target/fuzz-artifacts` | 失败现场（种子、操作序列、双方快照）的落盘目录 |
+
+三个测试类分别覆盖不同后端：`ShimFuzz`（macOS，无需特权）、`LinuxFuzz`（Linux，经 `world exec`）、`PrivilegedExecFuzz`（macOS，需要 `WORLD_SILO_INTEGRATION=1`，会真实添加/删除 loopback 别名）。默认只跑无需特权的部分。只跑特权那一类：
+
+```sh
+WORLD_SILO_INTEGRATION=1 python3 -m unittest tests.test_fuzz.PrivilegedExecFuzz -v
+```
+
+注意预算是按类计的：一个 job 里跑 N 个 fuzz 类，总耗时约为 N × `WORLD_FUZZ_BUDGET` 加上构建、语料重放、minimize 与清理（约 25 分钟）。所以 job 的 `timeout-minutes` 必须满足 `WORLD_FUZZ_BUDGET ≤ (timeout − 25 分钟) / N`；macOS `shim-diff`（75 分钟、2 个类）上限为 1500 秒。
+
+### Layer 3：压力与并发
+
+```sh
+python3 -m unittest tests.test_stress -v
+```
+
+默认是冒烟档位（约 20 秒）。完整档位：
+
+```sh
+WORLD_STRESS=1 WORLD_STRESS_SCALE=4 python3 -m unittest tests.test_stress -v
+```
+
+`WORLD_STRESS_SCALE` 是并发数/迭代数的整数倍数。`stress_probe` 会在写任何东西之前先做 `verify_redirected`：`/tmp` 必须确实被重定向到私有根（macOS 用 `WORLD_TMP`，Linux 经 `world exec` 时由测试通过 `STRESS_PROBE_PHYSICAL_ROOT` 传入），否则以 `not running redirected` 退出 2（失败即拒绝，`StressProbeRefusesUnredirected` 覆盖）。所有工作线程都按总期限 join，超时或异常会被记录并使测试失败，而不是让线程悄悄退出。`test_network_soak` 额外需要 `WORLD_SILO_INTEGRATION=1` 且 `WORLD_STRESS=1` 才会运行。macOS 上超时会用 `sample` 抓取卡住进程的调用栈存进 `target/fuzz-artifacts`；Linux 有专门的持有者竞争（holder race）测试。
+
+## 失败复现
+
+1. 从失败输出或 CI 产物里取到种子（`WORLD_FUZZ_SEED`）和落盘的操作序列。
+2. 用同一个种子重放：
+
+   ```sh
+   WORLD_FUZZ_SEED=<seed> python3 -m unittest tests.test_fuzz -v
+   ```
+
+   失败输出里的 `replay:` 那一行就是精确的复现命令，直接原样使用即可。它有两种形式，可作为模板：
+
+   - macOS（shim，`ShimFuzz`）：在环境变量前缀下运行**已构建好的**二进制，而不是 `cargo run`（否则注入会落到 cargo 自己身上）：
+
+     ```sh
+     DYLD_INSERT_LIBRARIES=<dylib> SILO_IP=<ip> WORLD_SILO_ACTIVE=1 WORLD_SILO_ACK=<ack> WORLD_TMP=<root> \
+       target/debug/examples/fuzz_driver replay <artifact-file>
+     ```
+
+     `minimize` 同样要带这套环境前缀（把 `replay` 换成 `minimize`）。最小化只接受“同一个”失败：发散的命令、细节类别（第一个 `:` 之前的文字，run id 归一化），以及模型/真实两侧具体的 errno 和返回值正负都必须一致；读出的数据、路径和目录树内容不参与比较。测试在 macOS 上失败时已自动做过一次最小化，产物在 `target/fuzz-artifacts`。
+   - Linux（`world exec`，`LinuxFuzz` / `PrivilegedExecFuzz`）：
+
+     ```sh
+     [HOME=<home>] world exec F --state-dir <state> --timeout 60s -- target/debug/examples/fuzz_driver replay <artifact-file>
+     ```
+
+     `world exec` 形式的失败产物不会被自动最小化。它依赖测试用的 workspace（`--state-dir`）仍然存在，而测试类在收尾时会删除它，所以复现前要先重建：`world workspace --state-dir <dir> create F --workdir <dir>`，Linux 上再执行 `setup F`；`PrivilegedExecFuzz` 还需要 loopback 别名和专用的 `HOME`。
+
+   直接运行 `fuzz_driver replay <artifact-file>`（不带上述环境或 `world exec`）是原生执行、没有任何重定向，只适合调试 harness 本身或守卫逻辑，不能复现 shim 或 namespace 里的分歧。
+3. Layer 1 的 proptest 失败会在 `crates/world-tmp-path/proptest-regressions/` 生成回归文件，直接提交进仓库即可保证之后不再回归。
+4. 长期有价值的 Layer 2 失败序列可以整理进固定回归语料，每次运行都会重放，不依赖随机种子命中。语料按 profile 分开：`tests/fuzz-corpus/*.ops` 是 `# profile mac`，由 `ShimFuzz` 经 shim 重放；`tests/fuzz-corpus/linux/*.ops` 是 `# profile linux`，由 `LinuxFuzz` 经 `world exec` 在 namespace 后端重放。文件头的 profile 必须与所在目录一致（`CorpusLayout` 检查）。Linux 语料是同一批场景去掉 `/private` 拼写、并把 `connect`/`bind` 名字长度改为跨越 Linux 的 `sun_path` 上限（108 字节）；生成器不产生的失败用例（如 `connect` 的各种 errno）靠这两份语料覆盖。
+
+## CI
+
+- `test.yml`（PR + push main）：`WORLD_FUZZ_BUDGET=10`，只跑冒烟档位，目标是几分钟内给出信号；另有一步 `! grep -rn 'process::exit' crates/world-fsmodel/tests`，禁止在测试线程里直接 `process::exit`；失败时上传 `target/fuzz-artifacts` 和 `**/proptest-regressions`。
+- `fuzz.yml`（每日 03:17 UTC 定时，也支持手动触发并指定 `seed`/`budget`，`budget` 的含义是每个 fuzz 类的秒数，留空使用各 job 的默认值）：大预算跑 Layer 1（`PROPTEST_CASES=100000`、`WORLD_FSMODEL_CASES=2000`，release 构建）、Layer 2（macOS `shim-diff` 75 分钟：`ShimFuzz` 1200 秒，再单独跑 `PrivilegedExecFuzz` 900 秒；Linux 60 分钟：1800 秒一个类）、Layer 3（`WORLD_STRESS=1`、`WORLD_STRESS_SCALE=4`，macOS 额外跑特权 soak）。每个 job 失败时上传产物，macOS job 结束时无论成败都会清理残留的 `127.77.*` loopback 别名和残留的 `wt-*` 私有临时目录。
+
+## 已知限制
+
+shim 是用户态的透明改写，以下情况文档化为已知缺口，不在判据覆盖范围内：
+
+- 绕过 libc 直接发起的原始 syscall。
+- `F_GETPATH`（以及等价的路径反解 API）可能拿到改写前后不一致的路径。
+- 执行前就已存在、指向宿主临时目录的符号链接不会被回溯改写。
+- 私有根内部的相对符号链接，如果逐级 `..` 能越出私有根，行为未定义（生成器不会主动构造这类链接，`WORLD_FSMODEL_ESCAPING_LINKS` 可单独打开验证）。`fuzz_driver run --allow-escaping-links` 会在 fixture 里种两条这样的链接，但只让不跟随链接的操作（`lstat`、`readlink`、`O_NOFOLLOW` 的 `open`）碰它们：`stat`、`realpath` 和新建符号链接的绝对目标都不会选中它们，它们本身和所在目录也从不被 `rename`，所以没有别的路径能经由它们解析。这些操作上的任何不一致都按正常发现报告，不会被当作已知缺口吞掉（`ShimFuzz.test_escaping_link_probes_are_compared` 覆盖）。
+- APFS 大小写不敏感：用例生成器只使用小写 ASCII 文件名，不覆盖大小写折叠相关的路径冲突。
+- 需要真实内核 namespace 或需要 root 的部分（Linux 持有者竞争、macOS 特权 loopback）本地未必能跑，只在 CI 里保证覆盖。
+- 整条路径长度上限：模型按各 profile 的 `PATH_MAX`（mac 1024、Linux 4096，含结尾 NUL，即长度 `>=` 上限时 `ENAMETOOLONG`）判定；执行端会先对整条路径做同样的检查（因为它只把拆开后的父目录和末尾名字交给 syscall）。shim 自己的限制不建模：私有根前缀 + 子目录 + 剩余路径长度 `>= PATH_MAX` 时 shim 返回 `ENAMETOOLONG`，因此 `/tmp`、`/var/tmp` 下的绝对路径实际上限是 `PATH_MAX` 减去私有根前缀长度（`/private/...` 拼写再多几个字节），符号链接目标同理。macOS 的 `namei` 在跟随链接时还会在“链接内容长度 + 剩余路径长度 `>= MAXPATHLEN`”时返回 `ENAMETOOLONG`，Linux 没有这条规则，模型同样不建模。生成器的文件名 1-4 个字符、嵌套不超过约 8 层，生成的路径长度远小于 512 字节（debug 构建下有断言），所以这些缺口不会被生成器触发。
+- Linux `rename` 的查找顺序：内核先解析两侧父目录，再检查跨挂载（`EXDEV`），然后才查找源、目标；模型先查源再解析目标的父目录。因此在 Linux profile 上，源不存在同时目标末尾名字超过 `NAME_MAX`（模型 `ENAMETOOLONG`，内核 `ENOENT`）、源不存在同时目标父目录是文件（模型 `ENOENT`，内核 `ENOTDIR`）、跨挂载且源不存在（内核 `EXDEV`）这几种组合模型与内核不一致，且表驱动测试只固定了 macOS 上的 `rename` 顺序。生成器的名字只有 1-4 个字符，不会触发，只影响手写的回放输入。

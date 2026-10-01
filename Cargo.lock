@@ -918,7 +918,15 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "world-fsmodel",
  "world-runtime",
+]
+
+[[package]]
+name = "world-fsmodel"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -959,6 +967,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "proptest",
+ "world-fsmodel",
 ]
 
 [[package]]

@@ -1,0 +1,55 @@
+# profile mac
+# seed 21
+# run-id fz-c0ffee04
+# allow-escaping-links 0
+mkdir /tmp/fz-c0ffee04 755
+mkdir /var/tmp/fz-c0ffee04 755
+chdir /tmp/fz-c0ffee04
+open /tmp/fz-c0ffee04/f 100100
+mkdir /tmp/fz-c0ffee04/d 755
+mkdir /tmp/fz-c0ffee04/t 755
+open /tmp/fz-c0ffee04/t/in 100100
+mkdir /tmp/fz-c0ffee04/e 755
+symlink t /tmp/fz-c0ffee04/ld
+symlink f /tmp/fz-c0ffee04/lf
+symlink e /tmp/fz-c0ffee04/le
+symlink nowhere /tmp/fz-c0ffee04/dl
+bind /tmp/fz-c0ffee04/s
+unlink /tmp/fz-c0ffee04/f/
+unlink /tmp/fz-c0ffee04/f//
+unlink /tmp/fz-c0ffee04/s/
+unlink /tmp/fz-c0ffee04/d/
+unlink /tmp/fz-c0ffee04/missing/
+rmdir /tmp/fz-c0ffee04/f/
+rename /tmp/fz-c0ffee04/f/ /tmp/fz-c0ffee04/x
+rename /tmp/fz-c0ffee04/f /tmp/fz-c0ffee04/x/
+rename /tmp/fz-c0ffee04/f /tmp/fz-c0ffee04/x//
+rename /tmp/fz-c0ffee04/f /tmp/fz-c0ffee04/d/
+rename /tmp/fz-c0ffee04/s /tmp/fz-c0ffee04/x/
+rename /tmp/fz-c0ffee04/lf /tmp/fz-c0ffee04/x/
+rename /tmp/fz-c0ffee04/d /tmp/fz-c0ffee04/f/
+rename /tmp/fz-c0ffee04/d /tmp/fz-c0ffee04/x/
+rename /tmp/fz-c0ffee04/x/ /tmp/fz-c0ffee04/d2/
+mkdir /tmp/fz-c0ffee04/n/ 755
+mkdir /tmp/fz-c0ffee04/n/ 755
+mkdir /tmp/fz-c0ffee04/f/ 755
+mkdir /tmp/fz-c0ffee04/f// 755
+symlink x /tmp/fz-c0ffee04/l/
+symlink x /tmp/fz-c0ffee04/f/
+symlink x /tmp/fz-c0ffee04/s/
+symlink x /tmp/fz-c0ffee04/n/
+symlink x /tmp/fz-c0ffee04/dl2/
+open /tmp/fz-c0ffee04/o2/ 100100
+open /tmp/fz-c0ffee04/o3/ 110100
+open /tmp/fz-c0ffee04/f/ 100100
+open /tmp/fz-c0ffee04/n/ 100100
+open /tmp/fz-c0ffee04/n// 100100
+open /tmp/fz-c0ffee04/n/ 110100
+bind /tmp/fz-c0ffee04/s2/
+bind /tmp/fz-c0ffee04/s/
+bind /tmp/fz-c0ffee04/f/
+bind /tmp/fz-c0ffee04/n/
+bind /tmp/fz-c0ffee04/s3//
+lstat /tmp/fz-c0ffee04/y
+lstat /tmp/fz-c0ffee04/le
+lstat /tmp/fz-c0ffee04/nowhere

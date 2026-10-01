@@ -1,0 +1,30 @@
+# profile mac
+# seed 1
+# run-id fz-c0ffee0a
+# allow-escaping-links 0
+mkdir /tmp/fz-c0ffee0a 755
+mkdir /var/tmp/fz-c0ffee0a 755
+chdir /tmp/fz-c0ffee0a
+mkdir /tmp/fz-c0ffee0a/d 755
+open /tmp/fz-c0ffee0a/f 100100
+bind /tmp/fz-c0ffee0a/s
+symlink s /tmp/fz-c0ffee0a/ls
+symlink f /tmp/fz-c0ffee0a/lf
+symlink nowhere /tmp/fz-c0ffee0a/dl
+symlink lp /tmp/fz-c0ffee0a/lp
+connect s
+connect ls
+connect missing
+connect nodir/x
+connect f/x
+connect f
+connect d
+connect d/
+connect lf
+connect dl
+connect dl/
+connect lp
+connect s/
+connect xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+connect xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+connect xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/

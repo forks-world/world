@@ -1,0 +1,29 @@
+# profile mac
+# seed 1
+# run-id fz-c0ffee0b
+# allow-escaping-links 0
+mkdir /tmp/fz-c0ffee0b 755
+mkdir /var/tmp/fz-c0ffee0b 755
+chdir /tmp/fz-c0ffee0b
+open /tmp/fz-c0ffee0b/f 100100
+close 3
+mkdir /tmp/fz-c0ffee0b/d 755
+mkdir /tmp/fz-c0ffee0b/e 755
+opendir /tmp/fz-c0ffee0b/e
+chdir d
+rmdir /tmp/fz-c0ffee0b/d
+rmdir /tmp/fz-c0ffee0b/e
+getcwd
+realpath .
+stat .
+mkdir x 755
+open x 100100
+symlink t y
+bind s
+rename ../f g
+mkdirat 3 z
+openat 3 w 100100
+stat ..
+chdir ..
+getcwd
+mkdir /tmp/fz-c0ffee0b/after 755

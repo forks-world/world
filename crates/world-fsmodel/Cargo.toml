@@ -1,5 +1,5 @@
 [package]
-name = "world-tmp-path"
+name = "world-fsmodel"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,7 +7,3 @@ license = "MIT"
 
 [dependencies]
 libc.workspace = true
-
-[dev-dependencies]
-proptest = "1"
-world-fsmodel = { path = "../world-fsmodel" }

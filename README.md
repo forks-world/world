@@ -43,6 +43,6 @@ mkdir -p ~/world-a ~/world-b
 # 另一终端可在 B 中运行相同命令、使用相同端口。
 ```
 
-使用、验证和兼容边界见 [macOS 网络运行时](docs/macos-network-isolation.md) 和 [Linux 网络运行时](docs/linux-network-isolation.md)。macOS 的 Workspace localhost 模式是开发任务的 localhost 兼容层，不是对抗恶意代码的内核网络命名空间；Linux 是内核 namespace，但也不限制文件访问。两者都不能与出站白名单模式混为一谈。
+使用、验证和兼容边界见 [macOS 网络运行时](docs/macos-network-isolation.md) 和 [Linux 网络运行时](docs/linux-network-isolation.md)。macOS 的 Workspace localhost 模式是开发任务的 localhost 兼容层，不是对抗恶意代码的内核网络命名空间；Linux 是内核 namespace，但也不限制文件访问。两者都不能与出站白名单模式混为一谈。模型对拍、fuzz 与压力测试的运行方式见 [测试工具](docs/testing.md)。
 
 完整控制面、认证、计费、Skill/MCP 和 forkfs RPC 接入仍为拟议规格。forkfs 接入坚持 RPC，不链接其 C ABI。

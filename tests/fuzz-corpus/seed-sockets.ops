@@ -1,0 +1,67 @@
+# profile mac
+# seed 5
+# run-id fz-c0ffee04
+# allow-escaping-links 0
+mkdir /tmp/fz-c0ffee04 755
+mkdir /var/tmp/fz-c0ffee04 755
+chdir /tmp/fz-c0ffee04
+mkdir /var/../tmp/fz-c0ffee04/9 755
+mkdir /var/../tmp/fz-c0ffee04/j 755
+mkdir /var/../tmp/fz-c0ffee04/1e13 755
+mkdir /private/tmp/fz-c0ffee04/pd23 755
+mkdir /tmp/fz-c0ffee04/1l8r 755
+mkdir /tmp/fz-c0ffee04/pd23/w5z4 755
+mkdir /tmp/fz-c0ffee04/pd23/w5z4/upoo 755
+mkdir /tmp/fz-c0ffee04/pd23/w5z4/upoo/73hh 755
+mkdir /tmp/fz-c0ffee04/pd23/w5z4/upoo/73hh/e3ha 755
+open /var/tmp/fz-c0ffee04/pj 100100
+open /tmp/fz-c0ffee04/pd23/w5z4/upoo/73hh/e 100100
+symlink pj /var/tmp/fz-c0ffee04/f1g8
+symlink f1g8 /var/tmp/fz-c0ffee04/y9b9
+symlink y9b9 /var/tmp/fz-c0ffee04/v7t
+symlink v7t /var/tmp/fz-c0ffee04/5tx4
+symlink 5tx4 /var/tmp/fz-c0ffee04/u
+symlink u /var/tmp/fz-c0ffee04/c4
+symlink l1 /var/tmp/fz-c0ffee04/0
+symlink 0 /var/tmp/fz-c0ffee04/l1
+mkdir /var/tmp/fz-c0ffee04/jls 755
+mkdirat 9914 xcd
+open /tmp/fz-c0ffee04/pd23/w5z4/upoo 000100
+openat 9364 4t 100100
+bind /private/tmp/fz-c0ffee04/9/5
+rename ./pd23/w5z4/upoo/73hh/e pd23/w5z4/upoo/73hh/e3ha/1
+connect 9/5
+getcwd
+chdir .
+realpath pd23/../pd23/w5z4/upoo/73hh/e3ha/1
+mkdir ./pd23/w5z4/upoo/73hh/0 755
+mkdir ./xe9 755
+realpath 9/../pd23/w5z4/upoo/73hh/e3ha/1
+openat 9104 h 110100
+write 3 
+getcwd
+connect ./9/5
+opendir pd23
+readlink /var/tmp/fz-c0ffee04/u
+rename ./j /tmp/fz-c0ffee04/pd23/9
+symlink pd23 e
+unlinkat 9416 d true
+readlink /tmp/../var/tmp/fz-c0ffee04/c4
+write 3 abcdefg
+mkdirat 9214 gj81
+stat /var/tmp/fz-c0ffee04/v7t
+list 1e13/../pd23/w5z4/upoo/73hh/0
+write 3 abcdefghij
+stat pd23/w5z4
+list 9/../1e13
+opendir ./pd23/w5z4/upoo/73hh
+mkdir /var/tmp/fz-c0ffee04/jls/5g 755
+rename /var/tmp/fz-c0ffee04/u pd23/w5z4/upoo/73hh/e3ha/bq
+realpath 1l8r/../e
+mkdir ./5 755
+unlinkat 5 gn true
+unlink /tmp/../var/tmp/fz-c0ffee04/pj
+getcwd
+symlink e3ha /private/tmp/fz-c0ffee04/pd23/w5z4/upoo/73hh/v7t
+read 4 20
+open 9/../9 000000

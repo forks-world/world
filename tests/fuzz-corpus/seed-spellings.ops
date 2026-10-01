@@ -1,0 +1,37 @@
+# profile mac
+# seed 3
+# run-id fz-c0ffee01
+# allow-escaping-links 0
+mkdir /tmp/fz-c0ffee01 755
+mkdir /var/tmp/fz-c0ffee01 755
+chdir /tmp/fz-c0ffee01
+mkdir /tmp/fz-c0ffee01/vx 755
+mkdir /tmp/fz-c0ffee01/mwog 755
+mkdir /tmp/fz-c0ffee01/25eg 755
+mkdir /tmp/fz-c0ffee01/mwog/04 755
+mkdir /tmp/fz-c0ffee01/mwog/04/ni3e 755
+mkdir /tmp/fz-c0ffee01/mwog/04/ni3e/ti 755
+open /var/tmp/fz-c0ffee01/7i 100100
+open /tmp/fz-c0ffee01/mwog/04/ni3e/ti/9ei 100100
+symlink 7i /var/tmp/fz-c0ffee01/1
+symlink 1 /var/tmp/fz-c0ffee01/e
+symlink e /var/tmp/fz-c0ffee01/hneo
+symlink hneo /var/tmp/fz-c0ffee01/1j5
+symlink i1r5 /tmp/fz-c0ffee01/mwog/04/ni3e/c1uq
+symlink c1uq /tmp/fz-c0ffee01/mwog/04/ni3e/i1r5
+mkdir /var/tmp/fz-c0ffee01/82r9 755
+openat 9537 v3zk 100100
+mkdirat 9222 7sl
+bind /var/../tmp/fz-c0ffee01/nc9
+readlink /var/tmp/fz-c0ffee01/1
+list 25eg/../mwog/04/ni3e/ti
+list .
+mkdirat 9887 8
+opendir /var/tmp/fz-c0ffee01
+lstat /private/tmp/fz-c0ffee01/mwog/04
+list 25eg/../mwog/04/ni3e
+realpath /private/var/tmp/fz-c0ffee01/7i
+mkdirat 9139 bwc
+getcwd
+read 3 4
+chdir mwog/04
