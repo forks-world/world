@@ -59,6 +59,83 @@ pub(crate) fn records(state: &Path) -> Result<BTreeMap<String, Record>> {
     Ok(records)
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Phase {
+    Created,
+    Provisioning,
+    Starting,
+    Ready,
+    Stopping,
+    Stopped,
+    Deleting,
+    Legacy,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Lifecycle {
+    owner: String,
+    phase: Phase,
+    generation: u64,
+}
+
+fn lifecycle(state: &Path, vm: &Vm) -> Result<Lifecycle> {
+    match File::open(state.join(format!("{}.runtime.json", vm.instance_id))) {
+        Ok(file) => {
+            let value: Lifecycle =
+                serde_json::from_reader(file).context("invalid VM lifecycle journal")?;
+            ensure!(value.owner == vm.owner, "lifecycle owner mismatch");
+            Ok(value)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Lifecycle {
+            owner: vm.owner.clone(),
+            phase: Phase::Legacy,
+            generation: 0,
+        }),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_lifecycle(state: &Path, vm: &Vm, lifecycle: &Lifecycle) -> Result<()> {
+    crate::silo::persist(
+        state,
+        &format!("{}.runtime.json", vm.instance_id),
+        lifecycle,
+    )
+}
+
+fn check_registered(state: &Path, vm: &Vm) -> Result<()> {
+    ensure!(
+        get(state, &vm.id)?.is_some_and(|current| current.owner == vm.owner),
+        "workspace was deleted or replaced; reload its configuration"
+    );
+    Ok(())
+}
+
+fn require_ready(state: &Path, vm: &Vm) -> Result<()> {
+    ensure!(
+        lifecycle(state, vm)?.phase == Phase::Ready,
+        "workspace is not ready; run workspace show and workspace setup first"
+    );
+    Ok(())
+}
+
+/// Local records are returned even when the provider cannot be contacted.
+pub async fn list(state: &Path) -> Result<Vec<serde_json::Value>> {
+    let mut result = Vec::new();
+    for (id, record) in records(state)? {
+        match record {
+            Record::Vm(vm) => result.push(show(state, &vm).await?),
+            Record::Native(world) => result.push(serde_json::json!({
+                "id":id, "configuration":world, "backend":"native",
+                "status":"unobserved", "note":"native runtime state is not probed by list"
+            })),
+        }
+    }
+    Ok(result)
+}
+
 pub fn get(state: &Path, id: &str) -> Result<Option<Vm>> {
     Ok(match records(state)?.remove(id) {
         Some(Record::Vm(vm)) => Some(vm),
@@ -116,6 +193,10 @@ pub fn create(state: &Path, id: &str, cpus: u32, memory_mib: u32) -> Result<Vm> 
     if let Some(record) = records.get(id) {
         if let Record::Vm(vm) = record {
             ensure!(
+                lifecycle(state, vm)?.phase != Phase::Deleting,
+                "workspace deletion is pending; retry workspace delete before reusing the name"
+            );
+            ensure!(
                 vm.cpus == cpus && vm.memory_mib == memory_mib,
                 "workspace exists with different resources"
             );
@@ -143,6 +224,15 @@ pub fn create(state: &Path, id: &str, cpus: u32, memory_mib: u32) -> Result<Vm> 
         std::fs::copy(state.join("registry.json"), &backup)?;
         File::open(&backup)?.sync_all()?;
     }
+    save_lifecycle(
+        state,
+        &vm,
+        &Lifecycle {
+            owner: vm.owner.clone(),
+            phase: Phase::Created,
+            generation: 0,
+        },
+    )?;
     records.insert(id.into(), Record::Vm(vm.clone()));
     crate::silo::persist(state, "registry.json", &records)?;
     Ok(vm)
@@ -235,7 +325,8 @@ async fn guest(vm: &Vm, args: &[&str]) -> Result<String> {
     output(&argv, Duration::from_secs(15)).await
 }
 
-pub async fn show(vm: &Vm) -> Result<serde_json::Value> {
+pub async fn show(state: &Path, vm: &Vm) -> Result<serde_json::Value> {
+    let journal = lifecycle(state, vm)?;
     let observation = async {
         check_provider().await?;
         inspect(vm).await
@@ -245,15 +336,40 @@ pub async fn show(vm: &Vm) -> Result<serde_json::Value> {
         Ok(value) => (value, None),
         Err(error) => (None, Some(format!("{error:#}"))),
     };
+    let status = if error.is_some() {
+        "unknown"
+    } else if journal.phase == Phase::Deleting {
+        "deleting"
+    } else if let Some(value) = &observed {
+        match value["status"]["state"].as_str() {
+            Some("running") if journal.phase == Phase::Ready => "ready",
+            Some("running") => "unverified",
+            Some("stopped") => "stopped",
+            _ => "unverified",
+        }
+    } else if journal.phase == Phase::Created {
+        "created"
+    } else {
+        "missing"
+    };
+    let observed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
     Ok(
-        serde_json::json!({"configuration":vm,"observed":observed,"observation_error":error,"experimental":true,
+        serde_json::json!({"id":vm.id,"status":status,"lifecycle":journal,"observed_at_unix":observed_at,"configuration":vm,"observed":observed,"observation_error":error,"experimental":true,
         "capabilities":{"host_directory_mounts":false,"file_import":true,"egress_filtering":false,"host_lan_blocking":false,"worldfs":false,"pty":false,"parallel_exec":true},
         "network_policy":"provider NAT, unrestricted egress; not a hostile-workload sandbox"}),
     )
 }
 
-pub async fn setup(state: &Path, vm: &Vm) -> Result<()> {
+pub async fn setup(state: &Path, vm: &Vm, recreate_missing: bool) -> Result<()> {
     let _lock = operation_lock(state, vm, false)?;
+    check_registered(state, vm)?;
+    let mut journal = lifecycle(state, vm)?;
+    ensure!(
+        journal.phase != Phase::Deleting,
+        "workspace deletion is pending; retry workspace delete"
+    );
     // Serialize VM admission across registries created by this user. A per-state
     // lock alone would allow two independent --state-dir values to race.
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is required")?)
@@ -282,6 +398,12 @@ pub async fn setup(state: &Path, vm: &Vm) -> Result<()> {
             "another container is running; experimental low-memory mode permits only one VM at a time"
         );
         if current.is_none() {
+            ensure!(
+                journal.phase == Phase::Created || recreate_missing,
+                "previous VM is missing or provisioning was interrupted; refusing to replace it with an empty VM. Inspect data recovery options, then use setup --recreate-missing to explicitly create an empty runtime"
+            );
+            journal.phase = Phase::Provisioning;
+            save_lifecycle(state, vm, &journal)?;
             let cpus = vm.cpus.to_string();
             let memory = format!("{}M", vm.memory_mib);
             let label = format!("world.owner={}", vm.owner);
@@ -310,6 +432,12 @@ pub async fn setup(state: &Path, vm: &Vm) -> Result<()> {
             )
             .await?;
         }
+        journal.generation = journal
+            .generation
+            .checked_add(1)
+            .context("VM generation overflow")?;
+        journal.phase = Phase::Starting;
+        save_lifecycle(state, vm, &journal)?;
         output(&["start", &vm.instance_id], Duration::from_secs(60)).await?;
     }
     let install = "import os,pathlib,sys; p=pathlib.Path('/opt/world'); p.mkdir(exist_ok=True); t=p/'supervisor.py.update'; t.write_text(sys.argv[1]); os.chmod(t,0o644); os.replace(t,p/'supervisor.py')";
@@ -335,6 +463,8 @@ pub async fn setup(state: &Path, vm: &Vm) -> Result<()> {
                     probe["protocol"] == 1 && probe["uid"] == 0 && probe["cgroup_kill"] == true,
                     "guest protocol/capability mismatch"
                 );
+                journal.phase = Phase::Ready;
+                save_lifecycle(state, vm, &journal)?;
                 eprintln!(
                     "world: experimental Linux VM ready; no host mounts; NAT egress is unrestricted"
                 );
@@ -352,17 +482,87 @@ pub async fn setup(state: &Path, vm: &Vm) -> Result<()> {
 
 pub async fn teardown(state: &Path, vm: &Vm) -> Result<()> {
     let _lock = operation_lock(state, vm, false)?;
+    check_registered(state, vm)?;
+    let mut journal = lifecycle(state, vm)?;
+    ensure!(
+        journal.phase != Phase::Deleting,
+        "workspace deletion is pending; retry workspace delete"
+    );
     check_provider().await?;
     if inspect(vm)
         .await?
         .is_some_and(|v| v["status"]["state"] == "running")
     {
+        journal.phase = Phase::Stopping;
+        save_lifecycle(state, vm, &journal)?;
         output(
             &["stop", "--time", "2", &vm.instance_id],
             Duration::from_secs(20),
         )
         .await?;
+        ensure!(
+            !inspect(vm)
+                .await?
+                .is_some_and(|v| v["status"]["state"] == "running"),
+            "VM still running after stop"
+        );
     }
+    // Missing is observed by show, not hidden by a successful teardown.
+    journal.phase = if journal.phase == Phase::Created {
+        Phase::Created
+    } else {
+        Phase::Stopped
+    };
+    save_lifecycle(state, vm, &journal)?;
+    Ok(())
+}
+
+/// Removes the owned provider instance and its record. Guest writable-layer
+/// data needs explicit consent until forkfs storage is mounted separately.
+pub async fn delete(state: &Path, vm: &Vm, discard_runtime_data: bool) -> Result<()> {
+    let _lock = operation_lock(state, vm, false)?;
+    check_registered(state, vm)?;
+    check_provider().await?;
+    let current = inspect(vm).await?;
+    if let Some(value) = &current {
+        ensure!(
+            matches!(
+                value["status"]["state"].as_str(),
+                Some("stopped" | "created")
+            ),
+            "VM is running or its state is not safely stopped; use workspace teardown before delete"
+        );
+        ensure!(
+            value["configuration"]["mounts"]
+                .as_array()
+                .is_some_and(|v| v.is_empty()),
+            "VM has mounts; detach managed storage before deleting runtime"
+        );
+        ensure!(
+            discard_runtime_data,
+            "VM writable layer may contain project files; pass --discard-runtime-data to delete it permanently"
+        );
+    }
+    let mut journal = lifecycle(state, vm)?;
+    journal.phase = Phase::Deleting;
+    save_lifecycle(state, vm, &journal)?;
+    if current.is_some() {
+        output(&["delete", &vm.instance_id], Duration::from_secs(30)).await?;
+    }
+    ensure!(
+        inspect(vm).await?.is_none(),
+        "VM still exists after delete; registration retained"
+    );
+    let _registry_lock = crate::silo::lock(state)?;
+    let mut registered = records(state)?;
+    ensure!(
+        matches!(registered.get(&vm.id), Some(Record::Vm(current)) if current.owner == vm.owner),
+        "workspace registration changed during delete"
+    );
+    registered.remove(&vm.id);
+    crate::silo::persist(state, "registry.json", &registered)?;
+    // Keep the tiny deletion journal and lock as tombstones. Waiting clients
+    // must not acquire a new inode or resurrect a stale Vm value.
     Ok(())
 }
 
@@ -379,6 +579,8 @@ pub async fn exec(
         "VM execution timeout cannot exceed 24 hours"
     );
     let _lock = operation_lock(state, vm, true)?;
+    check_registered(state, vm)?;
+    require_ready(state, vm)?;
     check_provider().await?;
     ensure!(
         inspect(vm)
@@ -447,6 +649,8 @@ pub async fn import(
     cancel: CancellationToken,
 ) -> Result<serde_json::Value> {
     let _lock = operation_lock(state, vm, false)?;
+    check_registered(state, vm)?;
+    require_ready(state, vm)?;
     check_provider().await?;
     ensure!(
         inspect(vm)
@@ -528,5 +732,35 @@ mod tests {
         .unwrap();
         assert!(get(state.path(), "vm").is_err());
         assert!(crate::silo::get(state.path(), "native").is_err());
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[tokio::test]
+    async fn pending_delete_blocks_setup_create_and_stale_handles() {
+        let root = tempfile::tempdir().unwrap();
+        let vm = create(root.path(), "vm", 1, 256).unwrap();
+        let mut journal = lifecycle(root.path(), &vm).unwrap();
+        assert_eq!(journal.phase, Phase::Created);
+        journal.phase = Phase::Deleting;
+        save_lifecycle(root.path(), &vm, &journal).unwrap();
+        assert!(
+            setup(root.path(), &vm, false)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("deletion")
+        );
+        assert!(
+            create(root.path(), "vm", 1, 256)
+                .unwrap_err()
+                .to_string()
+                .contains("deletion")
+        );
+        assert!(require_ready(root.path(), &vm).is_err());
+        let records: BTreeMap<String, Record> = BTreeMap::new();
+        crate::silo::persist(root.path(), "registry.json", &records).unwrap();
+        let replacement = create(root.path(), "vm", 1, 256).unwrap();
+        assert_ne!(replacement.owner, vm.owner);
+        assert!(check_registered(root.path(), &vm).is_err());
+        assert!(check_registered(root.path(), &replacement).is_ok());
     }
 }

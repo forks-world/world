@@ -7,7 +7,7 @@
 代码入口为 `crates/world-runtime/src/apple_vm.rs`、`guest/supervisor.py` 与 CLI 的 `--os` 选择。已实现：
 
 - macOS / arm64 + 显式 `--os linux` 选择 VM，原生工作流保持不变；一个 World 一个 VM。
-- create 保存配置；setup 创建/启动并检查 guest 协议与 cgroup.kill；show 返回配置、观测或观测失败原因；exec 显式要求 VM 运行；teardown 停机保留可写层。
+- create 保存配置和初始生命周期阶段；setup 创建/启动并检查 guest 协议与 cgroup.kill；show/list 返回配置、生命周期、provider 观测、时间和错误；exec 显式要求 ready；teardown 停机保留可写层；delete 仅删除已停机且归属匹配的 VM 实例与登记。
 - 固定 container 1.6.1 和 Python/Alpine 镜像 digest，guest `/workspace`、UID/GID 1000、独立 cgroup v2、no_new_privs。argv/标准输入/退出码透传；正常结束、超时与取消均清理同一任务的后代，包括 setsid 后代。
 - `workspace import <world> --source <host-directory>` 将宿主目录复制到空 guest `/workspace`。先以目录 fd 和 openat/O_NOFOLLOW 遍历，生成宿主磁盘上的有界流记录快照；guest 校验文件长度、结束标记、相对路径与父目录，拒绝 symlink 父目录、重复路径和特殊文件，暂存完成后原子替换空目录。导入与 exec/setup/teardown 使用独占锁互斥。源变化检测是尽力检查，源应暂停写入，不宣称一致性快照。
 - 同一 VM 的并发 exec 共享 localhost，任务间取消独立。每个任务的结果保存于 guest `/var/lib/world/executions`；启动前向 stderr 输出随机 Execution ID，重试命令不复用已执行 ID。尚无公共 execution 查询/日志 API，断线时可能返回 unknown，不自动重放。
@@ -21,7 +21,7 @@
 | 运行预算 | 每用户 setup 准入锁；除已运行的本 World 外，发现其他运行 container 即拒绝启动；不统计其他供应商 VM/machine，也未实现基于内存压力的准入 |
 | 数据与镜像 | guest 普通可写层，无宿主挂载；固定基础镜像加 root-owned helper；支持独立 import 命令；无 export、创建时 --import、自定义镜像、WorldFS、分支合并 |
 | 服务 | 使用仍在运行的前台 exec 承载服务；没有 named service、自动重启或宿主转发；普通 exec 结束会清理后台子进程 |
-| 生命周期 | setup/teardown 与 exec 用文件锁互斥；teardown 遇活跃执行返回 busy，不能自动批量取消；尚无运行代际及完整恢复日志 |
+| 生命周期 | setup/teardown 与 exec 用文件锁互斥；teardown 遇活跃执行返回 busy，不能自动批量取消；已落盘阶段和启动 generation；尚无完整 Execution 恢复日志 |
 | 协议 | 固定 helper 命令与独立 JSON 状态查询；不是完整 RPC/PTY/输出持久化协议；guest 控制进程故障后状态可能未知，需检查或停机 |
 | 安全级别 | 实验性 VM 执行边界，不是设计中的受管安全后端；未交付的出口策略不会被描述为有效 |
 
@@ -32,6 +32,20 @@
 宿主本地用户仍能直接用 container 管理自己的 VM，这属于受信任宿主权限范围。旧记录不做全库 schema 转换；完整注册表/host identity/运行代际迁移后续再实现。OS 不匹配、provider 不可用或版本不兼容时拒绝 exec，不回退到宿主。
 
 实际命令见 [README](../README.md#macos-上运行-linux-world实验性)。真实单 VM 回归用 `python3 experiments/macos/world_vm_smoke.py`：先 `cargo build --workspace` 并启动 container 服务；脚本建立 256 MiB VM，在临时目录记录结果，退出时停止并删除自己的实例，保留服务与镜像缓存。覆盖同名冲突、执行前置状态、stdin/argv、非零状态、后代回收、超时/取消、共享 localhost、独立任务取消、busy teardown、导入及重启持久化；导入覆盖跨块二进制内容、执行权限、相对与悬空链接、截断流、路径越界、symlink 父目录、特殊文件和覆盖拒绝。该测试只启动一个 VM，不声称完成跨 VM 网络策略验收。
+
+## 已实现的生命周期管理
+
+- `workspace list` 返回所有本地登记；原生记录标为 `unobserved`，不凭 loopback 地址推断进程存活。VM 的本地配置始终保留在查询结果中，provider/版本/归属校验失败返回 `unknown` 与 `observation_error`。
+- `workspace show` 的 VM 状态区分 `created`（尚未创建实例）、`ready`（实例运行且本地最近一次 setup 验证完成）、`unverified`（实例存在但本地阶段尚未就绪/无法识别 provider 状态）、`stopped`、`missing`（此前已尝试创建/运行、现在确认不存在）和 `deleting`。ready 不是持续 guest 健康探测；exec 会再次握手。`lifecycle.phase` 返回最后持久化的操作阶段，`observed_at_unix` 是本次观测时间，generation 在每次尝试启动前递增，幂等 setup 不递增。
+- 阶段记录按 instance owner 单独原子持久化，包含 created/provisioning/starting/ready/stopping/stopped/deleting。中断操作保留阶段用于后续检查；缺日志的旧记录视为 legacy，存在的实例可通过 setup 重新验证，缺失的实例不会被默认为从未创建。
+- setup 发现旧运行时缺失或首次创建是否成功无法确认时拒绝隐式新建。只有 `--recreate-missing` 显式允许在确认实例不存在时创建空运行时；存在的实例始终复用，不能用该选项覆盖。此行为不提供旧文件恢复，forkfs 分支挂载由 #28 单独实现。
+- teardown 保留注册和数据，不触发 WorldFS discard。活跃 exec/import 与其锁互斥，返回 busy，调用者应先取消执行。provider 不可用时不改写已知阶段；停止结果未知时保留 stopping，重试前重新观测。
+- `workspace delete <name>` 要求没有活跃执行、provider 可查询，实例已 stopped/created，owner/image 匹配且 mounts 为空。有实例时必须指定 `--discard-runtime-data`，明确授权永久删除其可写层；尚未创建或确认丢失的实例可仅删除登记。原生 Workspace 暂不支持 delete。
+- 删除先落盘 deleting，再删除 provider 实例，确认不存在后原子移除登记；任何 provider 错误保留登记，重复 delete 可完成收尾。deleting 阶段拒绝 setup/exec/import/同名 create。小型 journal/锁文件保留为 tombstone，避免旧句柄复活。所有操作取得锁后重新检查登记 owner，防止删除后同名重建的竞争。
+
+运行时删除不调用 forkfs 分支删除。当前带挂载的实例直接拒绝删除，避免在 #28 挂载与卸载契约尚未落地时自动处理存储；该阶段后续扩展必须先释放挂载。尚未实现公共 Execution 查询/日志恢复、完整操作错误日志、跨 provider 恢复或自动 setup。
+
+真实单 VM 回归追加验证：list、ready/stopped/created/missing/unknown 状态、幂等 setup 不推进 generation、重启推进 generation、删除运行 VM 拒绝、无数据删除确认拒绝、外部删除后的隐式重建拒绝与显式重建、删除 VM 保留同注册表原生记录，以及删除未创建实例的登记。单元测试覆盖 deleting 阶段防复活和同名替换后的旧句柄拒绝。
 
 ## 1. 决策与适用范围
 
