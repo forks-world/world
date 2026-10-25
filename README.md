@@ -72,4 +72,18 @@ VM 默认内存限额为 512 MiB，小型测试可指定 256 MiB；运行时与 
 
 工作目录固定为 guest `/workspace`，任务 UID 为 1000，不挂载宿主目录或导入宿主环境。首版使用固定 digest 的 Python/Alpine 镜像，已支持 `workspace import --source` 将宿主目录复制到空 `/workspace`；尚无 export、创建时的 `--import`、持久服务管理、PTY、宿主端口发布、WorldFS 或出口白名单。VM 提供独立内核边界，默认 NAT 并不阻止访问宿主、LAN 或其他 guest；不将此后端标为完整恶意任务沙盒。导入先生成宿主临时快照，再经 guest 暂存与校验发布，不覆盖已有内容。它包含隐藏文件与未跟踪文件，保留普通权限和符号链接，但不跟随链接读取外部目标；不保留 xattr/ACL/时间戳/硬链接关系，特殊文件和非 UTF-8 路径明确拒绝。导入时请暂停源目录写入；这不是原子文件系统快照。完整状态及限制见 [后端文档](docs/linux-vm-backend.md#当前实验实现)。
 
+### Linux VM 生命周期
+
+```sh
+./target/debug/world workspace list
+./target/debug/world workspace show linux-dev
+./target/debug/world workspace teardown linux-dev
+# 当前实验版可写层可能有项目文件：永久删除需要显式确认。
+./target/debug/world workspace delete linux-dev --discard-runtime-data
+```
+
+`list` 保留所有本地注册记录；原生 Workspace 暂不探测运行状态，VM 返回 `created`、`ready`、`stopped`、`missing`、`unknown` 等状态及观测时间。provider 不可用时返回 `unknown` 与错误，不能当作实例不存在。删除仅支持已停机的 Linux VM，活跃执行会拒绝停机/删除；不会调用 forkfs 分支删除或停止全局 container 服务。无实例的登记可直接删除，已有实例还必须确认删除其可写层，并且不允许带挂载的实例直接删除。
+
+生命周期阶段与启动 generation 落盘，删除中断可重复 `delete` 收尾。若已运行过的 VM 意外丢失，setup 会拒绝创建一个空环境来替代；检查数据恢复后，只有显式 `workspace setup <name> --recreate-missing` 才会重建空运行时。该选项不恢复旧文件。旧版本缺少生命周期记录的 VM 需 setup 重新验证；旧记录且实例缺失时同样要求显式重建。forkfs 挂载后 VM 仅承载运行时的工作另见 [Issue #28](https://github.com/forks-world/world/issues/28)。
+
 当前 `workspace create --workdir` 绑定已有目录，不会自动创建文件系统分支。完整控制面、认证、计费、Skill/MCP、forkfs RPC 接入、FUSE/FSKit 前端、数据库分支、外部副作用捕获与跨资源 merge/discard 均仍为规划，不能将现有网络运行时视为完整 World 生命周期。

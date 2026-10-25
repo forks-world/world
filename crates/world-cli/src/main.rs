@@ -54,6 +54,15 @@ enum Network {
 }
 #[derive(Subcommand)]
 enum Workspace {
+    /// List local workspace registrations, including unavailable VM runtimes.
+    List,
+    /// Remove a stopped VM workspace. Does not delete a forkfs branch.
+    Delete {
+        workspace: String,
+        /// Permanently delete data in the VM writable layer.
+        #[arg(long)]
+        discard_runtime_data: bool,
+    },
     Create {
         workspace: String,
         #[arg(long)]
@@ -80,6 +89,9 @@ enum Workspace {
     /// the process holding the workspace network namespace (no privilege).
     Setup {
         workspace: String,
+        /// Explicitly recreate an absent VM with an empty writable layer.
+        #[arg(long)]
+        recreate_missing: bool,
     },
     /// Linux: stop the workspace namespace holder started by setup.
     Teardown {
@@ -170,6 +182,22 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
         Commands::Workspace { state_dir, command } => {
             let state = state_dir.map(Ok).unwrap_or_else(silo::default_state_dir)?;
             match command {
+                Workspace::List => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&apple_vm::list(&state).await?)?
+                    );
+                    Ok(0)
+                }
+                Workspace::Delete {
+                    workspace,
+                    discard_runtime_data,
+                } => {
+                    let vm = apple_vm::get(&state, &workspace)?
+                        .context("delete currently supports Linux VM workspaces only; native workspaces are unchanged")?;
+                    apple_vm::delete(&state, &vm, discard_runtime_data).await?;
+                    Ok(0)
+                }
                 Workspace::Create {
                     workspace,
                     workdir,
@@ -225,7 +253,7 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                     if let Some(vm) = apple_vm::get(&state, &workspace)? {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&apple_vm::show(&vm).await?)?
+                            serde_json::to_string_pretty(&apple_vm::show(&state, &vm).await?)?
                         );
                     } else {
                         println!(
@@ -235,10 +263,17 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                     }
                     Ok(0)
                 }
-                Workspace::Setup { workspace } => {
+                Workspace::Setup {
+                    workspace,
+                    recreate_missing,
+                } => {
                     if let Some(vm) = apple_vm::get(&state, &workspace)? {
-                        apple_vm::setup(&state, &vm).await?;
+                        apple_vm::setup(&state, &vm, recreate_missing).await?;
                     } else {
+                        anyhow::ensure!(
+                            !recreate_missing,
+                            "--recreate-missing requires a Linux VM workspace"
+                        );
                         silo::setup(&state, &silo::get(&state, &workspace)?)?;
                     }
                     Ok(0)

@@ -45,6 +45,18 @@ def main():
         call('refuse-before-setup', execute('uname','-s'), expected=125)
         call('setup', workspace('setup','test'))
         call('setup-idempotent', workspace('setup','test'))
+        status = json.loads(call('show-ready',workspace('show','test')).stdout)
+        assert status['status'] == 'ready' and status['lifecycle']['generation'] == 1
+        listed = json.loads(call('list', workspace('list')).stdout)
+        assert len(listed) == 1 and listed[0]['id'] == 'test'
+        # Provider errors must not hide registrations or claim absence.
+        env = dict(os.environ, PATH='/nonexistent')
+        p = subprocess.run([binary,*workspace('list')],capture_output=True,text=True,env=env,timeout=15)
+        assert p.returncode == 0
+        unknown = json.loads(p.stdout)[0]
+        assert unknown['id'] == 'test' and unknown['status'] == 'unknown' and unknown['observation_error']
+        call('reject-delete-running',workspace('delete','test','--discard-runtime-data'),expected=125)
+
         # Reject corrupt/unsafe streams before publishing any file.
         def bad_stream(label, records):
             payload = ''.join(json.dumps(r) + '\n' for r in records)
@@ -128,11 +140,34 @@ def main():
                 server.kill(); server.wait()
         call('still-running', execute('true'))
         call('teardown', workspace('teardown','test'))
+        assert json.loads(call('show-stopped',workspace('show','test')).stdout)['status'] == 'stopped'
+        call('reject-data-delete-without-flag',workspace('delete','test'),expected=125)
+
         call('refuse-stopped', execute('true'), expected=125)
         call('restart', workspace('setup','test'))
         assert call('file-persists', execute('cat','persisted')).stdout == 'saved'
         call('import-persists', execute('python3','-c',imported_check))
-        call('show', workspace('show','test'))
+        final_status = json.loads(call('show', workspace('show','test')).stdout)
+        assert final_status['lifecycle']['generation'] == 2
+        # Simulate an externally lost runtime: setup must not silently replace data.
+        subprocess.run(['container','stop','--time','1',vm['instance_id']],check=True,timeout=20,capture_output=True)
+        subprocess.run(['container','delete',vm['instance_id']],check=True,timeout=20,capture_output=True)
+        assert json.loads(call('show-missing',workspace('show','test')).stdout)['status'] == 'missing'
+        call('reject-implicit-recreation',workspace('setup','test'),expected=125)
+        call('explicit-recreation',workspace('setup','test','--recreate-missing'))
+        call('recreated-runtime-empty',execute('test','!','-e','/workspace/persisted'))
+        call('stop-recreated-runtime',workspace('teardown','test'))
+        # A native entry in the same registry must survive deletion of the VM.
+        call('create-native',workspace('create','native','--workdir',str(root)))
+        call('delete-runtime',workspace('delete','test','--discard-runtime-data'))
+        remaining = json.loads(call('list-after-delete',workspace('list')).stdout)
+        assert [r['id'] for r in remaining] == ['native']
+        # Deleting an unprovisioned registration requires no data-discard flag.
+        call('create-unprovisioned',workspace('create','fresh','--os','linux','--memory','256M'))
+        assert json.loads(call('show-created',workspace('show','fresh')).stdout)['status'] == 'created'
+        call('delete-unprovisioned',workspace('delete','fresh'))
+        vm = None
+
         print('PASS', flush=True)
     finally:
         if vm:
