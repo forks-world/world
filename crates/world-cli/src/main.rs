@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::{ffi::OsString, path::PathBuf, time::Duration};
 use tokio_util::sync::CancellationToken;
 use world_runtime::{
+    apple_vm,
     policy::Policy,
     run::{self, RunOptions},
     silo,
@@ -56,10 +57,24 @@ enum Workspace {
     Create {
         workspace: String,
         #[arg(long)]
-        workdir: PathBuf,
+        workdir: Option<PathBuf>,
+        /// Execution OS. Omitted means native; macOS + linux uses an experimental VM.
+        #[arg(long, value_parser = ["linux", "macos"])]
+        os: Option<String>,
+        #[arg(long)]
+        cpus: Option<u32>,
+        /// VM workload memory limit, e.g. 256M, 512M or 1G.
+        #[arg(long, value_parser = parse_memory)]
+        memory: Option<u32>,
     },
     Show {
         workspace: String,
+    },
+    /// Copy a host directory into an empty Linux VM /workspace.
+    Import {
+        workspace: String,
+        #[arg(long)]
+        source: PathBuf,
     },
     /// macOS: add the workspace loopback alias (requires sudo). Linux: start
     /// the process holding the workspace network namespace (no privilege).
@@ -155,26 +170,85 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
         Commands::Workspace { state_dir, command } => {
             let state = state_dir.map(Ok).unwrap_or_else(silo::default_state_dir)?;
             match command {
-                Workspace::Create { workspace, workdir } => {
+                Workspace::Create {
+                    workspace,
+                    workdir,
+                    os,
+                    cpus,
+                    memory,
+                } => {
+                    let requested = os.as_deref().unwrap_or(std::env::consts::OS);
+                    let vm = requested == "linux" && std::env::consts::OS == "macos";
+                    if vm {
+                        anyhow::ensure!(
+                            workdir.is_none(),
+                            "Linux VM uses /workspace; --workdir is only for native workspaces (use workspace import after setup)"
+                        );
+                        let record = apple_vm::create(
+                            &state,
+                            &workspace,
+                            cpus.unwrap_or(1),
+                            memory.unwrap_or(512),
+                        )?;
+                        println!("{}", serde_json::to_string_pretty(&record)?);
+                    } else {
+                        anyhow::ensure!(
+                            requested == std::env::consts::OS,
+                            "unsupported host/execution OS combination"
+                        );
+                        anyhow::ensure!(
+                            cpus.is_none() && memory.is_none(),
+                            "resource flags currently require the Linux VM backend"
+                        );
+                        let workdir = workdir.context("native workspace requires --workdir")?;
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&silo::create(
+                                &state, &workspace, &workdir
+                            )?)?
+                        );
+                    }
+                    Ok(0)
+                }
+                Workspace::Import { workspace, source } => {
+                    let vm = apple_vm::get(&state, &workspace)?
+                        .context("import requires a Linux VM workspace")?;
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&silo::create(&state, &workspace, &workdir)?)?
+                        serde_json::to_string_pretty(
+                            &apple_vm::import(&state, &vm, &source, cancel).await?
+                        )?
                     );
                     Ok(0)
                 }
                 Workspace::Show { workspace } => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&silo::get(&state, &workspace)?)?
-                    );
+                    if let Some(vm) = apple_vm::get(&state, &workspace)? {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&apple_vm::show(&vm).await?)?
+                        );
+                    } else {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&silo::get(&state, &workspace)?)?
+                        );
+                    }
                     Ok(0)
                 }
                 Workspace::Setup { workspace } => {
-                    silo::setup(&state, &silo::get(&state, &workspace)?)?;
+                    if let Some(vm) = apple_vm::get(&state, &workspace)? {
+                        apple_vm::setup(&state, &vm).await?;
+                    } else {
+                        silo::setup(&state, &silo::get(&state, &workspace)?)?;
+                    }
                     Ok(0)
                 }
                 Workspace::Teardown { workspace } => {
-                    silo::teardown(&state, &silo::get(&state, &workspace)?)?;
+                    if let Some(vm) = apple_vm::get(&state, &workspace)? {
+                        apple_vm::teardown(&state, &vm).await?;
+                    } else {
+                        silo::teardown(&state, &silo::get(&state, &workspace)?)?;
+                    }
                     Ok(0)
                 }
             }
@@ -186,8 +260,28 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
             command,
         } => {
             let state = state_dir.map(Ok).unwrap_or_else(silo::default_state_dir)?;
-            let world = silo::get(&state, &workspace)?;
-            silo::exec(&state, world, command, timeout, cancel).await
+            if let Some(vm) = apple_vm::get(&state, &workspace)? {
+                apple_vm::exec(&state, &vm, command, timeout, cancel).await
+            } else {
+                let world = silo::get(&state, &workspace)?;
+                silo::exec(&state, world, command, timeout, cancel).await
+            }
         }
     }
+}
+
+fn parse_memory(input: &str) -> Result<u32, String> {
+    let (number, multiplier) = if let Some(value) = input.strip_suffix('M') {
+        (value, 1)
+    } else if let Some(value) = input.strip_suffix('G') {
+        (value, 1024)
+    } else {
+        return Err("memory requires M or G suffix, e.g. 256M".into());
+    };
+    number
+        .parse::<u32>()
+        .ok()
+        .and_then(|v| v.checked_mul(multiplier))
+        .filter(|v| (256..=4096).contains(v))
+        .ok_or_else(|| "memory must be between 256M and 4G".into())
 }

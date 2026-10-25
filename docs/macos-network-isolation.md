@@ -1,5 +1,11 @@
 # macOS 网络运行时
 
+与 Coding Agent 的组合尚未完成端到端验收；命令 sandbox 可能改变本页所述的 Workspace 视图。平台冲突、工具覆盖范围和接入计划见 [Agent sandbox 整合调研](agent-sandbox-integration.md)。
+
+本机入口注入、系统 shell 与子进程探测结果，以及完整链路的待验条件见 [macOS Agent 链路实测](macos-agent-chain-validation.md)。
+
+本文描述原生 macOS World 的已有运行时，Silo 保留为受支持原生程序的兼容后端；命令 wrapper 与透明代理组合尚未实现，边界见 [macOS 后端重新评估](macos-backend-reassessment.md)。当用户明确选择 Linux World 且宿主为 macOS / Apple Silicon 时，使用实验性的 [轻量 Linux VM 后端](linux-vm-backend.md)，完整出口策略及文件分支尚未实现。
+
 World 使用 Rust。CLI 位于 `crates/world-cli`，运行时位于 `crates/world-runtime`，silo 的 socket 拦截库位于 `vendor/silo-bind`。forkfs RPC、控制面认证与计费未实现。
 
 ## 两种执行模式
