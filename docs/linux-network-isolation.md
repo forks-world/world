@@ -1,5 +1,7 @@
 # Linux 网络运行时
 
+与 Coding Agent 的组合尚未完成端到端验收；命令 sandbox 可能改变本页所述的 Workspace 视图。平台冲突、工具覆盖范围和接入计划见 [Agent sandbox 整合调研](agent-sandbox-integration.md)。
+
 Linux 与 macOS 使用同一个 CLI（`world network exec`、`world workspace ...`、`world exec`），但后端是内核隔离：非特权 user namespace + network namespace。不需要 root，也不注入动态库。实现在 `crates/world-runtime/src/linux.rs`。
 
 ## 前提

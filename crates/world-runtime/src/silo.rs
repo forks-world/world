@@ -566,6 +566,10 @@ fn create_in(
     check_workdir(&workdir)?;
     let _lock = lock(state)?;
     let mut worlds = registry(state)?;
+    ensure!(
+        crate::apple_vm::get(state, id)?.is_none(),
+        "workspace already uses a Linux VM"
+    );
     if let Some(world) = worlds.get(id) {
         let mut world = world.clone();
         let mut dirty = false;
@@ -768,7 +772,7 @@ fn fill_temp_root(
 /// Take the exclusive registry lock, creating `state` first if needed. The
 /// returned file must be kept alive for as long as the lock must be held;
 /// it is released when dropped.
-fn lock(state: &Path) -> Result<File> {
+pub(crate) fn lock(state: &Path) -> Result<File> {
     std::fs::create_dir_all(state)?;
     let lock = OpenOptions::new()
         .create(true)
@@ -783,7 +787,7 @@ fn lock(state: &Path) -> Result<File> {
 /// Commit `value` to `state/name` atomically: write to a temp file in the
 /// same directory, fsync it, rename it into place, then fsync the directory
 /// so the rename itself is durable.
-fn persist<T: Serialize>(state: &Path, name: &str, value: &T) -> Result<()> {
+pub(crate) fn persist<T: Serialize>(state: &Path, name: &str, value: &T) -> Result<()> {
     let mut temp = tempfile::NamedTempFile::new_in(state)?;
     serde_json::to_writer_pretty(&mut temp, value)?;
     temp.write_all(b"\n")?;
@@ -794,13 +798,26 @@ fn persist<T: Serialize>(state: &Path, name: &str, value: &T) -> Result<()> {
 }
 
 fn save(state: &Path, worlds: &BTreeMap<String, World>) -> Result<()> {
-    persist(state, "registry.json", worlds)
+    let mut records = crate::apple_vm::records(state)?;
+    records.retain(|_, v| matches!(v, crate::apple_vm::Record::Vm(_)));
+    for (id, world) in worlds {
+        ensure!(!records.contains_key(id), "workspace backend conflict");
+        records.insert(id.clone(), crate::apple_vm::Record::Native(world.clone()));
+    }
+    persist(state, "registry.json", &records)
 }
 
 fn registry(state: &Path) -> Result<BTreeMap<String, World>> {
-    read_map(state, "registry.json")
+    Ok(crate::apple_vm::records(state)?
+        .into_iter()
+        .filter_map(|(id, record)| match record {
+            crate::apple_vm::Record::Native(world) => Some((id, world)),
+            crate::apple_vm::Record::Vm(_) => None,
+        })
+        .collect())
 }
 
+#[cfg(target_os = "linux")]
 fn read_map<T: serde::de::DeserializeOwned>(
     state: &Path,
     name: &str,
@@ -2556,5 +2573,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved, bin.canonicalize().unwrap());
+    }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod vm_registry_tests {
+    use super::*;
+
+    #[test]
+    fn native_updates_preserve_vm_and_old_readers_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let workdir = root.path().join("project");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        let vm = crate::apple_vm::create(&state, "linux", 1, 256).unwrap();
+        let native = create_in(&state, "native", &workdir, || Ok(home.clone())).unwrap();
+        assert_eq!(get(&state, "native").unwrap().ip, native.ip);
+        assert_eq!(
+            crate::apple_vm::get(&state, "linux")
+                .unwrap()
+                .unwrap()
+                .owner,
+            vm.owner
+        );
+        assert!(create_in(&state, "linux", &workdir, || Ok(home.clone())).is_err());
+        assert!(crate::apple_vm::create(&state, "native", 1, 256).is_err());
+        assert!(crate::apple_vm::create(&state, "linux", 2, 256).is_err());
+        let data = std::fs::read(state.join("registry.json")).unwrap();
+        assert!(serde_json::from_slice::<BTreeMap<String, World>>(&data).is_err());
     }
 }

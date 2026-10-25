@@ -2,15 +2,40 @@
 
 ## 1. 定位与设计前提
 
-World 是管理控制面，包含四个核心职责：CLI、付费管理、元信息管理，以及 Network 隔离。
+World 面向开发者和 Coding Agent，提供可分叉的状态与副作用环境。一个 World 将文件系统、数据库分支、服务路由和外部副作用记录关联到同一身份，让多个 Agent 从共同基线独立执行任务，检查差异，再决定合并、保留或丢弃。
 
-Coding Agent 是一等调用方。World 提供 CLI 与 MCP 两种入口，以及配套 Skill：Skill 描述如何完成任务，MCP 提供可执行的结构化工具，World API 统一执行领域规则。Agent 接入属于调用层，复用现有的付费、元信息和隔离能力。
+产品核心工作流是 **fork → execute → diff → merge/discard**，checkpoint 用于保存和恢复阶段状态。文件系统分支、数据库与服务分支、World 网络虚拟化、外部副作用管理是核心能力；CLI、Skill 和 MCP 提供统一入口。认证、组织、Network、元信息、配额和计费支撑协作与托管部署，按实际需要逐步接入。
 
-forkfs 是 World 的首批受控系统。World 负责决定谁能在什么 Network 中创建、使用和释放 forkfs 资源，并驱动实际操作。文件系统实现与文件数据由 forkfs 负责。
+### 产品边界与实现状态
 
-本设计暂将 Network 定义为可独立授权、分配配额和管理资源的逻辑空间，例如开发、测试、生产环境。Network 不预设为某一种区块链、公网或容器网络；底层运行环境由适配器接入。如果实际业务中的 Network 已有专门含义，需要在实现适配器前对齐其映射关系。
+- **状态与副作用**：World 协调各后端的分支、快照、差异和生命周期。数据库、对象存储及外部 API 必须逐项接入并声明能力；只为已接入的操作提供捕获、模拟、回放或提交语义。已发生的外部操作不能通过 discard 自动撤销，跨资源合并也不预设为原子事务。
+- **执行安全**：Agent 宿主、容器或其他执行后端负责文件访问、进程权限与网络出口限制。World 声明并验证所需能力，不将自研通用安全沙盒作为核心研发目标；已有出站白名单模式保留为可选执行能力。需要安全保证的受管部署仍必须验证后端策略生效，不能静默降级。
+- **网络虚拟化**：同一 World 的执行共享 localhost 和服务映射，不同 World 可以使用相同端口。Linux 宿主上的 Linux World 利用 namespace；macOS 宿主上明确选择 Linux 的 World 采用每 World 一个 Apple 轻量 Linux VM 的设计，见 [Linux VM 后端设计](linux-vm-backend.md)。原生 macOS World 保留 Silo 兼容后端及其注入限制，完整原生网络栈尚未通过验收，见 [macOS 后端重新评估](macos-backend-reassessment.md)。执行 OS 与宿主 OS 分开记录，不自动把原生 Workspace 转为 Linux。
+- **文件系统**：WorldFS / BranchFS 是核心能力，覆盖工作目录中的源码、未跟踪文件、构建产物与依赖。forkfs 作为首个计划接入的后端，通过 RPC 管理实际文件数据。FUSE/FSKit 是长期的文件系统前端方向；macOS 初期允许不同挂载路径，由 CLI 管理环境进入流程，不要求同一绝对路径具有不同进程视图。
 
-World 持有资源的期望配置与归属信息，底层运行环境负责实际运行。World 不存储业务数据、私钥或支付卡信息；元信息中的敏感配置使用密钥服务引用。
+当前已实现本地 Workspace 网络与临时目录运行时，以及独立的出站白名单模式。Linux VM 已有实验性后端选择、生命周期、guest cgroup 执行监督与单 VM 回归；出口隔离、完整恢复协议和文件分支接入仍未实现。文件系统 RPC 接入、挂载前端、数据库分支、副作用管理、跨资源生命周期、完整控制面及 Skill/MCP 均为规划。下文的 API、授权、付费和 forkfs RPC 细节是后续接入规格，不能视为已交付能力。
+
+### Agent sandbox 接入前提
+
+执行安全后端不能只按 Agent 名称选择。Codex 与 Claude Code 提供命令 sandbox，OpenCode 与 Pi 的安全边界需由外部环境补充；具体工具覆盖范围及版本差异见 [Agent sandbox 整合调研](agent-sandbox-integration.md)。World 应区分环境状态绑定、执行安全策略与工具权限，并记录各自的实际能力。
+
+平台适配按 Linux、macOS、WSL2 和 Windows 原生分别验收。记录宿主、Agent 与工具执行的实际 OS；Windows 原生还需区分安全后端模式、执行身份与文件/网络视图。当前 World 仅有 Linux/macOS 运行时，WSL2 为待验收的复用路线，Windows 原生后端另行设计，不能把 Agent 的跨平台支持当作 World 已支持。
+
+首批集成需验证两种组合：整个 Agent 在 World 对应环境内运行，以及宿主 Agent 把文件/执行工具委派给 World。MCP 负责生命周期操作，不能自动替换其他工具的执行路径。Linux 内层 bubblewrap 可能改变共享 localhost，macOS 的 sandbox helper 可能影响 Silo 注入；未经验证不能把内外层能力相加或关闭沙盒来宣称兼容。
+
+[其他 Coding Agent 调研](coding-agent-survey.md) 进一步覆盖十项产品入口。执行适配还需支持 agent server、自托管 worker 与一次性 runner：在实际执行端启动或领取任务前完成 World 绑定，记录会话身份与运行代际，并管理就绪、重连、取消和回收。仅包装桌面客户端、Docker CLI 或环境准备步骤，不保证后续工具进程继承 World 视图。这些适配器是待实现设计，按产品版本与执行平台分别验收。
+
+### 显式执行 OS 与后端选择
+
+Workspace 的 `execution_os` 是创建时确定的用户意图，`host_os` 是实际运行节点属性，后端由二者及架构、能力共同解析。macOS / arm64 宿主上显式 `--os linux` 选择 `apple-container`，每 World 一个持久 VM；未指定 OS 的新建和既有 Workspace 保持原生语义。Linux guest 不承诺 macOS 工具兼容，后端不可用时拒绝执行，不回退到宿主。
+
+VM 生命周期与存储生命周期分离：setup 创建/启动，exec 复用运行中的环境，teardown 停机并保留数据，discard/restore/GC 仍由状态后端定义。第一阶段 guest 普通目录不能宣称支持 WorldFS fork。详细接口、注册表迁移、资源预算、guest 协议、网络策略和验收以 [Linux VM 后端设计](linux-vm-backend.md) 为准。
+
+### World、Workspace 与 Network
+
+World 是产品名，也表示上述完整的可分叉环境。当前实现的 Workspace 绑定工作目录与运行时身份，后续将关联文件系统分支、数据库分支、服务映射和副作用记录；它是构建完整 World 的起点。本文沿用 Workspace 作为文件系统与执行资源的名称，避免与 forkfs 的底层 World 对象混淆。
+
+Network 定义为组织内部的授权与资源归属范围，一个 Network 可以包含多个独立 World/Workspace。Network 不等同于单个 World 的 localhost，也不预设为某一种内核网络命名空间。World 控制面保存归属、资源引用和期望配置，各后端保存实际状态与数据；敏感配置使用密钥服务引用。
 
 基本关系：
 
@@ -24,6 +49,8 @@ World 持有资源的期望配置与归属信息，底层运行环境负责实�
 组织内的多个 Network 共享付费账户，但不因此共享资源访问权限。初期一个资源只属于一个 Network，不支持原地变更归属；迁移通过目标 Network 内重新创建和显式迁移完成。
 
 ## 2. 系统结构与职责
+
+产品层由 World 生命周期协调文件系统后端、数据库与服务后端、网络路由和副作用记录。各后端需声明支持的 fork/checkpoint/diff/merge/discard 能力；执行失败时保留可查询的部分结果，不承诺尚未实现的跨后端一致性。下面的结构图描述拟议管理控制面及首个 forkfs 接入路径，数据库与副作用适配器在后续阶段补充。
 
 ```mermaid
 flowchart LR
@@ -86,11 +113,11 @@ flowchart LR
 
 资源名称在 `(organization_id, network_id, kind)` 范围内唯一。数据库通过复合外键保证资源、任务和授权引用的 Network 确实属于同一组织。Network 归属字段创建后不可修改。
 
-## 4. Network 隔离
+## 4. Network 授权与 World 网络虚拟化
 
 隔离必须由服务端和运行环境共同执行，CLI 的当前上下文仅用于选择操作目标。
 
-每个 World/Workspace 必须拥有独立网络栈：不同 World 能同时监听相同的地址、协议和端口，同一 World 的多个进程与多次 Execution 共享栈内的 `localhost` 和监听服务。应用不得为此修改端口或配置代理。运行时绑定使用全局 Workspace 身份与运行代际，不能使用 Store 局部简写或每次 Execution 身份；同属一个 Network 不代表共用端口空间。对外发布端口是显式授权动作，宿主端口冲突单独处理。完整验收要求见 [World 网络栈验收](macos-network-isolation.md#world-网络栈验收要求)。
+每个 World/Workspace 的目标是提供独立的 localhost 与服务视图：不同 World 能同时监听相同的地址、协议和端口，同一 World 的多个进程与多次 Execution 共享栈内的 `localhost` 和监听服务。应用不得为此修改端口或配置代理。运行时绑定使用全局 Workspace 身份与运行代际，不能使用 Store 局部简写或每次 Execution 身份；同属一个 Network 不代表共用端口空间。对外发布端口是显式授权动作，宿主端口冲突单独处理。完整网络栈的目标及当前兼容边界见 [World 网络栈验收](macos-network-isolation.md#world-网络栈验收要求)；原生 macOS 当前仅为受支持程序提供 localhost 兼容层；macOS-host/Linux-World 的 VM 路线另行验收，完整网络栈要求不作为本地首版已实现的承诺。
 
 ### 请求与权限
 
@@ -118,7 +145,7 @@ Network admin 可为本组织有效成员授予或撤销该 Network 的 operator
 
 ### 运行时网络
 
-元信息隔离不等于实际流量隔离。适配器必须提供各 Network 独立的运行空间或等效边界，并默认拒绝跨 Network 通信。外部出口通过显式策略放行；管理通道使用限定 Network 的身份。
+World 网络层负责按 World 身份进行 localhost 映射、服务寻址与分支路由，避免不同 World 意外共用服务状态。需要安全隔离的受管部署，由执行后端提供各 Network 独立的运行空间或等效边界，默认拒绝跨 Network 通信并按显式策略放行出口；World 验证这些能力，管理通道使用限定 Network 的身份。元信息隔离和 localhost 重写本身不提供上述安全保证。
 
 创建 Network 时先建立运行边界和默认策略，验证生效后才将状态设为 `active`。策略部署失败时保留失败状态，不允许资源进入运行环境。适配器无法满足这些能力时，不能宣称该运行环境已完成隔离。
 
@@ -373,17 +400,16 @@ World 已从 Go 原型迁移到 Rust。当前实际 workspace 仅包含 CLI、�
 
 ## 9. 实现顺序与验收
 
-1. **管理与 Agent 闭环**：实现认证、组织、Network、元信息 CRUD、基础 CLI、本地 MCP Server、配套 Skill 和一种运行环境适配器。验收组织和 Network 双重隔离、版本冲突，以及真实运行环境中的跨 Network 流量拒绝；使用 Coding Agent 完成一次查询、创建、跟踪和验证任务。
-2. **付费闭环**：接入一种支付服务，实现订阅、权益、配额预留、Webhook 与对账。验收重复和乱序支付事件、并发额度竞争、付款失败和降级处理。
-3. **可靠性闭环**：完善 outbox、重试、删除恢复、用量汇总与审计。验收 Worker 中断、响应丢失、重复执行和 Network 删除期间的并发请求。
+1. **本地状态闭环**：以现有 Workspace 运行时为基础接入 forkfs RPC，打通 init → fork → execute → inspect/diff → checkpoint → discard/restore，并跟踪 GC。优先验证多个 Workspace 同端口运行、文件变化独立、执行锁、结果未知时恢复及 discard 与实际空间回收的区别；不以认证或付费上线作为本地闭环的前置条件。
+2. **Agent 与文件系统体验**：提供与 CLI 共用应用服务的 MCP 和配套 Skill，逐步接入文件系统挂载前端，由 CLI 管理进入环境的流程。验收常用开发工具、未跟踪文件与构建产物的分支行为，以及两个 Agent 并发工作、断线后继续跟踪操作的能力。macOS 宿主按执行 OS 分别验收：Linux World 验证 VM 资源、guest 工具与文件视图；原生 macOS World 验证注入兼容范围。
+3. **数据库、服务与副作用闭环**：选择一个数据库或服务后端接入分支与路由，随后对明确支持的外部操作提供捕获、模拟、回放和待提交记录。diff 分别展示文件、数据库与副作用变化；合并/提交必须报告冲突、明确目标并取得相应授权，失败时保存各后端状态。验收不支持操作的明确拒绝、重复请求去重、部分成功恢复和 discard 不触发外部提交。
+4. **协作与托管管理**：按部署需求接入组织、Network 授权、元信息、远程节点、配额和付费。完善 outbox、审计、撤权传播与删除恢复；安全隔离由所选执行后端落实，并验证其与 World 路由的组合行为。
 
-隔离验收必须覆盖直接猜测资源 ID、列表、缓存、对象下载、后台任务、凭证和运行时通信，不能只验证 CLI 能切换上下文。付费验收必须覆盖支付成功但通知丢失，以及创建结果未知时的额度恢复。
+可靠性随各阶段交付：执行退出、非零状态、重复调用、响应丢失、取消竞争和未知状态恢复都需有可查询结果。各资源先明确 checkpoint 与一致性边界，再承诺组合生命周期；不假设文件、数据库和外部系统可以统一原子回滚。
 
-Agent 接入验收覆盖：仅安装 Skill 时明确报告 MCP 未连接、工具 schema 与 API 行为一致、两个 Agent 并发访问不同 Network 互不影响、篡改归属参数被拒绝、重复调用不重复创建、断线重连后能继续跟踪 Operation，以及受限身份无法通过 MCP 绕过付费或权限检查。CLI 与 MCP 对同一业务请求应产生一致结果。
+Agent 接入验收覆盖 Skill/MCP 未连接提示、工具 schema 与应用服务一致、并发 Workspace 互不影响、断线重连后可继续跟踪 Operation，以及 CLI/MCP 结果一致。协作部署另验收猜测资源 ID、列表、缓存、下载、后台任务、凭证和运行时通信的越权拒绝；受限身份不能绕过权限与配额。
 
-首阶段同时打通 forkfs 的最小控制闭环：init → fork → inspect/diff → checkpoint → discard/restore，并跟踪 GC。验收源与目标归属、执行锁、跨 Network 访问拒绝、结果未知时恢复，以及 discard 与实际空间回收的区别。Network 隔离验收需额外运行环境支持，不能以 forkfs 沙箱测试替代。
-
-开始实现前需要确定：Network 的实际业务含义与底层运行环境、首批资源类型、身份提供方、支付服务与套餐规则。这些选项保留为接入决策，当前设计不假设已有相关基础设施。
+付费能力上线时再验收支付通知丢失与乱序、并发额度竞争、增长操作结果未知时的额度保留，以及欠费仍能读取和释放资源。身份提供方、支付服务与套餐规则属于该阶段的接入决策。数据库和副作用后端则在进入对应阶段前确定支持范围与失败语义。
 
 ## 10. forkfs 控制：基于现有仓库的接入设计
 
@@ -409,7 +435,7 @@ forkfs 是本地工作空间提供方，核心对象是 Store、不可变 Snapsh
 
 **确定使用 RPC 作为项目边界。World 不通过 C ABI、FFI 或 CLI 输出解析接入 forkfs。** 上述 C ABI 仅记录上游现状，不构成 World 的依赖。forkfs 需要在自身仓库提供独立 RPC 服务，现有内部库如何组织由 forkfs 决定。
 
-World 仓库拥有统一 CLI、Skill、MCP、身份、付费、元信息及 Network 策略；forkfs 仓库继续拥有本地快照、克隆、差异、身份校验和回收机制。World 不直接改写 forkfs SQLite 或 `.world` 标记。
+World 仓库拥有环境生命周期编排、网络虚拟化、数据库与副作用后端接入，以及统一 CLI、Skill、MCP 和协作管理能力；forkfs 仓库继续拥有本地快照、克隆、差异、身份校验和回收机制。World 不直接改写 forkfs SQLite 或 `.world` 标记。
 
 ```text
 CLI / Coding Agent + Skill + MCP
@@ -419,6 +445,8 @@ CLI / Coding Agent + Skill + MCP
   → 节点上的 forkfs RPC 服务（待实现）
   → forkfs 核心 → 本地 Store / Workspace
 ```
+
+Linux VM 后端接入本节受管存储时，forkfs RPC 服务运行在 guest，World 宿主侧适配器负责 VM 生命周期与 RPC 传输；执行与存储锁仍由 forkfs 唯一持有。此前本地运行时阶段的 guest Execution 监督器不与 forkfs 并行接管同一 Workspace，具体过渡见 [Linux VM 后端设计](linux-vm-backend.md#4-组件与执行路径)。
 
 World 负责身份、权益、Network 授权、节点路由和任务编排；forkfs 服务负责存储操作、资源锁、执行进程、GC、pool 和持久化任务恢复。World 不再承担一个包装底层库的节点执行器。运行环境的 Network 策略仍由 World 管理，forkfs 执行进程需接入该策略已生效的运行环境。
 
@@ -739,7 +767,7 @@ Skill 的编码流程改为：确定 Network、节点与 Store → 选择或初�
 
 Linux 当前沙箱保留宿主网络，宿主可读文件也不是保密边界；macOS 使用允许默认访问的 seatbelt 策略，主要保护当前 Store 和其他 Workspace 的写入，且未指定 `--require-sandbox` 时可能降级为无沙箱。依据：[Linux 执行隔离说明](https://github.com/forks-world/forkfs/blob/6a89c15e121f0f42d50a72437ae5088e93af6b5b/docs/LINUX_XFS.md)、[CLI 沙箱实现](https://github.com/forks-world/forkfs/blob/6a89c15e121f0f42d50a72437ae5088e93af6b5b/cli/main.cpp)。
 
-因此 World 受管执行必须禁止静默降级，并额外部署 Network 流量策略及跨 Network 文件访问限制。只传 `--require-sandbox` 不足以完成这些保证。节点未提供所需隔离能力时拒绝受管执行，Network 不标为可执行状态。授权撤销也需要终止或隔离已有执行进程，不能仅删除控制面授权记录。
+因此，需要安全隔离保证的 World 受管执行必须禁止静默降级，并通过执行后端部署 Network 流量策略及跨 Network 文件访问限制。只传 `--require-sandbox` 不足以完成这些保证。节点未提供所需隔离能力时拒绝受管执行，Network 不标为可执行状态。授权撤销也需要终止或隔离已有执行进程，不能仅删除控制面授权记录。
 
 macOS 本地出站访问限制已有首版实现与内核集成测试：`world network exec` 使用默认拒绝的 Seatbelt 网络策略、每次执行独立且带凭证的 HTTP/CONNECT 代理、不可变目标白名单和有限执行期限。该出站模式禁止监听。另提供 `world exec <workspace>`，内部使用固定版本的 silo 动态库透明映射 localhost，支持同端口开发服务；它的注入兼容性有限，不能作为恶意任务的内核隔离边界。此入口尚未接入组织授权、forkfs RPC、远程租约和跨 Network 文件保密边界，不能据此将节点标为完整受管执行就绪。具体能力、限制和验证方法见 [macOS 网络隔离](macos-network-isolation.md)。
 
@@ -753,4 +781,4 @@ World 可以限制受管操作创建的对象数量；文件数据直接走本�
 
 World 新增 `internal/forkfs/` 管理领域映射、`internal/adapters/forkfs/` 实现 RPC 客户端、`contracts/forkfs/` 保存锁定版本的协议规格与兼容性用例；forkfs 仓库实现服务入口、RPC 方法、操作日志和恢复。客户端依赖版本化协议，不依赖内部符号；服务端检查 Store schema 兼容性。升级需停用相关后台 worker 并按上游兼容规则处理，不能让不同版本 GC 同时操作同一 Store。
 
-先在 forkfs 交付 RPC 生命周期、身份校验和幂等恢复，再对接 World 与结构化 MCP 工具，之后完成受管 Execution 和真实 Network 隔离；最后完善计量、pool 调度和多节点管理。验收覆盖：RPC 版本不兼容、伪造归属、重连和服务重启、取消与超时区别、不同 Store 的同号资源、源目标归属、执行中 checkpoint/discard 拒绝、重复投递、创建成功但返回丢失、trash 恢复边界、移动与复制的身份区分、磁盘满恢复，以及真实跨 Network 文件和流量拒绝。
+先在 forkfs 交付 RPC 生命周期、身份校验和幂等恢复，再对接 World 本地生命周期与结构化 MCP 工具，完成受管 Execution；协作部署阶段通过执行后端落实并验证真实 Network 安全隔离，之后完善计量、pool 调度和多节点管理。验收覆盖：RPC 版本不兼容、伪造归属、重连和服务重启、取消与超时区别、不同 Store 的同号资源、源目标归属、执行中 checkpoint/discard 拒绝、重复投递、创建成功但返回丢失、trash 恢复边界、移动与复制的身份区分、磁盘满恢复，以及真实跨 Network 文件和流量拒绝。

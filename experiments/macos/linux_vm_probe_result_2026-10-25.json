@@ -1,0 +1,525 @@
+{
+  "date": "2026-10-25",
+  "host": {
+    "os": "macOS 27.0.1 (26A434)",
+    "arch": "arm64",
+    "memory_bytes": 8589934592
+  },
+  "runtime": "Apple container 1.6.1 (Homebrew)",
+  "workload": {
+    "cpus": 1,
+    "memory_limit_bytes": 268435456,
+    "image": "docker.io/library/alpine:3.22",
+    "kernel": "6.18.35"
+  },
+  "scope": "Single VM smoke test, not World backend acceptance or build benchmark",
+  "raw_evidence": "/var/folders/22/rt9v8pks50j75q9bjmr58wq00000gn/T/world-vm-probe-930kewqk/results.json",
+  "results": [
+    {
+      "label": "version",
+      "argv": [
+        "container",
+        "--version"
+      ],
+      "seconds": 0.015344375,
+      "returncode": 0,
+      "stdout": "container CLI version 1.6.1 (build: release, commit: unspeci)\n",
+      "stderr": ""
+    },
+    {
+      "label": "image",
+      "argv": [
+        "container",
+        "image",
+        "inspect",
+        "docker.io/library/alpine:3.22"
+      ],
+      "seconds": 0.034776042,
+      "returncode": 0,
+      "stdout": "[\n  {\n    \"configuration\" : {\n      \"creationDate\" : \"2026-10-21T20:47:02Z\",\n      \"descriptor\" : {\n        \"digest\" : \"sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f\",\n        \"mediaType\" : \"application/vnd.oci.image.index.v1+json\",\n        \"size\" : 9218\n      },\n      \"name\" : \"docker.io/library/alpine:3.22\"\n    },\n    \"id\" : \"2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f\",\n    \"variants\" : [\n      {\n        \"config\" : {\n          \"architecture\" : \"arm64\",\n          \"config\" : {\n            \"Cmd\" : [\n              \"/bin/sh\"\n            ],\n            \"Env\" : [\n              \"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n            ],\n            \"WorkingDir\" : \"/\"\n          },\n          \"created\" : \"2026-10-21T20:47:02.239161075Z\",\n          \"history\" : [\n            {\n              \"comment\" : \"buildkit.dockerfile.v0\",\n              \"created\" : \"2026-10-21T20:47:02.239161075Z\",\n              \"created_by\" : \"ADD alpine-minirootfs-3.22.7-aarch64.tar.gz / # buildkit\"\n            },\n            {\n              \"comment\" : \"buildkit.dockerfile.v0\",\n              \"created\" : \"2026-10-21T20:47:02.239161075Z\",\n              \"created_by\" : \"CMD [\\\"/bin/sh\\\"]\",\n              \"empty_layer\" : true\n            }\n          ],\n          \"os\" : \"linux\",\n          \"rootfs\" : {\n            \"diff_ids\" : [\n              \"sha256:f27c84aef3509463528cb456fbf5bfa25cdc7dcea6912131a622883b5e005744\"\n            ],\n            \"type\" : \"layers\"\n          },\n          \"variant\" : \"v8\"\n        },\n        \"digest\" : \"sha256:3e07a4f627d12468155eb812785e10f2453a447c346872b47788a62437366764\",\n        \"platform\" : {\n          \"architecture\" : \"arm64\",\n          \"os\" : \"linux\",\n          \"variant\" : \"v8\"\n        },\n        \"size\" : 4129033\n      }\n    ]\n  }\n]\n",
+      "stderr": ""
+    },
+    {
+      "label": "before-pressure",
+      "argv": [
+        "memory_pressure"
+      ],
+      "seconds": 0.002335249999999997,
+      "returncode": 0,
+      "stdout": "The system has 8589934592 (524288 pages with a page size of 16384).\n\nStats: \nPages free: 46183 \nPages purgeable: 4538 \nPages purged: 1976077 \n\nSwap I/O:\nSwapins: 0 \nSwapouts: 0 \n\nPage Q counts:\nPages active: 106289 \nPages inactive: 102726 \nPages speculative: 2907 \nPages throttled: 0 \nPages wired down: 76550 \n\nCompressor Stats:\nPages used by compressor: 157616 \nPages decompressed: 4744753 \nPages compressed: 6780486 \n\nFile I/O:\nPageins: 10666085 \nPageouts: 187365 \n\nSystem-wide memory free percentage: 52%\n",
+      "stderr": ""
+    },
+    {
+      "label": "before-swap",
+      "argv": [
+        "sysctl",
+        "vm.swapusage"
+      ],
+      "seconds": 0.0021452500000000013,
+      "returncode": 0,
+      "stdout": "vm.swapusage: total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)\n",
+      "stderr": ""
+    },
+    {
+      "label": "before-footprint-24606",
+      "argv": [
+        "vmmap",
+        "-summary",
+        "24606"
+      ],
+      "seconds": 0.572022625,
+      "returncode": 0,
+      "stdout": "Physical footprint:         11.5M\nPhysical footprint (peak):  709.5M",
+      "stderr": ""
+    },
+    {
+      "label": "before-footprint-24613",
+      "argv": [
+        "vmmap",
+        "-summary",
+        "24613"
+      ],
+      "seconds": 0.5586505,
+      "returncode": 0,
+      "stdout": "Physical footprint:         3297K\nPhysical footprint (peak):  3377K",
+      "stderr": ""
+    },
+    {
+      "label": "before-footprint-24616",
+      "argv": [
+        "vmmap",
+        "-summary",
+        "24616"
+      ],
+      "seconds": 0.553876375,
+      "returncode": 0,
+      "stdout": "Physical footprint:         3089K\nPhysical footprint (peak):  3137K",
+      "stderr": ""
+    },
+    {
+      "label": "before-footprint-24618",
+      "argv": [
+        "vmmap",
+        "-summary",
+        "24618"
+      ],
+      "seconds": 0.5531059159999998,
+      "returncode": 0,
+      "stdout": "Physical footprint:         8641K\nPhysical footprint (peak):  12.4M",
+      "stderr": ""
+    },
+    {
+      "label": "first-start-cached-image",
+      "argv": [
+        "container",
+        "run",
+        "-d",
+        "--name",
+        "world-vm-probe-24859",
+        "--cpus",
+        "1",
+        "--memory",
+        "256M",
+        "docker.io/library/alpine:3.22",
+        "sleep",
+        "3600"
+      ],
+      "seconds": 0.6158370409999998,
+      "returncode": 0,
+      "stdout": "world-vm-probe-24859\n",
+      "stderr": "[0/6] [0s]\n[1/6] Fetching image [0s]\n[2/6] Unpacking image [0s]\n[3/6] Fetching kernel [0s]\n[4/6] Fetching init image [0s]\n[5/6] Unpacking init image [0s]\n[6/6] Starting container [0s]\n[6/6] Starting container [0s]\n"
+    },
+    {
+      "label": "inspect",
+      "argv": [
+        "container",
+        "inspect",
+        "world-vm-probe-24859"
+      ],
+      "seconds": 0.03972745799999977,
+      "returncode": 0,
+      "stdout": "[\n  {\n    \"configuration\" : {\n      \"capAdd\" : [\n\n      ],\n      \"capDrop\" : [\n\n      ],\n      \"creationDate\" : \"2026-10-25T01:56:54Z\",\n      \"dns\" : {\n        \"nameservers\" : [\n\n        ],\n        \"options\" : [\n\n        ],\n        \"searchDomains\" : [\n\n        ]\n      },\n      \"id\" : \"world-vm-probe-24859\",\n      \"image\" : {\n        \"descriptor\" : {\n          \"digest\" : \"sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f\",\n          \"mediaType\" : \"application/vnd.oci.image.index.v1+json\",\n          \"size\" : 9218\n        },\n        \"reference\" : \"docker.io/library/alpine:3.22\"\n      },\n      \"initProcess\" : {\n        \"arguments\" : [\n          \"3600\"\n        ],\n        \"environment\" : [\n          \"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n        ],\n        \"executable\" : \"sleep\",\n        \"rlimits\" : [\n\n        ],\n        \"supplementalGroups\" : [\n\n        ],\n        \"terminal\" : false,\n        \"user\" : {\n          \"id\" : {\n            \"gid\" : 0,\n            \"uid\" : 0\n          }\n        },\n        \"workingDirectory\" : \"/\"\n      },\n      \"labels\" : {\n\n      },\n      \"mounts\" : [\n\n      ],\n      \"networks\" : [\n        {\n          \"network\" : \"default\",\n          \"options\" : {\n            \"hostname\" : \"world-vm-probe-24859\",\n            \"mtu\" : 1280\n          }\n        }\n      ],\n      \"platform\" : {\n        \"architecture\" : \"arm64\",\n        \"os\" : \"linux\",\n        \"variant\" : \"v8\"\n      },\n      \"publishedPorts\" : [\n\n      ],\n      \"publishedSockets\" : [\n\n      ],\n      \"readOnly\" : false,\n      \"resources\" : {\n        \"cpuOverhead\" : 1,\n        \"cpus\" : 1,\n        \"memoryInBytes\" : 268435456\n      },\n      \"rosetta\" : false,\n      \"runtimeHandler\" : \"container-runtime-linux\",\n      \"ssh\" : false,\n      \"sysctls\" : {\n\n      },\n      \"useInit\" : false,\n      \"virtualization\" : false\n    },\n    \"id\" : \"world-vm-probe-24859\",\n    \"status\" : {\n      \"networks\" : [\n        {\n          \"hostname\" : \"world-vm-probe-24859\",\n          \"ipv4Address\" : \"192.168.64.4/24\",\n          \"ipv4Gateway\" : \"192.168.64.1\",\n          \"ipv6Address\" : \"fdc2:ef6:1640:41a7:f46e:33ff:fe6f:5d59/64\",\n          \"macAddress\" : \"f6:6e:33:6f:5d:59\",\n          \"mtu\" : 1280,\n          \"network\" : \"default\",\n          \"variant\" : \"reserved\"\n        }\n      ],\n      \"startedDate\" : \"2026-10-25T01:56:55Z\",\n      \"state\" : \"running\"\n    }\n  }\n]\n",
+      "stderr": ""
+    },
+    {
+      "label": "guest",
+      "argv": [
+        "container",
+        "exec",
+        "world-vm-probe-24859",
+        "sh",
+        "-ec",
+        "uname -a; cat /proc/meminfo; cat /proc/self/status; cat /proc/filesystems; ls /proc/self/ns; mount"
+      ],
+      "seconds": 0.05543112500000014,
+      "returncode": 0,
+      "stdout": "Linux world-vm-probe-24859 6.18.35 #1 SMP Mon Jun 15 12:55:27 UTC 2026 aarch64 Linux\nMemTotal:         359308 kB\nMemFree:          151640 kB\nMemAvailable:     286660 kB\nBuffers:           16732 kB\nCached:           123824 kB\nSwapCached:            0 kB\nActive:            32408 kB\nInactive:         111388 kB\nActive(anon):          0 kB\nInactive(anon):     3328 kB\nActive(file):      32408 kB\nInactive(file):   108060 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nDirty:                 0 kB\nWriteback:             0 kB\nAnonPages:          3380 kB\nMapped:            24908 kB\nShmem:                 0 kB\nKReclaimable:       2432 kB\nSlab:              13692 kB\nSReclaimable:       2432 kB\nSUnreclaim:        11260 kB\nKernelStack:        1296 kB\nPageTables:          796 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:      179652 kB\nCommitted_AS:      43404 kB\nVmallocTotal:   135288315904 kB\nVmallocUsed:        3640 kB\nVmallocChunk:          0 kB\nPercpu:              296 kB\nBalloon:               0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nName:\tcat\nUmask:\t0022\nState:\tR (running)\nTgid:\t5\nNgid:\t0\nPid:\t5\nPPid:\t2\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t0 \nNStgid:\t5\nNSpid:\t5\nNSpgid:\t2\nNSsid:\t2\nKthread:\t0\nVmPeak:\t    1772 kB\nVmSize:\t    1748 kB\nVmLck:\t       0 kB\nVmPin:\t       0 kB\nVmHWM:\t     888 kB\nVmRSS:\t     888 kB\nRssAnon:\t      48 kB\nRssFile:\t     840 kB\nRssShmem:\t       0 kB\nVmData:\t      84 kB\nVmStk:\t     132 kB\nVmExe:\t     840 kB\nVmLib:\t     652 kB\nVmPTE:\t      48 kB\nVmSwap:\t       0 kB\nHugetlbPages:\t       0 kB\nCoreDumping:\t0\nTHP_enabled:\t0\nuntag_mask:\t0xffffffffffffff\nThreads:\t1\nSigQ:\t0/1502\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000000000\nSigIgn:\t0000000000000000\nSigCgt:\t0000000000000000\nCapInh:\t0000000000000000\nCapPrm:\t00000000a80425fb\nCapEff:\t00000000a80425fb\nCapBnd:\t00000000a80425fb\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSeccomp_filters:\t0\nSpeculation_Store_Bypass:\tvulnerable\nSpeculationIndirectBranch:\tunknown\nCpus_allowed:\t3\nCpus_allowed_list:\t0-1\nMems_allowed:\t0001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\nnodev\tsysfs\nnodev\ttmpfs\nnodev\tbdev\nnodev\tproc\nnodev\tcgroup\nnodev\tcgroup2\nnodev\tdevtmpfs\nnodev\tbinfmt_misc\nnodev\tdebugfs\nnodev\ttracefs\nnodev\tsockfs\nnodev\tbpf\nnodev\tpipefs\nnodev\tramfs\nnodev\thugetlbfs\nnodev\tdevpts\n\text3\n\text2\n\text4\nnodev\tcifs\nnodev\tsmb3\nnodev\tautofs\n\tfuseblk\nnodev\tfuse\nnodev\tfusectl\nnodev\tvirtiofs\nnodev\toverlay\n\txfs\nnodev\t9p\n\terofs\nnodev\tmqueue\ncgroup\nipc\nmnt\nnet\npid\npid_for_children\nuser\nuts\n/dev/vdb on / type ext4 (rw,relatime)\nproc on /proc type proc (rw,relatime)\nsysfs on /sys type sysfs (rw,nosuid,nodev,noexec,relatime)\nnone on /dev type devtmpfs (rw,nosuid,relatime,size=177156k,nr_inodes=44289,mode=755)\nmqueue on /dev/mqueue type mqueue (rw,nosuid,nodev,noexec,relatime)\ntmpfs on /dev/shm type tmpfs (rw,nosuid,nodev,noexec,relatime,size=65536k)\ndevpts on /dev/pts type devpts (rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=666)\nnone on /sys/fs/cgroup type cgroup2 (rw,nosuid,nodev,noexec,relatime)\nnone on /proc/keys type devtmpfs (rw,nosuid,relatime,size=177156k,nr_inodes=44289,mode=755)\nnone on /proc/timer_list type devtmpfs (rw,nosuid,relatime,size=177156k,nr_inodes=44289,mode=755)\ntmpfs on /sys/firmware type tmpfs (ro,nosuid,nodev,noexec,relatime)\nproc on /proc/bus type proc (ro,relatime)\nproc on /proc/fs type proc (ro,relatime)\nproc on /proc/irq type proc (ro,relatime)\nproc on /proc/sys type proc (ro,relatime)\n",
+      "stderr": ""
+    },
+    {
+      "label": "start-service",
+      "argv": [
+        "container",
+        "exec",
+        "world-vm-probe-24859",
+        "sh",
+        "-ec",
+        "mkdir -p /tmp/world-probe; printf WORLD_VM_OK > /tmp/world-probe/index.html; printf '%s\\n' '#!/bin/sh' 'read -r request' \"printf 'HTTP/1.0 200 OK\\\\r\\\\nContent-Length: 11\\\\r\\\\n\\\\r\\\\nWORLD_VM_OK'\" > /tmp/world-probe/respond; chmod +x /tmp/world-probe/respond; nohup nc -lk -s 127.0.0.1 -p 8080 -e /tmp/world-probe/respond </dev/null >/tmp/world-probe/service.log 2>&1 &"
+      ],
+      "seconds": 0.07572579200000007,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "label": "separate-exec-http-0",
+      "argv": [
+        "container",
+        "exec",
+        "world-vm-probe-24859",
+        "wget",
+        "-qO-",
+        "http://127.0.0.1:8080"
+      ],
+      "seconds": 0.10433287499999988,
+      "returncode": 0,
+      "stdout": "WORLD_VM_OK",
+      "stderr": ""
+    },
+    {
+      "label": "separate-exec-http-1",
+      "argv": [
+        "container",
+        "exec",
+        "world-vm-probe-24859",
+        "wget",
+        "-qO-",
+        "http://127.0.0.1:8080"
+      ],
+      "seconds": 0.08018308400000018,
+      "returncode": 0,
+      "stdout": "WORLD_VM_OK",
+      "stderr": ""
+    },
+    {
+      "label": "separate-exec-http-2",
+      "argv": [
+        "container",
+        "exec",
+        "world-vm-probe-24859",
+        "wget",
+        "-qO-",
+        "http://127.0.0.1:8080"
+      ],
+      "seconds": 0.0835707499999998,
+      "returncode": 0,
+      "stdout": "WORLD_VM_OK",
+      "stderr": ""
+    },
+    {
+      "label": "guest-host-path-absent",
+      "argv": [
+        "container",
+        "exec",
+        "world-vm-probe-24859",
+        "sh",
+        "-ec",
+        "test ! -e /Users/hurricane; echo HOST_HOME_NOT_MOUNTED"
+      ],
+      "seconds": 0.07071083400000022,
+      "returncode": 0,
+      "stdout": "HOST_HOME_NOT_MOUNTED\n",
+      "stderr": ""
+    },
+    {
+      "label": "namespace-capability",
+      "argv": [
+        "container",
+        "exec",
+        "world-vm-probe-24859",
+        "sh",
+        "-c",
+        "unshare -Urnm sh -c 'echo NAMESPACE_OK; ip link'"
+      ],
+      "seconds": 0.06572641700000004,
+      "returncode": 0,
+      "stdout": "NAMESPACE_OK\n1: lo: <LOOPBACK> mtu 65536 qdisc noop state DOWN qlen 1000\n    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n",
+      "stderr": ""
+    },
+    {
+      "label": "stats",
+      "argv": [
+        "container",
+        "stats",
+        "--no-stream",
+        "--format",
+        "json",
+        "world-vm-probe-24859"
+      ],
+      "seconds": 2.0853122080000004,
+      "returncode": 0,
+      "stdout": "[{\"blockReadBytes\":1691648,\"blockWriteBytes\":0,\"cpuUsageUsec\":27329,\"id\":\"world-vm-probe-24859\",\"memoryLimitBytes\":268435456,\"memoryUsageBytes\":2244608,\"networkRxBytes\":4274,\"networkTxBytes\":516,\"numProcesses\":2}]\n",
+      "stderr": ""
+    },
+    {
+      "label": "running-pressure",
+      "argv": [
+        "memory_pressure"
+      ],
+      "seconds": 0.012829167000001362,
+      "returncode": 0,
+      "stdout": "The system has 8589934592 (524288 pages with a page size of 16384).\n\nStats: \nPages free: 14928 \nPages purgeable: 5061 \nPages purged: 1976077 \n\nSwap I/O:\nSwapins: 0 \nSwapouts: 0 \n\nPage Q counts:\nPages active: 121881 \nPages inactive: 118215 \nPages speculative: 3060 \nPages throttled: 0 \nPages wired down: 76643 \n\nCompressor Stats:\nPages used by compressor: 157544 \nPages decompressed: 4744916 \nPages compressed: 6780486 \n\nFile I/O:\nPageins: 10676373 \nPageouts: 187365 \n\nSystem-wide memory free percentage: 52%\n",
+      "stderr": ""
+    },
+    {
+      "label": "running-swap",
+      "argv": [
+        "sysctl",
+        "vm.swapusage"
+      ],
+      "seconds": 0.006383041999999506,
+      "returncode": 0,
+      "stdout": "vm.swapusage: total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)\n",
+      "stderr": ""
+    },
+    {
+      "label": "running-footprint-24606",
+      "argv": [
+        "vmmap",
+        "-summary",
+        "24606"
+      ],
+      "seconds": 0.6172342920000009,
+      "returncode": 0,
+      "stdout": "Physical footprint:         11.5M\nPhysical footprint (peak):  709.5M",
+      "stderr": ""
+    },
+    {
+      "label": "running-footprint-24613",
+      "argv": [
+        "vmmap",
+        "-summary",
+        "24613"
+      ],
+      "seconds": 0.5554377089999996,
+      "returncode": 0,
+      "stdout": "Physical footprint:         3361K\nPhysical footprint (peak):  3441K",
+      "stderr": ""
+    },
+    {
+      "label": "running-footprint-24616",
+      "argv": [
+        "vmmap",
+        "-summary",
+        "24616"
+      ],
+      "seconds": 0.5545003340000001,
+      "returncode": 0,
+      "stdout": "Physical footprint:         3089K\nPhysical footprint (peak):  3137K",
+      "stderr": ""
+    },
+    {
+      "label": "running-footprint-24618",
+      "argv": [
+        "vmmap",
+        "-summary",
+        "24618"
+      ],
+      "seconds": 0.5604963329999997,
+      "returncode": 0,
+      "stdout": "Physical footprint:         8529K\nPhysical footprint (peak):  12.4M",
+      "stderr": ""
+    },
+    {
+      "label": "running-footprint-24872",
+      "argv": [
+        "vmmap",
+        "-summary",
+        "24872"
+      ],
+      "seconds": 0.5576866660000004,
+      "returncode": 0,
+      "stdout": "Physical footprint:         20.1M\nPhysical footprint (peak):  20.1M",
+      "stderr": ""
+    },
+    {
+      "label": "running-footprint-24873",
+      "argv": [
+        "vmmap",
+        "-summary",
+        "24873"
+      ],
+      "seconds": 0.5780985419999993,
+      "returncode": 0,
+      "stdout": "Physical footprint:         266.1M\nPhysical footprint (peak):  266.1M",
+      "stderr": ""
+    },
+    {
+      "label": "stop",
+      "argv": [
+        "container",
+        "stop",
+        "--time",
+        "1",
+        "world-vm-probe-24859"
+      ],
+      "seconds": 1.1522509579999998,
+      "returncode": 0,
+      "stdout": "world-vm-probe-24859\n",
+      "stderr": ""
+    },
+    {
+      "label": "restart",
+      "argv": [
+        "container",
+        "start",
+        "world-vm-probe-24859"
+      ],
+      "seconds": 0.5173691250000001,
+      "returncode": 0,
+      "stdout": "world-vm-probe-24859\n",
+      "stderr": ""
+    },
+    {
+      "label": "restart-file",
+      "argv": [
+        "container",
+        "exec",
+        "world-vm-probe-24859",
+        "cat",
+        "/tmp/world-probe/index.html"
+      ],
+      "seconds": 0.06474920800000028,
+      "returncode": 0,
+      "stdout": "WORLD_VM_OK",
+      "stderr": ""
+    },
+    {
+      "label": "restart-service-absent",
+      "argv": [
+        "container",
+        "exec",
+        "world-vm-probe-24859",
+        "sh",
+        "-ec",
+        "if wget -T 2 -qO- http://127.0.0.1:8080; then exit 1; fi"
+      ],
+      "seconds": 0.05208554200000037,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": "wget: can't connect to remote host (127.0.0.1): Connection refused\n"
+    },
+    {
+      "label": "cleanup-stop",
+      "argv": [
+        "container",
+        "stop",
+        "--time",
+        "1",
+        "world-vm-probe-24859"
+      ],
+      "seconds": 1.1491807499999993,
+      "returncode": 0,
+      "stdout": "world-vm-probe-24859\n",
+      "stderr": ""
+    },
+    {
+      "label": "cleanup-delete",
+      "argv": [
+        "container",
+        "delete",
+        "world-vm-probe-24859"
+      ],
+      "seconds": 0.06051304200000018,
+      "returncode": 0,
+      "stdout": "world-vm-probe-24859\n",
+      "stderr": ""
+    },
+    {
+      "label": "after-pressure",
+      "argv": [
+        "memory_pressure"
+      ],
+      "seconds": 0.006405875000000449,
+      "returncode": 0,
+      "stdout": "The system has 8589934592 (524288 pages with a page size of 16384).\n\nStats: \nPages free: 44994 \nPages purgeable: 5050 \nPages purged: 1976077 \n\nSwap I/O:\nSwapins: 0 \nSwapouts: 0 \n\nPage Q counts:\nPages active: 106793 \nPages inactive: 103368 \nPages speculative: 3061 \nPages throttled: 0 \nPages wired down: 76550 \n\nCompressor Stats:\nPages used by compressor: 157505 \nPages decompressed: 4744977 \nPages compressed: 6780486 \n\nFile I/O:\nPageins: 10677065 \nPageouts: 187365 \n\nSystem-wide memory free percentage: 52%\n",
+      "stderr": ""
+    },
+    {
+      "label": "after-swap",
+      "argv": [
+        "sysctl",
+        "vm.swapusage"
+      ],
+      "seconds": 0.00479862499999939,
+      "returncode": 0,
+      "stdout": "vm.swapusage: total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)\n",
+      "stderr": ""
+    },
+    {
+      "label": "after-footprint-24606",
+      "argv": [
+        "vmmap",
+        "-summary",
+        "24606"
+      ],
+      "seconds": 0.5820367499999985,
+      "returncode": 0,
+      "stdout": "Physical footprint:         11.5M\nPhysical footprint (peak):  709.5M",
+      "stderr": ""
+    },
+    {
+      "label": "after-footprint-24613",
+      "argv": [
+        "vmmap",
+        "-summary",
+        "24613"
+      ],
+      "seconds": 0.5947473750000007,
+      "returncode": 0,
+      "stdout": "Physical footprint:         3489K\nPhysical footprint (peak):  3489K",
+      "stderr": ""
+    },
+    {
+      "label": "after-footprint-24616",
+      "argv": [
+        "vmmap",
+        "-summary",
+        "24616"
+      ],
+      "seconds": 0.559458124999999,
+      "returncode": 0,
+      "stdout": "Physical footprint:         3089K\nPhysical footprint (peak):  3137K",
+      "stderr": ""
+    },
+    {
+      "label": "after-footprint-24618",
+      "argv": [
+        "vmmap",
+        "-summary",
+        "24618"
+      ],
+      "seconds": 0.5545025000000017,
+      "returncode": 0,
+      "stdout": "Physical footprint:         8529K\nPhysical footprint (peak):  12.4M",
+      "stderr": ""
+    }
+  ],
+  "limitations": [
+    "Startup timing excludes cached kernel, init image and Alpine image downloads.",
+    "An earlier first run took 21.388 seconds including runtime initialization; not a pure VM boot measurement.",
+    "An APK installation attempt was stopped after 66.871 seconds; final probe uses built-in tools. Internet/package installation compatibility is not established.",
+    "The memory option limits workload memory, not total host footprint.",
+    "vmmap physical footprint snapshots are approximate process accounting, not isolated whole-machine memory deltas.",
+    "API server historical footprint peak was 709.5M during setup; steady idle footprint is not the provisioning peak.",
+    "No build, Agent, pasta, Landlock, seccomp enforcement, cross-World isolation or hostile-workload acceptance tests.",
+    "Restart preserves files, not process state."
+  ],
+  "cleanup": {
+    "test_containers_deleted": true,
+    "container_system_stopped": true,
+    "runtime_processes_remaining": false,
+    "swap_used_after": "0.00M",
+    "installation_and_image_cache_retained": true
+  }
+}
