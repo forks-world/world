@@ -148,6 +148,14 @@ def import_workspace():
 
 def main():
     mode = sys.argv[1]
+    if mode in ('boot-id', 'probe', 'run', 'import'):
+        boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        expected = os.environ.get('WORLD_EXPECTED_BOOT_ID')
+        if expected is not None and expected != boot_id:
+            raise ValueError('guest boot changed; run workspace setup first')
+        if mode == 'boot-id':
+            print(boot_id)
+            return 0
     if mode == 'import':
         import_workspace()
         return 0
@@ -156,7 +164,7 @@ def main():
         p.mkdir(exist_ok=True)
         assert (p / 'cgroup.kill').exists()
         p.rmdir()
-        print(json.dumps({'protocol': 1, 'uid': os.getuid(), 'cgroup_kill': True, 'import_protocol': 1}))
+        print(json.dumps({'protocol': 1, 'uid': os.getuid(), 'cgroup_kill': True, 'import_protocol': 1, 'boot_id': boot_id}))
         return 0
     token = sys.argv[2]
     if not re.fullmatch('[0-9a-f]{32}', token):

@@ -18,6 +18,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const IMAGE: &str = "docker.io/library/python@sha256:bf12ecc0bea3f171d55145dd02c78b5eeb09f30ee2ac9cc2b4c9e4e8f5e30741";
+const PROVIDER_VERSIONS: &[&str] = &["1.6.1", "1.7.1"];
 const GUEST: &str = include_str!("../guest/supervisor.py");
 const HELPER: &str = "/opt/world/supervisor.py";
 
@@ -78,6 +79,8 @@ struct Lifecycle {
     owner: String,
     phase: Phase,
     generation: u64,
+    #[serde(default)]
+    boot_id: Option<String>,
 }
 
 fn lifecycle(state: &Path, vm: &Vm) -> Result<Lifecycle> {
@@ -92,6 +95,7 @@ fn lifecycle(state: &Path, vm: &Vm) -> Result<Lifecycle> {
             owner: vm.owner.clone(),
             phase: Phase::Legacy,
             generation: 0,
+            boot_id: None,
         }),
         Err(error) => Err(error.into()),
     }
@@ -113,12 +117,15 @@ fn check_registered(state: &Path, vm: &Vm) -> Result<()> {
     Ok(())
 }
 
-fn require_ready(state: &Path, vm: &Vm) -> Result<()> {
+fn require_ready(state: &Path, vm: &Vm) -> Result<String> {
+    let journal = lifecycle(state, vm)?;
     ensure!(
-        lifecycle(state, vm)?.phase == Phase::Ready,
+        journal.phase == Phase::Ready,
         "workspace is not ready; run workspace show and workspace setup first"
     );
-    Ok(())
+    journal
+        .boot_id
+        .context("VM boot is unverified; run workspace setup first")
 }
 
 /// Local records are returned even when the provider cannot be contacted.
@@ -231,6 +238,7 @@ pub fn create(state: &Path, id: &str, cpus: u32, memory_mib: u32) -> Result<Vm> 
             owner: vm.owner.clone(),
             phase: Phase::Created,
             generation: 0,
+            boot_id: None,
         },
     )?;
     records.insert(id.into(), Record::Vm(vm.clone()));
@@ -278,10 +286,16 @@ async fn check_provider() -> Result<()> {
     supported()?;
     let version = output(&["--version"], Duration::from_secs(10))
         .await
-        .context("Apple container is missing; install container 1.6.1")?;
+        .context(
+            "cannot query Apple container version; check that container is installed and on PATH",
+        )?;
     ensure!(
-        version.split_whitespace().any(|s| s == "1.6.1"),
-        "unsupported container version; this experimental backend requires 1.6.1"
+        version
+            .split_whitespace()
+            .any(|s| PROVIDER_VERSIONS.contains(&s)),
+        "unsupported Apple container version: {}; supported versions: {}",
+        version.trim(),
+        PROVIDER_VERSIONS.join(", ")
     );
     output(&["system", "status"], Duration::from_secs(10))
         .await
@@ -336,13 +350,23 @@ pub async fn show(state: &Path, vm: &Vm) -> Result<serde_json::Value> {
         Ok(value) => (value, None),
         Err(error) => (None, Some(format!("{error:#}"))),
     };
+    let mut error = error;
     let status = if error.is_some() {
         "unknown"
     } else if journal.phase == Phase::Deleting {
         "deleting"
     } else if let Some(value) = &observed {
         match value["status"]["state"].as_str() {
-            Some("running") if journal.phase == Phase::Ready => "ready",
+            Some("running") if journal.phase == Phase::Ready && journal.boot_id.is_some() => {
+                match guest(vm, &["boot-id"]).await {
+                    Ok(boot_id) if journal.boot_id.as_deref() == Some(boot_id.trim()) => "ready",
+                    Ok(_) => "unverified",
+                    Err(cause) => {
+                        error = Some(format!("cannot verify guest boot: {cause:#}"));
+                        "unknown"
+                    }
+                }
+            }
             Some("running") => "unverified",
             Some("stopped") => "stopped",
             _ => "unverified",
@@ -463,6 +487,17 @@ pub async fn setup(state: &Path, vm: &Vm, recreate_missing: bool) -> Result<()> 
                     probe["protocol"] == 1 && probe["uid"] == 0 && probe["cgroup_kill"] == true,
                     "guest protocol/capability mismatch"
                 );
+                let boot_id = probe["boot_id"].as_str().context("guest boot ID missing")?;
+                if running
+                    && journal.phase != Phase::Starting
+                    && journal.boot_id.as_deref() != Some(boot_id)
+                {
+                    journal.generation = journal
+                        .generation
+                        .checked_add(1)
+                        .context("VM generation overflow")?;
+                }
+                journal.boot_id = Some(boot_id.to_owned());
                 journal.phase = Phase::Ready;
                 save_lifecycle(state, vm, &journal)?;
                 eprintln!(
@@ -580,7 +615,7 @@ pub async fn exec(
     );
     let _lock = operation_lock(state, vm, true)?;
     check_registered(state, vm)?;
-    require_ready(state, vm)?;
+    let boot_id = require_ready(state, vm)?;
     check_provider().await?;
     ensure!(
         inspect(vm)
@@ -590,6 +625,10 @@ pub async fn exec(
     );
     let probe: serde_json::Value = serde_json::from_str(&guest(vm, &["probe"]).await?)?;
     ensure!(probe["protocol"] == 1, "guest protocol mismatch");
+    ensure!(
+        probe["boot_id"].as_str() == Some(&boot_id),
+        "VM restarted outside World; run workspace setup first"
+    );
     if cancel.is_cancelled() {
         return Ok(124);
     }
@@ -600,6 +639,8 @@ pub async fn exec(
         .args([
             "exec",
             "-i",
+            "-e",
+            &format!("WORLD_EXPECTED_BOOT_ID={boot_id}"),
             &vm.instance_id,
             "python3",
             "-I",
@@ -630,13 +671,18 @@ pub async fn exec(
             }
         }
     }
-    let result: serde_json::Value = serde_json::from_str(&guest(vm, &["status", &token]).await?)?;
+    let result: serde_json::Value =
+        serde_json::from_str(&guest(vm, &["status", &token]).await.with_context(|| {
+            format!(
+                "execution {token} status unknown; guest result unavailable, command may have run"
+            )
+        })?)?;
     match result["state"].as_str() {
         Some("exited" | "timed_out" | "cancelled") => Ok(result["exit_code"]
             .as_i64()
             .context("missing guest exit code")?
             as i32),
-        _ => bail!("execution {token} did not complete successfully: {result}"),
+        _ => bail!("execution {token} status unknown; command may have run: {result}"),
     }
 }
 
@@ -650,7 +696,7 @@ pub async fn import(
 ) -> Result<serde_json::Value> {
     let _lock = operation_lock(state, vm, false)?;
     check_registered(state, vm)?;
-    require_ready(state, vm)?;
+    let boot_id = require_ready(state, vm)?;
     check_provider().await?;
     ensure!(
         inspect(vm)
@@ -662,6 +708,10 @@ pub async fn import(
     ensure!(
         probe["import_protocol"] == 1,
         "guest lacks import support; run workspace setup to update helper"
+    );
+    ensure!(
+        probe["boot_id"].as_str() == Some(&boot_id),
+        "VM restarted outside World; run workspace setup first"
     );
     let source = source.to_path_buf();
     let snapshot =
@@ -675,6 +725,8 @@ pub async fn import(
         .args([
             "exec",
             "-i",
+            "-e",
+            &format!("WORLD_EXPECTED_BOOT_ID={boot_id}"),
             &vm.instance_id,
             "python3",
             "-I",

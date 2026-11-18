@@ -53,7 +53,7 @@ mkdir -p ~/world-a ~/world-b
 
 ### macOS 上运行 Linux World（实验性）
 
-当前支持 Apple Silicon 与 Apple `container` 1.6.1；本机验证系统为 macOS 27.0.1。先安装该版本并显式启动服务，再运行：
+当前支持 Apple Silicon 与 Apple `container` 1.6.1 或 1.7.1。实测组合见[后端文档](docs/linux-vm-backend.md#阶段-1-回归记录)。安装支持版本并显式启动服务后运行：
 
 ```sh
 container system start
