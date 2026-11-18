@@ -28,6 +28,16 @@ enum Commands {
         #[command(subcommand)]
         command: Workspace,
     },
+    /// Manage persistent services inside a Linux VM workspace.
+    Service {
+        #[arg(long, global = true)]
+        state_dir: Option<PathBuf>,
+        /// Retry a write using the operation ID printed by the first attempt.
+        #[arg(long, global = true)]
+        request_id: Option<String>,
+        #[command(subcommand)]
+        command: Service,
+    },
     /// Run a command inside a workspace's isolated localhost.
     Exec {
         workspace: String,
@@ -39,6 +49,46 @@ enum Commands {
         command: Vec<OsString>,
     },
 }
+#[derive(Subcommand)]
+enum Service {
+    Operation {
+        workspace: String,
+        id: String,
+    },
+    Start {
+        workspace: String,
+        name: String,
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
+    List {
+        workspace: String,
+    },
+    Show {
+        workspace: String,
+        name: String,
+    },
+    Stop {
+        workspace: String,
+        name: String,
+    },
+    Restart {
+        workspace: String,
+        name: String,
+    },
+    Remove {
+        workspace: String,
+        name: String,
+    },
+    /// Return the last 64 KiB of a log stream in JSON as base64.
+    Logs {
+        workspace: String,
+        name: String,
+        #[arg(long, default_value = "stdout", value_parser = ["stdout", "stderr"])]
+        stream: String,
+    },
+}
+
 #[derive(Subcommand)]
 enum Network {
     Exec {
@@ -287,6 +337,55 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                     Ok(0)
                 }
             }
+        }
+        Commands::Service {
+            state_dir,
+            request_id,
+            command,
+        } => {
+            use serde_json::json;
+
+            let (workspace, request) = match command {
+                Service::Start {
+                    workspace,
+                    name,
+                    argv,
+                } => (
+                    workspace,
+                    json!({"action": "start", "name": name, "argv": argv}),
+                ),
+                Service::Operation { workspace, id } => (
+                    workspace,
+                    json!({"action": "operation", "operation_id": id}),
+                ),
+                Service::List { workspace } => (workspace, json!({"action": "list"})),
+                Service::Show { workspace, name } => {
+                    (workspace, json!({"action": "show", "name": name}))
+                }
+                Service::Stop { workspace, name } => {
+                    (workspace, json!({"action": "stop", "name": name}))
+                }
+                Service::Restart { workspace, name } => {
+                    (workspace, json!({"action": "restart", "name": name}))
+                }
+                Service::Remove { workspace, name } => {
+                    (workspace, json!({"action": "remove", "name": name}))
+                }
+                Service::Logs {
+                    workspace,
+                    name,
+                    stream,
+                } => (
+                    workspace,
+                    json!({"action": "logs", "name": name, "stream": stream}),
+                ),
+            };
+            let state = state_dir.map(Ok).unwrap_or_else(silo::default_state_dir)?;
+            let vm = apple_vm::get(&state, &workspace)?
+                .context("service requires a Linux VM workspace")?;
+            let response = apple_vm::service(&state, &vm, request, request_id).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            Ok(0)
         }
         Commands::Exec {
             workspace,

@@ -50,6 +50,9 @@ def main():
     def workspace(*args):
         return ['workspace', '--state-dir', str(state), *args]
 
+    def service(action, *args):
+        return ['service', '--state-dir', str(state), action, 'test', *args]
+
     def execute(*args, duration='5m'):
         return ['exec', 'test', '--state-dir', str(state), '--timeout', duration, '--', *args]
 
@@ -179,6 +182,50 @@ def main():
         finally:
             if server.poll() is None:
                 server.kill(); server.wait()
+        command = ['web', '--', 'python3', '-u', '-m', 'http.server', '8080', '--bind', '127.0.0.1']
+        run = json.loads(call('service-start', service('start', *command)).stdout)
+        assert run['state'] == 'running'
+        duplicate = json.loads(call('service-start-idempotent', service('start', *command)).stdout)
+        assert duplicate['run_id'] == run['run_id']
+        call('service-reject-changed-command', service('start', 'web', '--', 'true'), expected=125)
+        assert call('service-outlives-cli', execute('python3', '-c', client)).stdout.strip() == 'saved'
+        log = json.loads(call('service-logs', service('logs', 'web', '--stream', 'stderr')).stdout)
+        import base64
+        assert b'GET /persisted' in base64.b64decode(log['base64'])
+        call('service-refuse-remove-running', service('remove', 'web'), expected=125)
+        restarted = json.loads(call('service-restart', service('restart', 'web')).stdout)
+        assert restarted['run_id'] != run['run_id']
+        operation_id = restarted['operation_id']
+        replayed = json.loads(call('service-restart-retry', service(
+            'restart', 'web', '--request-id', operation_id,
+        )).stdout)
+        assert replayed['run_id'] == restarted['run_id']
+        operation = json.loads(call('service-operation', service('operation', operation_id)).stdout)
+        assert operation['state'] == 'completed' and operation['result']['run_id'] == restarted['run_id']
+        call('service-request-conflict', service('stop', 'web', '--request-id', operation_id),
+             expected=125)
+        assert call('service-restarted', execute('python3', '-c', client)).stdout.strip() == 'saved'
+        stopped = json.loads(call('service-stop', service('stop', 'web')).stdout)
+        assert stopped['state'] == 'stopped'
+        call('service-remove', service('remove', 'web'))
+        assert json.loads(call('service-list-empty', service('list')).stdout) == []
+        call('service-start-log-volume', service(
+            'start', 'logger', '--', 'python3', '-c',
+            "import os; os.write(1, b'x' * (2300 * 1024) + bytes(range(256)))",
+        ))
+        for _ in range(45):
+            status = json.loads(call('service-log-volume-status', service('show', 'logger')).stdout)
+            if status['state'] == 'exited':
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError('log producer did not finish')
+        assert status['exit_code'] == 0
+        log = json.loads(call('service-bounded-logs', service('logs', 'logger')).stdout)
+        data = base64.b64decode(log['base64'])
+        assert log['truncated'] and len(data) == 65536 and data.endswith(bytes(range(256)))
+        call('service-remove-logger', service('remove', 'logger'))
+        call('service-start-before-teardown', service('start', *command))
         call('still-running', execute('true'))
         call('teardown', workspace('teardown','test'))
         assert json.loads(call('show-stopped',workspace('show','test')).stdout)['status'] == 'stopped'
@@ -187,9 +234,12 @@ def main():
         call('refuse-stopped', execute('true'), expected=125)
         call('restart', workspace('setup','test'))
         assert call('file-persists', execute('cat','persisted')).stdout == 'saved'
+        saved_service = json.loads(call('service-after-teardown', service('show', 'web')).stdout)
+        assert saved_service['state'] == 'stopped'
         call('import-persists', execute('python3','-c',imported_check))
         final_status = json.loads(call('show', workspace('show','test')).stdout)
         assert final_status['lifecycle']['generation'] == 2
+        call('service-start-before-crash', service('start', *command))
         # Lose the runtime after a command writes its first side effect.
         with subprocess.Popen(
             [binary, *execute('sh', '-ec', 'echo ran >> interrupted; sleep 45')],
@@ -227,6 +277,8 @@ def main():
         call('recover-external-stop', workspace('setup', 'test'))
         recovered = json.loads(call('observe-recovered-vm', workspace('show', 'test')).stdout)
         assert recovered['status'] == 'ready' and recovered['lifecycle']['generation'] == 3
+        crashed_service = json.loads(call('service-observe-interrupted', service('show', 'web')).stdout)
+        assert crashed_service['state'] == 'interrupted'
         assert call('external-stop-preserves-data', execute('cat', 'persisted')).stdout == 'saved'
         assert call('interrupted-command-not-replayed', execute('cat', 'interrupted')).stdout == 'ran\n'
 
