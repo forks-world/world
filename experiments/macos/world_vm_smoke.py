@@ -1,9 +1,10 @@
 """Opt-in real VM integration test. Requires `container system start`.
 
 Build first with cargo build --workspace, then run this script from the repo.
-Creates exactly one 256 MiB VM, keeps evidence in a temporary directory,
+Creates at most one running 512 MiB VM, keeps evidence in a temporary directory,
 removes only its own VM, and leaves the caller's provider service running.
 """
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,8 @@ import signal
 import subprocess
 import tempfile
 import time
+
+from vm_channel_probe import run as probe_channels
 
 
 def main():
@@ -21,16 +24,28 @@ def main():
     vm = None
     print(f'Evidence: {root}', flush=True)
 
-    def call(label, args, expected=0, input=None, limit=180):
+    def save(label, **values):
+        evidence.append(dict(label=label, **values))
+        (root / 'results.json').write_text(json.dumps(evidence, indent=2))
+
+    def record(label, args, expected=0, input=None, limit=180, env=None, details=None):
+        if args is None:
+            save(label, **details)
+            return
         start = time.monotonic()
-        p = subprocess.run([binary, *args], input=input, capture_output=True,
-                           text=True, timeout=limit)
-        evidence.append(dict(label=label, seconds=time.monotonic()-start,
-                             code=p.returncode, stdout=p.stdout, stderr=p.stderr))
-        (root/'results.json').write_text(json.dumps(evidence, indent=2))
+        binary_io = isinstance(input, bytes)
+        p = subprocess.run(args, input=input, capture_output=True,
+                           text=not binary_io, timeout=limit, env=env)
+        stdout = f'<{len(p.stdout)} bytes>' if binary_io else p.stdout
+        stderr = p.stderr.decode(errors='replace') if binary_io else p.stderr
+        save(label, seconds=time.monotonic() - start,
+             code=p.returncode, stdout=stdout, stderr=stderr)
         print(f'{label}: rc={p.returncode}, {evidence[-1]["seconds"]:.3f}s', flush=True)
-        assert p.returncode == expected, p.stderr + p.stdout
+        assert p.returncode == expected, stderr + stdout
         return p
+
+    def call(label, args, **kwargs):
+        return record(label, [binary, *args], **kwargs)
 
     def workspace(*args):
         return ['workspace', '--state-dir', str(state), *args]
@@ -38,12 +53,33 @@ def main():
     def execute(*args, duration='5m'):
         return ['exec', 'test', '--state-dir', str(state), '--timeout', duration, '--', *args]
 
+    record('macos-version', ['sw_vers'])
+    record('provider-version', ['container', '--version'])
+    record('provider-status', ['container', 'system', 'status'])
+
     try:
-        vm = json.loads(call('create', workspace('create','test','--os','linux','--memory','256M')).stdout)
+        vm = json.loads(call('create', workspace('create','test','--os','linux','--memory','512M')).stdout)
         call('reject-native-collision', workspace('create','test','--workdir',str(root)), expected=125)
         call('reject-workdir', workspace('create','other','--os','linux','--workdir',str(root)), expected=125)
         call('refuse-before-setup', execute('uname','-s'), expected=125)
-        call('setup', workspace('setup','test'))
+        # The losing setup may see the workspace lock, or arrive after readiness.
+        setup = [binary, *workspace('setup', 'test')]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            attempts = [pool.submit(subprocess.run, setup, capture_output=True,
+                                    text=True, timeout=180) for _ in range(2)]
+            results = [attempt.result() for attempt in attempts]
+        for i, result in enumerate(results):
+            save(f'concurrent-setup-{i}', code=result.returncode,
+                 stdout=result.stdout, stderr=result.stderr)
+            assert result.returncode == 0 or (
+                result.returncode == 125 and 'workspace busy' in result.stderr
+            ), result.stderr
+        assert any(result.returncode == 0 for result in results)
+        instances = json.loads(record('provider-instances', [
+            'container', 'list', '--all', '--format', 'json',
+        ]).stdout)
+        owned = [item for item in instances if item['id'] == vm['instance_id']]
+        assert len(owned) == 1
         call('setup-idempotent', workspace('setup','test'))
         status = json.loads(call('show-ready',workspace('show','test')).stdout)
         assert status['status'] == 'ready' and status['lifecycle']['generation'] == 1
@@ -51,10 +87,15 @@ def main():
         assert len(listed) == 1 and listed[0]['id'] == 'test'
         # Provider errors must not hide registrations or claim absence.
         env = dict(os.environ, PATH='/nonexistent')
-        p = subprocess.run([binary,*workspace('list')],capture_output=True,text=True,env=env,timeout=15)
-        assert p.returncode == 0
+        p = call('list-without-provider', workspace('list'), env=env, limit=15)
         unknown = json.loads(p.stdout)[0]
         assert unknown['id'] == 'test' and unknown['status'] == 'unknown' and unknown['observation_error']
+        before = unknown['lifecycle']
+        call('setup-without-provider', workspace('setup', 'test'), env=env, expected=125)
+        call('teardown-without-provider', workspace('teardown', 'test'), env=env, expected=125)
+        observed = json.loads(call('provider-available-again', workspace('show', 'test')).stdout)
+        assert observed['status'] == 'ready' and observed['lifecycle'] == before
+        probe_channels(vm['instance_id'], record)
         call('reject-delete-running',workspace('delete','test','--discard-runtime-data'),expected=125)
 
         # Reject corrupt/unsafe streams before publishing any file.
@@ -149,8 +190,48 @@ def main():
         call('import-persists', execute('python3','-c',imported_check))
         final_status = json.loads(call('show', workspace('show','test')).stdout)
         assert final_status['lifecycle']['generation'] == 2
+        # Lose the runtime after a command writes its first side effect.
+        with subprocess.Popen(
+            [binary, *execute('sh', '-ec', 'echo ran >> interrupted; sleep 45')],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ) as interrupted:
+            try:
+                for _ in range(50):
+                    check = subprocess.run(
+                        ['container', 'exec', vm['instance_id'], 'test', '-s', '/workspace/interrupted'],
+                        capture_output=True, timeout=5,
+                    )
+                    if check.returncode == 0:
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise AssertionError('interrupted execution did not become ready')
+                record('out-of-band-stop',
+                       ['container', 'stop', '--time', '1', vm['instance_id']], limit=20)
+                out, err = interrupted.communicate(timeout=25)
+                save('interrupted-exec', code=interrupted.returncode, stdout=out, stderr=err)
+                assert interrupted.returncode == 125 and 'status unknown' in err, err
+            finally:
+                if interrupted.poll() is None:
+                    interrupted.kill()
+                    interrupted.wait(timeout=5)
+        stopped = json.loads(call('observe-external-stop', workspace('show', 'test')).stdout)
+        assert stopped['status'] == 'stopped' and stopped['lifecycle']['phase'] == 'ready'
+        call('refuse-exec-after-external-stop', execute('true'), expected=125)
+        record('out-of-band-start', ['container', 'start', vm['instance_id']], limit=60)
+        unverified = json.loads(call('observe-external-restart', workspace('show', 'test')).stdout)
+        assert unverified['status'] == 'unverified' and unverified['lifecycle']['generation'] == 2
+        call('refuse-exec-unverified-boot', execute('true'), expected=125)
+        call('refuse-import-unverified-boot', workspace('import', 'test', '--source', str(source)),
+             expected=125)
+        call('recover-external-stop', workspace('setup', 'test'))
+        recovered = json.loads(call('observe-recovered-vm', workspace('show', 'test')).stdout)
+        assert recovered['status'] == 'ready' and recovered['lifecycle']['generation'] == 3
+        assert call('external-stop-preserves-data', execute('cat', 'persisted')).stdout == 'saved'
+        assert call('interrupted-command-not-replayed', execute('cat', 'interrupted')).stdout == 'ran\n'
+
         # Simulate an externally lost runtime: setup must not silently replace data.
-        subprocess.run(['container','stop','--time','1',vm['instance_id']],check=True,timeout=20,capture_output=True)
+        record('external-stop-before-delete', ['container', 'stop', '--time', '1', vm['instance_id']], limit=20)
         subprocess.run(['container','delete',vm['instance_id']],check=True,timeout=20,capture_output=True)
         assert json.loads(call('show-missing',workspace('show','test')).stdout)['status'] == 'missing'
         call('reject-implicit-recreation',workspace('setup','test'),expected=125)
@@ -171,8 +252,15 @@ def main():
         print('PASS', flush=True)
     finally:
         if vm:
-            subprocess.run([binary,*workspace('teardown','test')],timeout=30)
-            subprocess.run(['container','delete',vm['instance_id']],check=True,timeout=30)
+            cleanup = subprocess.run(
+                [binary, *workspace('teardown', 'test')], capture_output=True, text=True, timeout=40,
+            )
+            save('cleanup-teardown', code=cleanup.returncode, stderr=cleanup.stderr)
+            if cleanup.returncode == 0:
+                subprocess.run([binary, *workspace('delete', 'test', '--discard-runtime-data')],
+                               timeout=40)
+            else:
+                print(f'Cleanup could not stop {vm["instance_id"]}; see {root}', flush=True)
         (root/'results.json').write_text(json.dumps(evidence, indent=2))
 
 

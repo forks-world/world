@@ -8,7 +8,7 @@
 
 - macOS / arm64 + 显式 `--os linux` 选择 VM，原生工作流保持不变；一个 World 一个 VM。
 - create 保存配置和初始生命周期阶段；setup 创建/启动并检查 guest 协议与 cgroup.kill；show/list 返回配置、生命周期、provider 观测、时间和错误；exec 显式要求 ready；teardown 停机保留可写层；delete 仅删除已停机且归属匹配的 VM 实例与登记。
-- 固定 container 1.6.1 和 Python/Alpine 镜像 digest，guest `/workspace`、UID/GID 1000、独立 cgroup v2、no_new_privs。argv/标准输入/退出码透传；正常结束、超时与取消均清理同一任务的后代，包括 setsid 后代。
+- 允许 container 1.6.1、1.7.1，固定 Python/Alpine 镜像 digest，guest `/workspace`、UID/GID 1000、独立 cgroup v2、no_new_privs。argv/标准输入/退出码透传；正常结束、超时与取消均清理同一任务的后代，包括 setsid 后代。
 - `workspace import <world> --source <host-directory>` 将宿主目录复制到空 guest `/workspace`。先以目录 fd 和 openat/O_NOFOLLOW 遍历，生成宿主磁盘上的有界流记录快照；guest 校验文件长度、结束标记、相对路径与父目录，拒绝 symlink 父目录、重复路径和特殊文件，暂存完成后原子替换空目录。导入与 exec/setup/teardown 使用独占锁互斥。源变化检测是尽力检查，源应暂停写入，不宣称一致性快照。
 - 同一 VM 的并发 exec 共享 localhost，任务间取消独立。每个任务的结果保存于 guest `/var/lib/world/executions`；启动前向 stderr 输出随机 Execution ID，重试命令不复用已执行 ID。尚无公共 execution 查询/日志 API，断线时可能返回 unknown，不自动重放。
 - 原生与 VM 记录共用原子注册表，原生条目保持旧格式，VM 条目标注 schema_version=2；首次加入 VM 前备份已有注册表。原生更新保留 VM 条目，重复名称禁止跨后端覆盖。旧二进制会因无法解析 VM 条目拒绝整个混合注册表；不能自动退回备份。
@@ -31,12 +31,12 @@
 
 宿主本地用户仍能直接用 container 管理自己的 VM，这属于受信任宿主权限范围。旧记录不做全库 schema 转换；完整注册表/host identity/运行代际迁移后续再实现。OS 不匹配、provider 不可用或版本不兼容时拒绝 exec，不回退到宿主。
 
-实际命令见 [README](../README.md#macos-上运行-linux-world实验性)。真实单 VM 回归用 `python3 experiments/macos/world_vm_smoke.py`：先 `cargo build --workspace` 并启动 container 服务；脚本建立 256 MiB VM，在临时目录记录结果，退出时停止并删除自己的实例，保留服务与镜像缓存。覆盖同名冲突、执行前置状态、stdin/argv、非零状态、后代回收、超时/取消、共享 localhost、独立任务取消、busy teardown、导入及重启持久化；导入覆盖跨块二进制内容、执行权限、相对与悬空链接、截断流、路径越界、symlink 父目录、特殊文件和覆盖拒绝。该测试只启动一个 VM，不声称完成跨 VM 网络策略验收。
+实际命令见 [README](../README.md#macos-上运行-linux-world实验性)。真实单 VM 回归用 `python3 experiments/macos/world_vm_smoke.py`：先 `cargo build --workspace` 并启动 container 服务；脚本以 512 MiB 工作负载限额启动一个 VM，在临时目录记录结果，退出时停止并删除自己的实例，保留服务与镜像缓存。覆盖同名冲突、执行前置状态、stdin/argv、非零状态、后代回收、超时/取消、共享 localhost、独立任务取消、busy teardown、导入及重启持久化；导入覆盖跨块二进制内容、执行权限、相对与悬空链接、截断流、路径越界、symlink 父目录、特殊文件和覆盖拒绝。该测试只启动一个 VM，不声称完成跨 VM 网络策略验收。
 
 ## 已实现的生命周期管理
 
 - `workspace list` 返回所有本地登记；原生记录标为 `unobserved`，不凭 loopback 地址推断进程存活。VM 的本地配置始终保留在查询结果中，provider/版本/归属校验失败返回 `unknown` 与 `observation_error`。
-- `workspace show` 的 VM 状态区分 `created`（尚未创建实例）、`ready`（实例运行且本地最近一次 setup 验证完成）、`unverified`（实例存在但本地阶段尚未就绪/无法识别 provider 状态）、`stopped`、`missing`（此前已尝试创建/运行、现在确认不存在）和 `deleting`。ready 不是持续 guest 健康探测；exec 会再次握手。`lifecycle.phase` 返回最后持久化的操作阶段，`observed_at_unix` 是本次观测时间，generation 在每次尝试启动前递增，幂等 setup 不递增。
+- `workspace show` 的 VM 状态区分 `created`（尚未创建实例）、`ready`（实例运行，且 guest boot ID 与最近一次 setup 的记录一致）、`unverified`（实例存在，但本地阶段、guest boot ID 或 provider 状态尚未确认）、`stopped`、`missing`（此前已尝试创建/运行、现在确认不存在）和 `deleting`。ready 不是持续 guest 健康探测；exec 会再次握手。`lifecycle.phase` 返回最后持久化的操作阶段，`observed_at_unix` 是本次观测时间，generation 在每次尝试启动前递增。若 provider 已在 World 外重启 VM，setup 验证并登记新 boot ID 时递增；同一次启动上的幂等 setup 保持原代际。旧记录缺少 boot ID 时需先执行 setup。
 - 阶段记录按 instance owner 单独原子持久化，包含 created/provisioning/starting/ready/stopping/stopped/deleting。中断操作保留阶段用于后续检查；缺日志的旧记录视为 legacy，存在的实例可通过 setup 重新验证，缺失的实例不会被默认为从未创建。
 - setup 发现旧运行时缺失或首次创建是否成功无法确认时拒绝隐式新建。只有 `--recreate-missing` 显式允许在确认实例不存在时创建空运行时；存在的实例始终复用，不能用该选项覆盖。此行为不提供旧文件恢复，forkfs 分支挂载由 #28 单独实现。
 - teardown 保留注册和数据，不触发 WorldFS discard。活跃 exec/import 与其锁互斥，返回 busy，调用者应先取消执行。provider 不可用时不改写已知阶段；停止结果未知时保留 stopping，重试前重新观测。
@@ -211,7 +211,7 @@ world service unpublish dev web
 
 端口冲突明确失败，不自动改端口；默认禁止监听 `0.0.0.0`。转发是明确开放的双向应用数据通道，只允许连接指定 guest 目标，不提供 guest 任意访问宿主的隧道。停止、失联或 generation 变化立即关闭旧转发，重新握手后才能恢复，避免转发给复用 IP 的其他 VM。浏览器看到独立宿主端口，不能给多个 World 同时承诺相同宿主 URL。
 
-## 8. 依赖、错误与交付顺序
+## 8. 依赖、错误与研发路线图
 
 首个已测版本组合为 macOS 27.0.1 / Apple Silicon / container 1.6.1；其他版本要通过兼容矩阵，不能把上游支持范围等同于 World 已验收范围。Apple 官方资料：[Containerization](https://opensource.apple.com/projects/containerization/)、[container 1.6.1 技术概览](https://github.com/apple/container/blob/1.6.1/docs/technical-overview.md)、[命令契约](https://github.com/apple/container/blob/1.6.1/docs/command-reference.md)。
 
@@ -219,20 +219,30 @@ setup 先检查架构、系统/API 能力、provider 版本与服务、镜像/�
 
 结构化错误至少区分 `unsupported_platform`、`runtime_missing`、`runtime_unavailable`、`version_mismatch`、`image_unavailable`、`resource_exhausted`、`import_failed`、`policy_unavailable`、`guest_handshake_failed`、`workspace_not_ready`、`execution_unknown` 与 `storage_unavailable`。错误保留重试条件和已完成阶段，不把启动基础设施失败变成命令成功。
 
-实现按以下顺序推进，每一步独立标注已支持的能力：
+### macOS 上的 Linux World 研发路线图
 
-1. **后端选择与注册表迁移**：从 `silo.rs` 提取平台无关 Workspace/registry；新增 `ExecutionOs`、带标签的 runtime 配置与 resolver，保留原生行为。`world-runtime` 新增后端接口和 `apple_container` 模块；CLI 增加 `--os` 与资源参数。此阶段还不开放未完成的 VM exec。
-2. **单 VM 生命周期与执行**：锁定镜像与 guest 协议，完成 setup/show/teardown、状态对账、受管 exec/取消及出口策略；发布 Linux arm64 guest helper。达到下面的 MVP 门槛后才标为实验性可用。
-3. **文件与开发体验**：交付安全 import/export、长期服务监督、宿主 TCP 发布和完整 Agent 文件/命令视图；补包管理与实际开发工具测试。导入接口只在本阶段通过后开放。
-4. **WorldFS 与完整状态分支**：验证数据卷布局、forkfs RPC、fork/checkpoint/diff/merge/discard/restore，明确与数据库及副作用后端的能力组合。
+这一轮集中在 Apple Silicon 宿主上的 Linux World。每个 World 使用一个 Apple container 轻量 VM，沿用显式 `--os linux` 入口。macOS World、Linux 原生后端、Windows 和控制面另行规划。
 
-MVP 验收必须包含：
+当前起点是实验性单 VM：生命周期、非交互 exec、取消、导入和重启保留文件已有实现及单 VM 回归。研发工作按下表验收，每阶段可以独立评审。
 
-- 显式 macOS-host/Linux-World 选择正确；未指定 OS 和旧记录保持原生；不支持平台与缺依赖绝不落回宿主执行。
-- 并发 setup 只创建一个实例；命令 argv、退出码、stdin/输出、超时取消准确；客户端断连后不重放命令；VM 崩溃与宿主重启后可对账。
-- 多次 exec 共享 localhost；服务与任务生命周期分离；重启保留文件、旧进程不复活；teardown 不影响非 World 容器。
-- 两个 World 的同端口、跨 World 文件/网络隔离、宿主与 LAN 访问拒绝在容量足够的测试机验证；8 GiB 本机默认仅做一个 VM，不为验收强行超预算。
-- 运行中与初始化阶段分别测内存、CPU、启动时间、停止后回收；预算不足和磁盘满时保留数据；OOM 与一般 SIGKILL 可区分。
-- 版本不匹配、部分创建、数据导入失败、过期 generation、端口冲突及失联转发均有确定结果。各阶段尚未实现的能力必须明确拒绝。
+| 阶段 | 交付 | 验收门槛 |
+| --- | --- | --- |
+| 1. 固化单 VM 基线 | 扩展现有真实 VM smoke，补 provider 状态对账、故障诊断和版本兼容记录。做两个小探针，分别验证 detached exec 退出 CLI 后仍存活，以及交互通道是否支持二进制、背压和 TCP 半关闭。 | 并发 setup 只创建一个实例；provider 失联、VM 崩溃或宿主重启后能对账；未知结果不自动重放命令、不重建缺失数据；teardown 不影响其他容器。探针记录结果，决定服务与转发通道能否沿用现有设计。 |
+| 2. 单 World 开发预览 | guest 常驻服务监督、状态和有界日志；宿主显式发布 loopback TCP；支持安全 export；在 guest 内跑通一个真实项目和一个 CLI Agent。 | 导入项目 → 安装依赖和运行测试 → 启动服务 → 宿主访问 → 导出成果。Agent 文件与命令工具使用同一工作目录；启动 CLI 退出后服务仍存活；停止、重启、通道断开和端口冲突均有明确结果，旧发布不会接到新 run。预览限可信工作负载，明确显示当前 NAT 边界。 |
+| 3. 文件分叉闭环 | 对接 forkfs RPC，验证独占分支卷、挂载就绪、写入租约及卸载，工作数据与 VM 可写层分离（[#28](https://github.com/forks-world/world/issues/28)）。交付文件级 fork、checkpoint、diff、merge/discard。 | 从同一基线创建两个分支，分别修改源码和未跟踪文件，检查差异、合并一个并丢弃另一个；有活跃写入时拒绝或先协调停写；挂载失联时拒绝新执行；删除并重建 VM 后可重新挂载保留的分支。 |
+| 4. 多 World 本地 MVP | 在容量足够的 Mac 启用有预算的多 VM 准入，完成出口策略、版本兼容及故障回归。 | 两个 World 同时监听同一 guest 端口，分别从宿主 loopback 访问且互不串流；验证文件隔离，以及策略对宿主、LAN、其他 guest 的拒绝和对所需出口的放行；IPv4、IPv6 与 DNS 例外均纳入验收；策略无法验证时拒绝受限执行；资源不足时拒绝新 VM，已有任务继续运行。 |
 
-当前实验实现仅覆盖本文开头列出的范围，不将探针或实验回归通过当作上述完整 MVP 已完成。
+阶段 1 完成后，服务监督和 export 进入主线。同时做 forkfs 挂载与出口策略两项可行性验证，尽早确认 Apple container 能提供的能力。阶段 2 可用临时 `/workspace` 验证服务与发布。阶段 3 接入 forkfs 后，服务启动必须检查挂载状态，teardown 先停服务、撤发布，再释放写入租约和卸载。若通道探针或出口拒绝用例失败，先重新评估 transport 或网络设计，再开放对应能力。
+
+每个阶段用真实 Apple Silicon 回归记录缓存启动到首条命令的耗时、冷初始化峰值、空闲宿主物理占用、代表性构建耗时和停机后回收。现有约 286 MiB 的 VM 与专属 runtime 占用来自单次 256 MiB 轻负载探针。以 512 MiB 工作负载限额作为首轮开发测试配置，8 GiB 宿主先跑一个 VM。多 VM 容量以实测的宿主内存压力、磁盘和工作负载决定。回归覆盖磁盘满时保留已有数据，依据 guest cgroup 证据区分 OOM 与一般 SIGKILL。
+
+### 阶段 1 回归记录
+
+| 宿主和 provider | 验证结果 |
+| --- | --- |
+| Apple Silicon，macOS 27.0.1 / container 1.6.1 | 既有单 VM 执行与生命周期基线。新增 boot ID 对账与通道探针待复跑。 |
+| Apple Silicon，macOS 27.2 (26B123) / container 1.7.1 | 512 MiB 单 VM smoke 通过，覆盖并发 setup、provider 不可用、执行中途失去 VM、外部重启后的代际对账、数据保留和缺失实例恢复。 |
+
+[通道探针](../experiments/macos/vm_channel_probe.py)与 smoke 共用一次性 VM。1.7.1 上 detached exec 在启动 CLI 退出后仍可通过 guest loopback 访问。无 TTY 的交互通道完整往返 8 MiB 二进制数据，且在宿主关闭 stdin 后仍能读取 guest TCP 半关闭触发的应答。暂停读取宿主 stdout 时，探针发送了全部 8 MiB，未观察到写端停顿。阶段 2 的转发需独立做发送额度和队列限制，不能依赖 provider 在这个预算内产生背压。
+
+真实宿主重启仍待验收。本次用 provider 直接停止并重新启动实例复现了 guest boot ID 变化。资源记录仍以第 2 节已有探针为基线，本轮 smoke 未重测宿主物理内存或真实项目构建开销。
