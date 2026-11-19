@@ -461,6 +461,13 @@ pub async fn publish(
         probe["port_protocol"] == 1,
         "guest lacks TCP publishing support; run workspace setup first"
     );
+    let capabilities = guest_service(vm, &boot_id, serde_json::json!({
+        "action": "publication-capabilities",
+    })).await.context("cannot verify TCP publishing support in the running service supervisor; stop the VM with workspace teardown and run workspace setup")?;
+    ensure!(
+        capabilities["port_protocol"] == 1,
+        "running service supervisor lacks TCP publishing support; stop the VM with workspace teardown and run workspace setup"
+    );
     let status = guest_service(
         vm,
         &boot_id,
@@ -1149,20 +1156,7 @@ pub async fn export(
         probe["boot_id"].as_str() == Some(&boot_id),
         "VM restarted outside World; run workspace setup first"
     );
-    let services = guest_service(vm, &boot_id, serde_json::json!({"action": "list"})).await?;
-    ensure!(
-        services
-            .as_array()
-            .context("invalid service state")?
-            .iter()
-            .all(|service| {
-                matches!(
-                    service["state"].as_str(),
-                    Some("stopped" | "exited" | "failed" | "interrupted")
-                )
-            }),
-        "workspace has active services; stop them before export"
-    );
+    require_no_active_services(vm, &boot_id).await?;
     ensure!(!cancel.is_cancelled(), "export cancelled");
     let mut staging = crate::export_stream::Staging::new(destination)?;
     let mut child = provider()
