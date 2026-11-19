@@ -151,15 +151,19 @@ def import_workspace():
             shutil.rmtree(staging)
 
 
+def drop_workload_privileges():
+    os.setgroups([])
+    os.setgid(1000)
+    os.setuid(1000)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(38, 1, 0, 0, 0) != 0:  # PR_SET_NO_NEW_PRIVS
+        raise OSError(ctypes.get_errno(), 'prctl')
+
+
 def spawn_workload(argv, group, **streams):
     def prepare():
         (group / 'cgroup.procs').write_text(str(os.getpid()))
-        os.setgroups([])
-        os.setgid(1000)
-        os.setuid(1000)
-        libc = ctypes.CDLL(None, use_errno=True)
-        if libc.prctl(38, 1, 0, 0, 0) != 0:  # PR_SET_NO_NEW_PRIVS
-            raise OSError(ctypes.get_errno(), 'prctl')
+        drop_workload_privileges()
 
     return subprocess.Popen(argv, cwd='/workspace', preexec_fn=prepare,
                             env={'PATH': '/usr/local/bin:/usr/bin:/bin',
@@ -169,7 +173,7 @@ def spawn_workload(argv, group, **streams):
 
 def main():
     mode = sys.argv[1]
-    if mode in ('boot-id', 'probe', 'run', 'import', 'service', 'service-daemon'):
+    if mode in ('boot-id', 'probe', 'run', 'import', 'export', 'port-bridge', 'service', 'service-daemon'):
         boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
         expected = os.environ.get('WORLD_EXPECTED_BOOT_ID')
         if expected is not None and expected != boot_id:
@@ -177,11 +181,17 @@ def main():
         if mode == 'boot-id':
             print(boot_id)
             return 0
+    if mode == 'port-bridge':
+        asyncio.run(bridge(boot_id, sys.argv[2], sys.argv[3], int(sys.argv[4])))
+        return 0
     if mode == 'service-daemon':
         service_daemon(boot_id)
         return 0
     if mode == 'service':
         service_client(boot_id, sys.argv[2:])
+        return 0
+    if mode == 'export':
+        export_workspace()
         return 0
     if mode == 'import':
         import_workspace()
@@ -191,7 +201,7 @@ def main():
         p.mkdir(exist_ok=True)
         assert (p / 'cgroup.kill').exists()
         p.rmdir()
-        print(json.dumps({'protocol': 1, 'uid': os.getuid(), 'cgroup_kill': True, 'import_protocol': 1, 'boot_id': boot_id, 'service_protocol': 1}))
+        print(json.dumps({'protocol': 1, 'uid': os.getuid(), 'cgroup_kill': True, 'import_protocol': 1, 'export_protocol': 1, 'port_protocol': 1, 'boot_id': boot_id, 'service_protocol': 1}))
         return 0
     token = sys.argv[2]
     if not re.fullmatch('[0-9a-f]{32}', token):

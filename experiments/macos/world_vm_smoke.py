@@ -9,9 +9,11 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import tempfile
 import time
+import urllib.request
 
 from vm_channel_probe import run as probe_channels
 
@@ -181,6 +183,10 @@ def main():
         try:
             client = "import urllib.request,time; " + "\nfor _ in range(50):\n try:\n  print(urllib.request.urlopen('http://127.0.0.1:8080/persisted',timeout=1).read().decode()); break\n except OSError: time.sleep(.1)\nelse: raise RuntimeError('server not ready')"
             assert call('shared-localhost', execute('python3','-c',client)).stdout.strip() == 'saved'
+            call('busy-export-refused', workspace(
+                'export', 'test', '--destination', str(root / 'busy-export'),
+            ), expected=125)
+            assert not (root / 'busy-export').exists()
             call('busy-teardown-refused', workspace('teardown','test'), expected=125)
             call('independent-timeout', execute('sleep','5',duration='200ms'), expected=124)
             assert call('server-survives-other-timeout', execute('python3','-c',client)).stdout.strip() == 'saved'
@@ -193,16 +199,53 @@ def main():
         command = ['web', '--', 'python3', '-u', '-m', 'http.server', '8080', '--bind', '127.0.0.1']
         run = json.loads(call('service-start', service('start', *command)).stdout)
         assert run['state'] == 'running'
+        call('active-service-export-refused', workspace(
+            'export', 'test', '--destination', str(root / 'service-export'),
+        ), expected=125)
+        assert not (root / 'service-export').exists()
         duplicate = json.loads(call('service-start-idempotent', service('start', *command)).stdout)
         assert duplicate['run_id'] == run['run_id']
         call('service-reject-changed-command', service('start', 'web', '--', 'true'), expected=125)
         assert call('service-outlives-cli', execute('python3', '-c', client)).stdout.strip() == 'saved'
+        with socket.socket() as occupied:
+            occupied.bind(('127.0.0.1', 0))
+            occupied.listen()
+            host_port = occupied.getsockname()[1]
+            port_args = ('web', '--name', 'browser', '--host-port', str(host_port),
+                         '--target-port', '8080')
+            call('publish-port-conflict', service('publish', *port_args), expected=125)
+        published = json.loads(call('publish-loopback', service('publish', *port_args)).stdout)
+        assert published['host_address'] == '127.0.0.1' and published['run_id'] == run['run_id']
+        assert json.loads(call('publish-idempotent', service('publish', *port_args)).stdout) == published
+        assert json.loads(call('service-ports', service('ports', 'web')).stdout) == [published]
+        url = f'http://127.0.0.1:{host_port}'
+        with urllib.request.urlopen(f'{url}/persisted', timeout=5) as response:
+            assert response.read() == b'saved'
+        def fetch_binary(_):
+            with urllib.request.urlopen(f'{url}/sub/binary', timeout=5) as response:
+                return response.read()
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            assert all(content == data for content in pool.map(fetch_binary, range(8)))
+        with socket.create_connection(('127.0.0.1', host_port), timeout=5) as open_client:
+            open_client.sendall(b'GET / HTTP/1.1\r\n')
+            call('unpublish-loopback', service('unpublish', 'web', '--name', 'browser'))
+            try:
+                assert open_client.recv(1) == b''
+            except ConnectionResetError:
+                pass
+        with socket.socket() as available:
+            assert available.connect_ex(('127.0.0.1', host_port)) != 0
+        call('republish-loopback', service('publish', *port_args))
         log = json.loads(call('service-logs', service('logs', 'web', '--stream', 'stderr')).stdout)
         import base64
         assert b'GET /persisted' in base64.b64decode(log['base64'])
         call('service-refuse-remove-running', service('remove', 'web'), expected=125)
         restarted = json.loads(call('service-restart', service('restart', 'web')).stdout)
         assert restarted['run_id'] != run['run_id']
+        assert json.loads(call('old-publication-revoked', service('ports', 'web')).stdout) == []
+        with socket.socket() as available:
+            assert available.connect_ex(('127.0.0.1', host_port)) != 0
         operation_id = restarted['operation_id']
         replayed = json.loads(call('service-restart-retry', service(
             'restart', 'web', '--request-id', operation_id,
@@ -230,6 +273,54 @@ def main():
         log = json.loads(call('unrotated-log-tail', service('logs', 'shortlog')).stdout)
         assert log['truncated'] and base64.b64decode(log['base64']) == b'x' * 65536
         call('remove-unrotated-log', service('remove', 'shortlog'))
+        echo = (
+            "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1);"
+            "s.bind(('127.0.0.1',8081)); s.listen(); c,_=s.accept();"
+            "data=c.makefile('rb').read(); c.sendall(data[::-1]); c.shutdown(socket.SHUT_WR);"
+            "__import__('time').sleep(30)"
+        )
+        call('start-half-close-service', service('start', 'echo', '--', 'python3', '-c', echo))
+        call('publish-half-close-service', service('publish', 'echo', '--name', 'tcp',
+             '--host-port', str(host_port), '--target-port', '8081'))
+        with socket.create_connection(('127.0.0.1', host_port), timeout=5) as tcp:
+            tcp.sendall(data)
+            tcp.shutdown(socket.SHUT_WR)
+            with tcp.makefile('rb') as tcp_data:
+                assert tcp_data.read() == data[::-1]
+        call('unpublish-half-close-service', service('unpublish', 'echo', '--name', 'tcp'))
+        call('stop-half-close-service', service('stop', 'echo'))
+        call('remove-half-close-service', service('remove', 'echo'))
+        exported = root / 'exported'
+        call('create-export-files', execute(
+            'sh', '-ec', 'printf hidden > .hidden; mkdir empty; chmod 750 empty',
+        ))
+        result = json.loads(call('export', workspace(
+            'export', 'test', '--destination', str(exported),
+        )).stdout)
+        assert result['state'] == 'exported' and result['entries'] >= 8
+        assert (exported / 'persisted').read_text() == 'saved'
+        assert (exported / '.hidden').read_text() == 'hidden'
+        assert (exported / 'empty').stat().st_mode & 0o777 == 0o750
+        assert (exported / 'check.sh').stat().st_mode & 0o777 == 0o755
+        assert (exported / 'sub' / 'binary').read_bytes() == data
+        assert os.readlink(exported / 'relative-link') == 'sub/binary'
+        assert os.readlink(exported / 'outside-link') == '/host-only-secret-never-follow'
+        call('export-refuse-overwrite', workspace(
+            'export', 'test', '--destination', str(exported),
+        ), expected=125)
+        dangling = root / 'dangling-destination'
+        dangling.symlink_to('absent')
+        call('export-refuse-symlink-destination', workspace(
+            'export', 'test', '--destination', str(dangling),
+        ), expected=125)
+        assert dangling.is_symlink() and not (root / 'absent').exists()
+        call('create-guest-fifo', execute('mkfifo', 'unsupported'))
+        bad = root / 'bad-export'
+        call('export-reject-special-file', workspace(
+            'export', 'test', '--destination', str(bad),
+        ), expected=125)
+        assert not bad.exists() and not list(root.glob('.world-export-*'))
+        call('remove-guest-fifo', execute('rm', 'unsupported'))
         call('service-start-log-volume', service(
             'start', 'logger', '--', 'python3', '-c',
             "import os; os.write(1, b'x' * (2300 * 1024) + bytes(range(256)))",
@@ -247,8 +338,12 @@ def main():
         assert log['truncated'] and len(data) == 65536 and data.endswith(bytes(range(256)))
         call('service-remove-logger', service('remove', 'logger'))
         call('service-start-before-teardown', service('start', *command))
+        call('publish-before-teardown', service('publish', *port_args))
         call('still-running', execute('true'))
         call('teardown', workspace('teardown','test'))
+        assert json.loads(call('teardown-revoked-publication', service('ports', 'web')).stdout) == []
+        with socket.socket() as available:
+            assert available.connect_ex(('127.0.0.1', host_port)) != 0
         assert json.loads(call('show-stopped',workspace('show','test')).stdout)['status'] == 'stopped'
         call('reject-data-delete-without-flag',workspace('delete','test'),expected=125)
 
@@ -261,6 +356,7 @@ def main():
         final_status = json.loads(call('show', workspace('show','test')).stdout)
         assert final_status['lifecycle']['generation'] == 2
         call('service-start-before-crash', service('start', *command))
+        call('publish-before-crash', service('publish', *port_args))
         # Lose the runtime after a command writes its first side effect.
         with subprocess.Popen(
             [binary, *execute('sh', '-ec', 'echo ran >> interrupted; sleep 45')],
@@ -286,6 +382,15 @@ def main():
                 if interrupted.poll() is None:
                     interrupted.kill()
                     interrupted.wait(timeout=5)
+        for _ in range(40):
+            ports = json.loads(call('observe-ports-after-external-stop', service('ports', 'web')).stdout)
+            if ports == []:
+                break
+            time.sleep(0.15)
+        else:
+            raise AssertionError('publication remained active after VM stopped')
+        with socket.socket() as available:
+            assert available.connect_ex(('127.0.0.1', host_port)) != 0
         stopped = json.loads(call('observe-external-stop', workspace('show', 'test')).stdout)
         assert stopped['status'] == 'stopped' and stopped['lifecycle']['phase'] == 'ready'
         call('refuse-exec-after-external-stop', execute('true'), expected=125)

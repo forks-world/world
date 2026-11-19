@@ -19,6 +19,10 @@ MESSAGE_LIMIT = 128 * 1024
 def service_client(boot_id, args):
     payload = json.loads(args[0])
     payload['boot_id'] = boot_id
+    print(json.dumps(service_query(payload)))
+
+
+def service_query(payload):
     request = json.dumps(payload).encode() + b'\n'
     if len(request) > MESSAGE_LIMIT:
         raise ValueError('service request exceeds size limit')
@@ -32,7 +36,7 @@ def service_client(boot_id, args):
     result = json.loads(response)
     if 'error' in result:
         raise RuntimeError(result['error'])
-    print(json.dumps(result['result']))
+    return result['result']
 
 
 def service_daemon(boot_id):
