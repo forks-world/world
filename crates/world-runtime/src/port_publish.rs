@@ -297,6 +297,15 @@ async fn relay(
                         Ok(Ok(b'q')) => {
                             drop(listener);
                             sockets.shutdown().await;
+                            timeout(Duration::from_secs(2), async {
+                                outbound.send(Frame::new("shutdown", 0)).await?;
+                                while let Some(frame) = incoming.recv().await {
+                                    if frame.kind == "closed" && frame.id == 0 {
+                                        return Ok(());
+                                    }
+                                }
+                                bail!("guest publication shutdown was not confirmed")
+                            }).await.context("guest publication shutdown timed out")??;
                             return Ok(peer);
                         }
                         _ => {}
