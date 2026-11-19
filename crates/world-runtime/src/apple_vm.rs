@@ -19,7 +19,11 @@ use tokio_util::sync::CancellationToken;
 
 const IMAGE: &str = "docker.io/library/python@sha256:bf12ecc0bea3f171d55145dd02c78b5eeb09f30ee2ac9cc2b4c9e4e8f5e30741";
 const PROVIDER_VERSIONS: &[&str] = &["1.6.1", "1.7.1"];
-const GUEST: &str = include_str!("../guest/supervisor.py");
+const GUEST: &str = concat!(
+    include_str!("../guest/supervisor.py"),
+    "\n",
+    include_str!("../guest/services.py")
+);
 const HELPER: &str = "/opt/world/supervisor.py";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,6 +343,119 @@ async fn guest(vm: &Vm, args: &[&str]) -> Result<String> {
     output(&argv, Duration::from_secs(15)).await
 }
 
+async fn guest_service(
+    vm: &Vm,
+    boot_id: &str,
+    request: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let request = serde_json::to_string(&request)?;
+    ensure!(
+        request.len() <= 64 * 1024,
+        "service request exceeds size limit"
+    );
+    let response = output(
+        &[
+            "exec",
+            "-e",
+            &format!("WORLD_EXPECTED_BOOT_ID={boot_id}"),
+            &vm.instance_id,
+            "python3",
+            "-I",
+            HELPER,
+            "service",
+            &request,
+        ],
+        Duration::from_secs(15),
+    )
+    .await?;
+    Ok(serde_json::from_str(&response)?)
+}
+
+pub async fn service(
+    state: &Path,
+    vm: &Vm,
+    mut request: serde_json::Value,
+    request_id: Option<String>,
+) -> Result<serde_json::Value> {
+    let _lock = operation_lock(state, vm, true)?;
+    check_registered(state, vm)?;
+    let boot_id = require_ready(state, vm)?;
+    check_provider().await?;
+    ensure!(
+        inspect(vm)
+            .await?
+            .is_some_and(|v| v["status"]["state"] == "running"),
+        "workspace is not running; run workspace setup first"
+    );
+    let action = request["action"]
+        .as_str()
+        .context("missing service action")?;
+    if matches!(action, "start" | "stop" | "restart" | "remove") {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let id = request_id.unwrap_or_else(|| format!("{now}-{}", random_id()));
+        ensure!(
+            id.split_once('-').is_some_and(|(issued, token)| {
+                !issued.is_empty()
+                    && issued.len() <= 12
+                    && issued.bytes().all(|c| c.is_ascii_digit())
+                    && hex_id(token)
+                    && token.bytes().all(|c| !c.is_ascii_uppercase())
+            }),
+            "invalid service operation ID"
+        );
+        eprintln!("world: service operation {id}");
+        request["operation_id"] = id.into();
+    } else {
+        ensure!(
+            request_id.is_none(),
+            "--request-id requires a service write operation"
+        );
+    }
+    let mut result = guest_service(vm, &boot_id, request).await?;
+    if let Some(object) = result.as_object_mut() {
+        object.insert(
+            "observed_generation".into(),
+            lifecycle(state, vm)?.generation.into(),
+        );
+    }
+    Ok(result)
+}
+
+async fn start_service_supervisor(vm: &Vm, boot_id: &str) -> Result<()> {
+    if guest_service(vm, boot_id, serde_json::json!({"action": "list"}))
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    output(
+        &[
+            "exec",
+            "--detach",
+            "-e",
+            &format!("WORLD_EXPECTED_BOOT_ID={boot_id}"),
+            &vm.instance_id,
+            "python3",
+            "-I",
+            HELPER,
+            "service-daemon",
+        ],
+        Duration::from_secs(15),
+    )
+    .await?;
+    let mut last = None;
+    for _ in 0..20 {
+        match guest_service(vm, boot_id, serde_json::json!({"action": "list"})).await {
+            Ok(_) => return Ok(()),
+            Err(error) => last = Some(error),
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    Err(last.unwrap()).context("guest service supervisor did not become ready")
+}
+
 pub async fn show(state: &Path, vm: &Vm) -> Result<serde_json::Value> {
     let journal = lifecycle(state, vm)?;
     let observation = async {
@@ -381,7 +498,7 @@ pub async fn show(state: &Path, vm: &Vm) -> Result<serde_json::Value> {
         .as_secs();
     Ok(
         serde_json::json!({"id":vm.id,"status":status,"lifecycle":journal,"observed_at_unix":observed_at,"configuration":vm,"observed":observed,"observation_error":error,"experimental":true,
-        "capabilities":{"host_directory_mounts":false,"file_import":true,"egress_filtering":false,"host_lan_blocking":false,"worldfs":false,"pty":false,"parallel_exec":true},
+        "capabilities":{"host_directory_mounts":false,"file_import":true,"egress_filtering":false,"host_lan_blocking":false,"worldfs":false,"pty":false,"parallel_exec":true,"guest_services":true},
         "network_policy":"provider NAT, unrestricted egress; not a hostile-workload sandbox"}),
     )
 }
@@ -497,6 +614,8 @@ pub async fn setup(state: &Path, vm: &Vm, recreate_missing: bool) -> Result<()> 
                         .checked_add(1)
                         .context("VM generation overflow")?;
                 }
+                start_service_supervisor(vm, boot_id).await?;
+                guest_service(vm, boot_id, serde_json::json!({"action": "activate"})).await?;
                 journal.boot_id = Some(boot_id.to_owned());
                 journal.phase = Phase::Ready;
                 save_lifecycle(state, vm, &journal)?;
@@ -530,6 +649,22 @@ pub async fn teardown(state: &Path, vm: &Vm) -> Result<()> {
     {
         journal.phase = Phase::Stopping;
         save_lifecycle(state, vm, &journal)?;
+        let drain = async {
+            let probe: serde_json::Value = serde_json::from_str(&guest(vm, &["probe"]).await?)?;
+            if probe["service_protocol"] == 1 {
+                let boot_id = probe["boot_id"].as_str().context("guest boot ID missing")?;
+                start_service_supervisor(vm, boot_id).await?;
+                guest_service(vm, boot_id, serde_json::json!({"action": "drain"})).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        match timeout(Duration::from_secs(15), drain).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("world: guest service drain failed; stopping VM: {error:#}")
+            }
+            Err(_) => eprintln!("world: guest service drain timed out; stopping VM"),
+        }
         output(
             &["stop", "--time", "2", &vm.instance_id],
             Duration::from_secs(20),
@@ -688,6 +823,26 @@ pub async fn exec(
 
 /// Copy a completed host snapshot into an empty guest workspace. The exclusive
 /// lifecycle lock prevents commands from racing extraction/publication.
+async fn require_no_active_services(vm: &Vm, boot_id: &str) -> Result<()> {
+    let services = guest_service(vm, boot_id, serde_json::json!({"action": "list"}))
+        .await
+        .context("cannot verify service state; run workspace setup first")?;
+    ensure!(
+        services
+            .as_array()
+            .context("invalid service state")?
+            .iter()
+            .all(|service| {
+                matches!(
+                    service["state"].as_str(),
+                    Some("stopped" | "exited" | "failed" | "interrupted")
+                )
+            }),
+        "workspace has active services; stop them before transferring files"
+    );
+    Ok(())
+}
+
 pub async fn import(
     state: &Path,
     vm: &Vm,
@@ -713,6 +868,9 @@ pub async fn import(
         probe["boot_id"].as_str() == Some(&boot_id),
         "VM restarted outside World; run workspace setup first"
     );
+    if probe["service_protocol"] == 1 {
+        require_no_active_services(vm, &boot_id).await?;
+    }
     let source = source.to_path_buf();
     let snapshot =
         tokio::task::spawn_blocking(move || crate::import_stream::snapshot(&source)).await??;

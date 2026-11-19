@@ -50,6 +50,9 @@ def main():
     def workspace(*args):
         return ['workspace', '--state-dir', str(state), *args]
 
+    def service(action, *args):
+        return ['service', '--state-dir', str(state), action, 'test', *args]
+
     def execute(*args, duration='5m'):
         return ['exec', 'test', '--state-dir', str(state), '--timeout', duration, '--', *args]
 
@@ -122,6 +125,14 @@ def main():
         os.mkfifo(fifo)
         call('reject-special-file-import', workspace('import','test','--source',str(source)), expected=125)
         fifo.unlink()
+        call('start-service-before-import', service('start', 'importguard', '--', 'sleep', '60'))
+        blocked = call('active-service-import-refused', workspace(
+            'import', 'test', '--source', str(source),
+        ), expected=125)
+        assert 'workspace has active services' in blocked.stderr
+        call('verify-import-target-stayed-empty', execute('sh', '-ec', 'test -z "$(ls -A /workspace)"'))
+        call('stop-service-before-import', service('stop', 'importguard'))
+        call('remove-import-guard-service', service('remove', 'importguard'))
         call('import', workspace('import','test','--source',str(source)))
         import hashlib
         digest = hashlib.sha256(data).hexdigest()
@@ -179,6 +190,63 @@ def main():
         finally:
             if server.poll() is None:
                 server.kill(); server.wait()
+        command = ['web', '--', 'python3', '-u', '-m', 'http.server', '8080', '--bind', '127.0.0.1']
+        run = json.loads(call('service-start', service('start', *command)).stdout)
+        assert run['state'] == 'running'
+        duplicate = json.loads(call('service-start-idempotent', service('start', *command)).stdout)
+        assert duplicate['run_id'] == run['run_id']
+        call('service-reject-changed-command', service('start', 'web', '--', 'true'), expected=125)
+        assert call('service-outlives-cli', execute('python3', '-c', client)).stdout.strip() == 'saved'
+        log = json.loads(call('service-logs', service('logs', 'web', '--stream', 'stderr')).stdout)
+        import base64
+        assert b'GET /persisted' in base64.b64decode(log['base64'])
+        call('service-refuse-remove-running', service('remove', 'web'), expected=125)
+        restarted = json.loads(call('service-restart', service('restart', 'web')).stdout)
+        assert restarted['run_id'] != run['run_id']
+        operation_id = restarted['operation_id']
+        replayed = json.loads(call('service-restart-retry', service(
+            'restart', 'web', '--request-id', operation_id,
+        )).stdout)
+        assert replayed['run_id'] == restarted['run_id']
+        operation = json.loads(call('service-operation', service('operation', operation_id)).stdout)
+        assert operation['state'] == 'completed' and operation['result']['run_id'] == restarted['run_id']
+        call('service-request-conflict', service('stop', 'web', '--request-id', operation_id),
+             expected=125)
+        assert call('service-restarted', execute('python3', '-c', client)).stdout.strip() == 'saved'
+        stopped = json.loads(call('service-stop', service('stop', 'web')).stdout)
+        assert stopped['state'] == 'stopped'
+        call('service-remove', service('remove', 'web'))
+        assert json.loads(call('service-list-empty', service('list')).stdout) == []
+        call('start-unrotated-log', service(
+            'start', 'shortlog', '--', 'python3', '-c', "import os; os.write(1, b'x' * 70000)",
+        ))
+        for _ in range(20):
+            status = json.loads(call('unrotated-log-status', service('show', 'shortlog')).stdout)
+            if status['state'] == 'exited':
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError('unrotated log producer did not finish')
+        log = json.loads(call('unrotated-log-tail', service('logs', 'shortlog')).stdout)
+        assert log['truncated'] and base64.b64decode(log['base64']) == b'x' * 65536
+        call('remove-unrotated-log', service('remove', 'shortlog'))
+        call('service-start-log-volume', service(
+            'start', 'logger', '--', 'python3', '-c',
+            "import os; os.write(1, b'x' * (2300 * 1024) + bytes(range(256)))",
+        ))
+        for _ in range(45):
+            status = json.loads(call('service-log-volume-status', service('show', 'logger')).stdout)
+            if status['state'] == 'exited':
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError('log producer did not finish')
+        assert status['exit_code'] == 0
+        log = json.loads(call('service-bounded-logs', service('logs', 'logger')).stdout)
+        data = base64.b64decode(log['base64'])
+        assert log['truncated'] and len(data) == 65536 and data.endswith(bytes(range(256)))
+        call('service-remove-logger', service('remove', 'logger'))
+        call('service-start-before-teardown', service('start', *command))
         call('still-running', execute('true'))
         call('teardown', workspace('teardown','test'))
         assert json.loads(call('show-stopped',workspace('show','test')).stdout)['status'] == 'stopped'
@@ -187,9 +255,12 @@ def main():
         call('refuse-stopped', execute('true'), expected=125)
         call('restart', workspace('setup','test'))
         assert call('file-persists', execute('cat','persisted')).stdout == 'saved'
+        saved_service = json.loads(call('service-after-teardown', service('show', 'web')).stdout)
+        assert saved_service['state'] == 'stopped'
         call('import-persists', execute('python3','-c',imported_check))
         final_status = json.loads(call('show', workspace('show','test')).stdout)
         assert final_status['lifecycle']['generation'] == 2
+        call('service-start-before-crash', service('start', *command))
         # Lose the runtime after a command writes its first side effect.
         with subprocess.Popen(
             [binary, *execute('sh', '-ec', 'echo ran >> interrupted; sleep 45')],
@@ -227,6 +298,8 @@ def main():
         call('recover-external-stop', workspace('setup', 'test'))
         recovered = json.loads(call('observe-recovered-vm', workspace('show', 'test')).stdout)
         assert recovered['status'] == 'ready' and recovered['lifecycle']['generation'] == 3
+        crashed_service = json.loads(call('service-observe-interrupted', service('show', 'web')).stdout)
+        assert crashed_service['state'] == 'interrupted'
         assert call('external-stop-preserves-data', execute('cat', 'persisted')).stdout == 'saved'
         assert call('interrupted-command-not-replayed', execute('cat', 'interrupted')).stdout == 'ran\n'
 
@@ -237,7 +310,44 @@ def main():
         call('reject-implicit-recreation',workspace('setup','test'),expected=125)
         call('explicit-recreation',workspace('setup','test','--recreate-missing'))
         call('recreated-runtime-empty',execute('test','!','-e','/workspace/persisted'))
-        call('stop-recreated-runtime',workspace('teardown','test'))
+        call('start-service-before-drain-failure', service('start', 'broken', '--', 'sleep', '60'))
+        call('start-exiting-service-before-catalog-failure', service(
+            'start', 'exiting', '--', 'sh', '-ec',
+            'while [ ! -e /workspace/exit-now ]; do sleep 0.05; done',
+        ))
+        record('make-service-catalog-unwritable', [
+            'container', 'exec', vm['instance_id'], 'sh', '-ec',
+            'p=/var/lib/world/runtime/services/catalog.json; mv "$p" "$p.saved"; mkdir "$p"',
+        ])
+        call('exit-one-service-with-catalog-unwritable', execute('touch', 'exit-now'))
+        for _ in range(15):
+            services = json.loads(call('observe-services-with-catalog-failure', service('list')).stdout)
+            by_name = {record['name']: record for record in services}
+            if by_name['exiting']['state'] == 'exited':
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError('supervisor did not observe natural exit')
+        assert by_name['exiting']['catalog_persistence_pending'] is True
+        assert by_name['broken']['state'] == 'running'
+        record('restore-catalog-writability', [
+            'container', 'exec', vm['instance_id'], 'rmdir', '/var/lib/world/runtime/services/catalog.json',
+        ])
+        for _ in range(20):
+            status = json.loads(call('observe-catalog-recovery', service('show', 'exiting')).stdout)
+            if not status.get('catalog_persistence_pending'):
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError('supervisor did not persist recovered catalog')
+        record('make-catalog-unwritable-again', [
+            'container', 'exec', vm['instance_id'], 'sh', '-ec',
+            'p=/var/lib/world/runtime/services/catalog.json; mv "$p" "$p.saved"; mkdir "$p"',
+        ])
+        stopped = call('stop-recreated-runtime', workspace('teardown', 'test'))
+        assert 'guest service drain failed; stopping VM' in stopped.stderr
+        assert json.loads(call('show-after-drain-failure', workspace('show', 'test')).stdout)['status'] == 'stopped'
+
         # A native entry in the same registry must survive deletion of the VM.
         call('create-native',workspace('create','native','--workdir',str(root)))
         call('delete-runtime',workspace('delete','test','--discard-runtime-data'))

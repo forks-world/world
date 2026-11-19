@@ -20,18 +20,32 @@
 | 网络安全策略 | provider NAT，**尚不阻止宿主/LAN/跨 guest 出站**；show 明确返回能力 false；不支持严格出口策略 |
 | 运行预算 | 每用户 setup 准入锁；除已运行的本 World 外，发现其他运行 container 即拒绝启动；不统计其他供应商 VM/machine，也未实现基于内存压力的准入 |
 | 数据与镜像 | guest 普通可写层，无宿主挂载；固定基础镜像加 root-owned helper；支持独立 import 命令；无 export、创建时 --import、自定义镜像、WorldFS、分支合并 |
-| 服务 | 使用仍在运行的前台 exec 承载服务；没有 named service、自动重启或宿主转发；普通 exec 结束会清理后台子进程 |
+| 服务 | Linux VM 已支持命名服务、独立 cgroup、状态和有界日志，宿主 TCP 发布待实现。普通 exec 结束仍会清理后台子进程 |
 | 生命周期 | setup/teardown 与 exec 用文件锁互斥；teardown 遇活跃执行返回 busy，不能自动批量取消；已落盘阶段和启动 generation；尚无完整 Execution 恢复日志 |
 | 协议 | 固定 helper 命令与独立 JSON 状态查询；不是完整 RPC/PTY/输出持久化协议；guest 控制进程故障后状态可能未知，需检查或停机 |
 | 安全级别 | 实验性 VM 执行边界，不是设计中的受管安全后端；未交付的出口策略不会被描述为有效 |
 
 导入保留内容、普通权限、可执行位和符号链接（包括悬空链接），移除 setuid/setgid/sticky 位，所有权设为 guest UID/GID 1000。隐藏文件和未跟踪文件默认包含；不保留时间戳、xattr、ACL、稀疏布局或硬链接关系。非 UTF-8 名称/链接目标、设备节点、FIFO、socket、超过 128 层的目录、超过一百万个条目及超过 4096 字节的相对路径明确失败。快照临时文件需要与源数据规模相当的宿主磁盘空间，传输记录有界，不将整个项目放入内存。guest 文件逐个 fsync，发布后同步父目录；不承诺磁盘崩溃下所有目录项的事务持久性。
 
-取消信号在快照完成、传输开始前生效；传输开始后等待确定结果，上限 10 分钟，避免只关闭客户端就错误报告“未导入”。传输断线/超时返回结果未知，重试前先检查 `/workspace`；guest 的正常失败会清理暂存目录，VM 崩溃可能留下 `/var/lib/world/imports` 中的暂存数据，暂未自动回收。已有内容始终不自动覆盖。旧 VM 在无活跃 exec 时执行 setup，可原子更新 guest helper 后使用 import。
+取消信号在快照完成、传输开始前生效；传输开始后等待确定结果，上限 10 分钟，避免只关闭客户端就错误报告“未导入”。传输断线/超时返回结果未知，重试前先检查 `/workspace`；guest 的正常失败会清理暂存目录，VM 崩溃可能留下 `/var/lib/world/imports` 中的暂存数据，暂未自动回收。导入要求结束正在执行的命令并停止常驻服务。已有内容始终不自动覆盖。旧 VM 在无活跃 exec 时执行 setup，可原子更新 guest helper 后使用 import。
 
 宿主本地用户仍能直接用 container 管理自己的 VM，这属于受信任宿主权限范围。旧记录不做全库 schema 转换；完整注册表/host identity/运行代际迁移后续再实现。OS 不匹配、provider 不可用或版本不兼容时拒绝 exec，不回退到宿主。
 
 实际命令见 [README](../README.md#macos-上运行-linux-world实验性)。真实单 VM 回归用 `python3 experiments/macos/world_vm_smoke.py`：先 `cargo build --workspace` 并启动 container 服务；脚本以 512 MiB 工作负载限额启动一个 VM，在临时目录记录结果，退出时停止并删除自己的实例，保留服务与镜像缓存。覆盖同名冲突、执行前置状态、stdin/argv、非零状态、后代回收、超时/取消、共享 localhost、独立任务取消、busy teardown、导入及重启持久化；导入覆盖跨块二进制内容、执行权限、相对与悬空链接、截断流、路径越界、symlink 父目录、特殊文件和覆盖拒绝。该测试只启动一个 VM，不声称完成跨 VM 网络策略验收。
+
+### 实验性 guest 服务
+
+```sh
+world service start dev web -- python3 -u -m http.server 3000 --bind 127.0.0.1
+world service list dev
+world service show dev web
+world service logs dev web --stream stderr
+world service restart dev web
+world service stop dev web
+world service remove dev web
+```
+
+服务使用 UID 1000 和独立 cgroup，工作目录为 `/workspace`，在发起命令退出后继续运行。日志查询返回所选流最新 64 KiB 的 base64，旧日志有大小上限。停止和 teardown 清理整个服务 cgroup。VM 再次启动时保留服务定义，不自动启动服务。写操作在发送前打印 operation ID，`world service operation dev <id>` 可查询 24 小时内的结果，`--request-id <id>` 可重试同一请求。宿主浏览器端口发布、日志 follow 和优雅停止待实现。
 
 ## 已实现的生命周期管理
 
