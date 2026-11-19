@@ -282,3 +282,20 @@ setup 先检查架构、系统/API 能力、provider 版本与服务、镜像/�
 [通道探针](../experiments/macos/vm_channel_probe.py)与 smoke 共用一次性 VM。1.7.1 上 detached exec 在启动 CLI 退出后仍可通过 guest loopback 访问。无 TTY 的交互通道完整往返 8 MiB 二进制数据，且在宿主关闭 stdin 后仍能读取 guest TCP 半关闭触发的应答。暂停读取宿主 stdout 时，探针发送了全部 8 MiB，未观察到写端停顿。阶段 2 的转发需独立做发送额度和队列限制，不能依赖 provider 在这个预算内产生背压。
 
 真实宿主重启仍待验收。本次用 provider 直接停止并重新启动实例复现了 guest boot ID 变化。资源记录仍以第 2 节已有探针为基线，本轮 smoke 未重测宿主物理内存或真实项目构建开销。
+
+### 阶段 2 开发预览验收
+
+在 Apple Silicon Mac 上先构建 CLI 并启动 Apple container 服务，再运行：
+
+```sh
+cargo build --workspace --locked
+python3 experiments/macos/world_vm_dev_preview.py
+```
+
+脚本使用 Flask 3.1.2 的官方示例 Flaskr 和 OpenCode 1.18.35。宿主需要 Git、Python 及 pip，以及对 GitHub、PyPI、npm 和 Alpine 包仓库的访问。脚本在宿主准备 Linux wheel 和 OpenCode 安装包，在一次性 guest 内安装依赖，并用 Alpine 签名包补齐 OpenCode 所需的运行库。所有项目命令与 Agent 都以 UID 1000 运行。默认使用 1 GiB 工作负载限额。
+
+验收覆盖导入、安装、24 项 Flaskr 测试、Agent 在 `/workspace` 读取及修改模板并再次跑测试、发布 Flaskr、从 Mac 读取包含修改的页面、停止服务和导出。脚本检查 guest 的修改出现在导出目录，宿主导入源中的模板仍保持原样。每步日志保存在脚本输出的 Evidence 目录，仅清理本次创建的 VM。
+
+OpenCode 使用 guest loopback 上的 [脚本化模型替身](../experiments/macos/preview_model.py)。实际执行的是 OpenCode 的文件与命令工具，验收无需模型账户或凭据。开发预览使用宿主下载、guest 安装的路径。直接在 guest 从公有仓库安装的稳定性与外部模型接入另行验证。
+
+2026-11-19 实测通过。环境为 macOS 27.2 (26B123)、Apple container 1.7.1、Apple Silicon 和 1 GiB guest 工作负载限额。OpenCode 的 `read`、`edit`、`bash` 三项工具均完成，命令工具输出 `/workspace` 和 `24 passed`。宿主 HTTP 响应和导出文件均包含改后的标题。此前从 guest 直接下载依赖能访问仓库并下载多个 wheel，但在 180 秒内未完成安装。
