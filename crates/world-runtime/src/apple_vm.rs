@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
+    io::AsyncReadExt,
     process::Command,
     time::{sleep, timeout},
 };
@@ -21,6 +22,10 @@ const IMAGE: &str = "docker.io/library/python@sha256:bf12ecc0bea3f171d55145dd02c
 const PROVIDER_VERSIONS: &[&str] = &["1.6.1", "1.7.1"];
 const GUEST: &str = concat!(
     include_str!("../guest/supervisor.py"),
+    "\n",
+    include_str!("../guest/export.py"),
+    "\n",
+    include_str!("../guest/port_bridge.py"),
     "\n",
     include_str!("../guest/services.py")
 );
@@ -371,6 +376,170 @@ async fn guest_service(
     Ok(serde_json::from_str(&response)?)
 }
 
+fn publication_operation_lock(state: &Path, vm: &Vm) -> Result<File> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(state.join(format!("{}.publication.lock", vm.instance_id)))?;
+    lock.try_lock_exclusive()
+        .context("another service or publication operation is in progress")?;
+    Ok(lock)
+}
+
+fn publication_json(publication: crate::port_publish::Publication) -> serde_json::Value {
+    serde_json::json!({
+        "state": "active",
+        "name": publication.name,
+        "service": publication.service,
+        "run_id": publication.run_id,
+        "host_address": "127.0.0.1",
+        "host_port": publication.host_port,
+        "target_address": "127.0.0.1",
+        "target_port": publication.target_port,
+    })
+}
+
+pub async fn service_ports(state: &Path, vm: &Vm, service: &str) -> Result<Vec<serde_json::Value>> {
+    let _workspace = operation_lock(state, vm, true)?;
+    check_registered(state, vm)?;
+    Ok(crate::port_publish::control(&vm.owner, b"?")
+        .await?
+        .filter(|publication| publication.service == service)
+        .map(publication_json)
+        .into_iter()
+        .collect())
+}
+
+pub async fn unpublish(state: &Path, vm: &Vm, service: &str, name: &str) -> Result<()> {
+    let _workspace = operation_lock(state, vm, true)?;
+    check_registered(state, vm)?;
+    let _operation = publication_operation_lock(state, vm)?;
+    if crate::port_publish::control(&vm.owner, b"?")
+        .await?
+        .is_some_and(|publication| publication.service == service && publication.name == name)
+    {
+        crate::port_publish::control(&vm.owner, b"q").await?;
+    }
+    Ok(())
+}
+
+pub async fn publish(
+    state: &Path,
+    vm: &Vm,
+    service: String,
+    name: String,
+    host_port: u16,
+    target_port: u16,
+) -> Result<serde_json::Value> {
+    ensure!(
+        (1024..).contains(&host_port) && target_port != 0,
+        "invalid publication port"
+    );
+    ensure!(
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c)),
+        "invalid publication name"
+    );
+    let _workspace = operation_lock(state, vm, true)?;
+    check_registered(state, vm)?;
+    let _operation = publication_operation_lock(state, vm)?;
+    let boot_id = require_ready(state, vm)?;
+    check_provider().await?;
+    ensure!(
+        inspect(vm)
+            .await?
+            .is_some_and(|v| v["status"]["state"] == "running"),
+        "workspace is not running"
+    );
+    let probe: serde_json::Value = serde_json::from_str(&guest(vm, &["probe"]).await?)?;
+    ensure!(
+        probe["port_protocol"] == 1,
+        "guest lacks TCP publishing support; run workspace setup first"
+    );
+    let capabilities = guest_service(vm, &boot_id, serde_json::json!({
+        "action": "publication-capabilities",
+    })).await.context("cannot verify TCP publishing support in the running service supervisor; stop the VM with workspace teardown and run workspace setup")?;
+    ensure!(
+        capabilities["port_protocol"] == 1,
+        "running service supervisor lacks TCP publishing support; stop the VM with workspace teardown and run workspace setup"
+    );
+    let status = guest_service(
+        vm,
+        &boot_id,
+        serde_json::json!({"action":"show","name":service}),
+    )
+    .await?;
+    ensure!(status["state"] == "running", "service is not running");
+    let run_id = status["run_id"]
+        .as_str()
+        .filter(|id| hex_id(id))
+        .context("invalid service run ID")?;
+    let publication = crate::port_publish::Publication {
+        service,
+        name,
+        run_id: run_id.into(),
+        host_port,
+        target_port,
+    };
+    if let Some(active) = crate::port_publish::control(&vm.owner, b"?").await? {
+        ensure!(
+            active == publication,
+            "a different publication is active; unpublish it first"
+        );
+    } else {
+        crate::port_publish::launch(&std::env::current_exe()?, state, &vm.id, &publication).await?;
+    }
+    Ok(publication_json(publication))
+}
+
+#[doc(hidden)]
+pub async fn port_worker(
+    state: &Path,
+    workspace: &str,
+    spec: &str,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let vm = get(state, workspace)?.context("publication requires a Linux VM workspace")?;
+    let boot_id = require_ready(state, &vm)?;
+    let publication: crate::port_publish::Publication = serde_json::from_str(spec)?;
+    check_provider().await?;
+    ensure!(
+        inspect(&vm)
+            .await?
+            .is_some_and(|v| v["status"]["state"] == "running"),
+        "workspace is not running"
+    );
+    ensure!(
+        publication.host_port >= 1024 && publication.target_port != 0,
+        "invalid publication port"
+    );
+    let bridge = provider()
+        .args([
+            "exec",
+            "-i",
+            "-e",
+            &format!("WORLD_EXPECTED_BOOT_ID={boot_id}"),
+            &vm.instance_id,
+            "python3",
+            "-I",
+            HELPER,
+            "port-bridge",
+            &publication.service,
+            &publication.run_id,
+            &publication.target_port.to_string(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    crate::port_publish::broker(&vm.owner, publication, bridge, cancel).await
+}
+
 pub async fn service(
     state: &Path,
     vm: &Vm,
@@ -389,8 +558,14 @@ pub async fn service(
     );
     let action = request["action"]
         .as_str()
-        .context("missing service action")?;
-    if matches!(action, "start" | "stop" | "restart" | "remove") {
+        .context("missing service action")?
+        .to_owned();
+    let writes = matches!(action.as_str(), "start" | "stop" | "restart" | "remove");
+    let _publication = writes
+        .then(|| publication_operation_lock(state, vm))
+        .transpose()?;
+    let service = request["name"].as_str().map(str::to_owned);
+    if writes {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
@@ -412,6 +587,44 @@ pub async fn service(
             request_id.is_none(),
             "--request-id requires a service write operation"
         );
+    }
+    if matches!(action.as_str(), "start" | "stop" | "restart")
+        && let Some(active) = crate::port_publish::control(&vm.owner, b"?").await?
+        && service.as_deref() == Some(active.service.as_str())
+    {
+        // A retry returns its historical result. It must leave any publication
+        // created since that result untouched.
+        let cache = guest_service(
+            vm,
+            &boot_id,
+            serde_json::json!({
+                "action": "operation-known", "operation_id": request["operation_id"],
+            }),
+        )
+        .await?;
+        let known = cache["known"]
+            .as_bool()
+            .context("invalid operation cache response")?;
+        if !known {
+            let retains_run = if action == "start" {
+                let current = guest_service(
+                    vm,
+                    &boot_id,
+                    serde_json::json!({
+                        "action": "show", "name": active.service,
+                    }),
+                )
+                .await?;
+                current["state"] == "running" && current["run_id"] == active.run_id
+            } else {
+                false
+            };
+            if retains_run {
+                request["retain_run_id"] = active.run_id.into();
+            } else {
+                crate::port_publish::control(&vm.owner, b"q").await?;
+            }
+        }
     }
     let mut result = guest_service(vm, &boot_id, request).await?;
     if let Some(object) = result.as_object_mut() {
@@ -498,7 +711,7 @@ pub async fn show(state: &Path, vm: &Vm) -> Result<serde_json::Value> {
         .as_secs();
     Ok(
         serde_json::json!({"id":vm.id,"status":status,"lifecycle":journal,"observed_at_unix":observed_at,"configuration":vm,"observed":observed,"observation_error":error,"experimental":true,
-        "capabilities":{"host_directory_mounts":false,"file_import":true,"egress_filtering":false,"host_lan_blocking":false,"worldfs":false,"pty":false,"parallel_exec":true,"guest_services":true},
+        "capabilities":{"host_directory_mounts":false,"file_import":true,"file_export":true,"egress_filtering":false,"host_lan_blocking":false,"worldfs":false,"pty":false,"parallel_exec":true,"guest_services":true,"host_tcp_publish":true},
         "network_policy":"provider NAT, unrestricted egress; not a hostile-workload sandbox"}),
     )
 }
@@ -642,6 +855,7 @@ pub async fn teardown(state: &Path, vm: &Vm) -> Result<()> {
         journal.phase != Phase::Deleting,
         "workspace deletion is pending; retry workspace delete"
     );
+    crate::port_publish::control(&vm.owner, b"q").await?;
     check_provider().await?;
     if inspect(vm)
         .await?
@@ -713,6 +927,7 @@ pub async fn delete(state: &Path, vm: &Vm, discard_runtime_data: bool) -> Result
             "VM writable layer may contain project files; pass --discard-runtime-data to delete it permanently"
         );
     }
+    crate::port_publish::control(&vm.owner, b"q").await?;
     let mut journal = lifecycle(state, vm)?;
     journal.phase = Phase::Deleting;
     save_lifecycle(state, vm, &journal)?;
@@ -913,6 +1128,88 @@ pub async fn import(
         "unexpected guest import result"
     );
     Ok(result)
+}
+
+/// Export a quiescent workspace into a new host directory.
+pub async fn export(
+    state: &Path,
+    vm: &Vm,
+    destination: &Path,
+    cancel: CancellationToken,
+) -> Result<serde_json::Value> {
+    let _lock = operation_lock(state, vm, false)?;
+    check_registered(state, vm)?;
+    let boot_id = require_ready(state, vm)?;
+    check_provider().await?;
+    ensure!(
+        inspect(vm)
+            .await?
+            .is_some_and(|v| v["status"]["state"] == "running"),
+        "workspace is not running; run workspace setup first"
+    );
+    let probe: serde_json::Value = serde_json::from_str(&guest(vm, &["probe"]).await?)?;
+    ensure!(
+        probe["export_protocol"] == 1,
+        "guest lacks export support; run workspace setup first"
+    );
+    ensure!(
+        probe["boot_id"].as_str() == Some(&boot_id),
+        "VM restarted outside World; run workspace setup first"
+    );
+    require_no_active_services(vm, &boot_id).await?;
+    ensure!(!cancel.is_cancelled(), "export cancelled");
+    let mut staging = crate::export_stream::Staging::new(destination)?;
+    let mut child = provider()
+        .args([
+            "exec",
+            "-e",
+            &format!("WORLD_EXPECTED_BOOT_ID={boot_id}"),
+            &vm.instance_id,
+            "python3",
+            "-I",
+            HELPER,
+            "export",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().context("export stdout missing")?;
+    let mut stderr = child.stderr.take().context("export stderr missing")?;
+    let collect_stderr = async {
+        let mut diagnostic = Vec::new();
+        (&mut stderr)
+            .take(16384)
+            .read_to_end(&mut diagnostic)
+            .await?;
+        tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await?;
+        Ok::<_, std::io::Error>(diagnostic)
+    };
+    let transferred = tokio::select! {
+        result = timeout(Duration::from_secs(600), async {
+            tokio::join!(staging.receive(stdout), child.wait(), collect_stderr)
+        }) => result.context("export timed out"),
+        _ = cancel.cancelled() => Err(anyhow::anyhow!("export cancelled")),
+    };
+    let (entries, status, diagnostic) = match transferred {
+        Ok(transfer) => transfer,
+        Err(error) => {
+            let _ = child.kill().await;
+            return Err(error);
+        }
+    };
+    let diagnostic = diagnostic?;
+    ensure!(
+        status?.success(),
+        "guest export failed: {}",
+        String::from_utf8_lossy(&diagnostic).trim()
+    );
+    let entries = entries?;
+    ensure!(!cancel.is_cancelled(), "export cancelled");
+    tokio::task::spawn_blocking(move || staging.publish(&cancel)).await??;
+    Ok(
+        serde_json::json!({"state":"exported", "entries":entries, "destination":destination.to_string_lossy()}),
+    )
 }
 
 #[cfg(test)]

@@ -17,6 +17,12 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Commands {
+    #[command(name = "__port-worker", hide = true)]
+    PortWorker {
+        state: PathBuf,
+        workspace: String,
+        spec: String,
+    },
     Network {
         #[command(subcommand)]
         command: Network,
@@ -51,6 +57,26 @@ enum Commands {
 }
 #[derive(Subcommand)]
 enum Service {
+    Publish {
+        workspace: String,
+        service: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        host_port: u16,
+        #[arg(long)]
+        target_port: u16,
+    },
+    Unpublish {
+        workspace: String,
+        service: String,
+        #[arg(long)]
+        name: String,
+    },
+    Ports {
+        workspace: String,
+        service: String,
+    },
     Operation {
         workspace: String,
         id: String,
@@ -135,6 +161,12 @@ enum Workspace {
         #[arg(long)]
         source: PathBuf,
     },
+    /// Copy a Linux VM workspace into a new host directory.
+    Export {
+        workspace: String,
+        #[arg(long)]
+        destination: PathBuf,
+    },
     /// macOS: add the workspace loopback alias (requires sudo). Linux: start
     /// the process holding the workspace network namespace (no privilege).
     Setup {
@@ -208,6 +240,22 @@ async fn run(cli: Cli) -> i32 {
 
 async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
     match cli.command {
+        Commands::PortWorker {
+            state,
+            workspace,
+            spec,
+        } => {
+            if let Err(error) = apple_vm::port_worker(&state, &workspace, &spec, cancel).await {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stdout(),
+                    "{}",
+                    serde_json::json!({"error":format!("{error:#}")})
+                );
+                return Ok(125);
+            }
+            Ok(0)
+        }
         Commands::Network {
             command:
                 Network::Exec {
@@ -299,6 +347,16 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                     );
                     Ok(0)
                 }
+                Workspace::Export {
+                    workspace,
+                    destination,
+                } => {
+                    let vm = apple_vm::get(&state, &workspace)?
+                        .context("export requires a Linux VM workspace")?;
+                    let result = apple_vm::export(&state, &vm, &destination, cancel).await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    Ok(0)
+                }
                 Workspace::Show { workspace } => {
                     if let Some(vm) = apple_vm::get(&state, &workspace)? {
                         println!(
@@ -345,6 +403,53 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
         } => {
             use serde_json::json;
 
+            let state = state_dir.map(Ok).unwrap_or_else(silo::default_state_dir)?;
+            let vm_for = |workspace: &str| {
+                apple_vm::get(&state, workspace)?.context("service requires a Linux VM workspace")
+            };
+            let command = match command {
+                Service::Publish {
+                    workspace,
+                    service,
+                    name,
+                    host_port,
+                    target_port,
+                } => {
+                    anyhow::ensure!(
+                        request_id.is_none(),
+                        "--request-id is not supported for ports"
+                    );
+                    let vm = vm_for(&workspace)?;
+                    let result =
+                        apple_vm::publish(&state, &vm, service, name, host_port, target_port)
+                            .await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    return Ok(0);
+                }
+                Service::Unpublish {
+                    workspace,
+                    service,
+                    name,
+                } => {
+                    anyhow::ensure!(
+                        request_id.is_none(),
+                        "--request-id is not supported for ports"
+                    );
+                    apple_vm::unpublish(&state, &vm_for(&workspace)?, &service, &name).await?;
+                    return Ok(0);
+                }
+                Service::Ports { workspace, service } => {
+                    anyhow::ensure!(
+                        request_id.is_none(),
+                        "--request-id is not supported for ports"
+                    );
+                    let result =
+                        apple_vm::service_ports(&state, &vm_for(&workspace)?, &service).await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    return Ok(0);
+                }
+                other => other,
+            };
             let (workspace, request) = match command {
                 Service::Start {
                     workspace,
@@ -379,10 +484,11 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                     workspace,
                     json!({"action": "logs", "name": name, "stream": stream}),
                 ),
+                Service::Publish { .. } | Service::Unpublish { .. } | Service::Ports { .. } => {
+                    unreachable!()
+                }
             };
-            let state = state_dir.map(Ok).unwrap_or_else(silo::default_state_dir)?;
-            let vm = apple_vm::get(&state, &workspace)?
-                .context("service requires a Linux VM workspace")?;
+            let vm = vm_for(&workspace)?;
             let response = apple_vm::service(&state, &vm, request, request_id).await?;
             println!("{}", serde_json::to_string_pretty(&response)?);
             Ok(0)

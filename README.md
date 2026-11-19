@@ -70,9 +70,11 @@ cargo build --workspace
 
 VM 默认内存限额为 512 MiB，小型测试可指定 256 MiB；运行时与 guest 内核另有开销。首版保守限制同一用户经 World 启动的 VM：发现其他运行中的 container 时拒绝启动新 VM。允许同一个 World 的多个 exec 并发，每个命令具有独立 cgroup；命令结束时会清理其后台后代，常驻开发服务可通过 `world service` 管理。teardown 遇到活跃执行会拒绝，先取消这些执行再停机。
 
-工作目录固定为 guest `/workspace`，任务 UID 为 1000，不挂载宿主目录或导入宿主环境。首版使用固定 digest 的 Python/Alpine 镜像，已支持 `workspace import --source` 将宿主目录复制到空 `/workspace`；尚无 export、创建时的 `--import`、PTY、宿主端口发布、WorldFS 或出口白名单。VM 提供独立内核边界，默认 NAT 并不阻止访问宿主、LAN 或其他 guest；不将此后端标为完整恶意任务沙盒。导入先生成宿主临时快照，再经 guest 暂存与校验发布，不覆盖已有内容。它包含隐藏文件与未跟踪文件，保留普通权限和符号链接，但不跟随链接读取外部目标；不保留 xattr/ACL/时间戳/硬链接关系，特殊文件和非 UTF-8 路径明确拒绝。导入时请暂停源目录写入；这不是原子文件系统快照。完整状态及限制见 [后端文档](docs/linux-vm-backend.md#当前实验实现)。
+工作目录固定为 guest `/workspace`，任务 UID 为 1000，不挂载宿主目录或导入宿主环境。首版使用固定 digest 的 Python/Alpine 镜像，已支持 `workspace import --source` 将宿主目录复制到空 `/workspace`；尚无创建时的 `--import`、PTY、WorldFS 或出口白名单。VM 提供独立内核边界，默认 NAT 并不阻止访问宿主、LAN 或其他 guest；不将此后端标为完整恶意任务沙盒。导入先生成宿主临时快照，再经 guest 暂存与校验发布，不覆盖已有内容。它包含隐藏文件与未跟踪文件，保留普通权限和符号链接，但不跟随链接读取外部目标；不保留 xattr/ACL/时间戳/硬链接关系，特殊文件和非 UTF-8 路径明确拒绝。导入时请暂停源目录写入；这不是原子文件系统快照。完整状态及限制见 [后端文档](docs/linux-vm-backend.md#当前实验实现)。
 
-可用 `world service` 在 Linux VM 内管理常驻服务。宿主 TCP 发布仍在设计中。见 [实验性 guest 服务](docs/linux-vm-backend.md#实验性-guest-服务)。
+用 `world workspace export linux-dev --destination ./results` 将 VM 中的项目导出到新建的宿主目录。导出前需结束执行并停止服务。
+
+可用 `world service` 在 Linux VM 内管理常驻服务，并将服务端口显式发布到 Mac 的 `127.0.0.1`。见 [实验性 guest 服务](docs/linux-vm-backend.md#实验性-guest-服务)。
 
 ### Linux VM 生命周期
 
