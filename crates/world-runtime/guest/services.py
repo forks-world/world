@@ -90,6 +90,7 @@ class Services:
         self.boot_id = boot_id
         self.live = {}
         self.draining = False
+        self.catalog_retry_at = None
         self.journal = SERVICE_DIR / 'operations.json'
         self.operations = json.loads(self.journal.read_text()) if self.journal.exists() else {}
         self.catalog = SERVICE_DIR / 'catalog.json'
@@ -105,13 +106,21 @@ class Services:
                 path.unlink()
 
     def persist(self):
-        write(self.catalog, self.records)
+        try:
+            write(self.catalog, self.records)
+        except OSError:
+            self.catalog_retry_at = time.monotonic() + 1
+            raise
+        self.catalog_retry_at = None
 
     def log_path(self, record, stream):
         return SERVICE_DIR / f'{record["run_id"]}.{stream}'
 
     def public(self, record):
-        return {key: value for key, value in record.items() if key != 'argv'}
+        result = {key: value for key, value in record.items() if key != 'argv'}
+        if self.catalog_retry_at is not None:
+            result['catalog_persistence_pending'] = True
+        return result
 
     def drain(self, record, child):
         for stream in ('stdout', 'stderr'):
@@ -136,7 +145,7 @@ class Services:
             except OSError:
                 record['logs_truncated'] = True
 
-    def finish(self, name, stopped=False):
+    def finish(self, name, stopped=False, defer_catalog_error=False):
         child, group = self.live[name]
         record = self.records[name]
         clear_service_group(group)
@@ -151,14 +160,23 @@ class Services:
                 record['logs_truncated'] = True
         record.update(state='stopped' if stopped else 'exited', exit_code=code)
         del self.live[name]
-        self.persist()
+        try:
+            self.persist()
+        except OSError:
+            if not defer_catalog_error:
+                raise
         return self.public(record)
 
     def poll(self):
         for name, (child, _) in list(self.live.items()):
             self.drain(self.records[name], child)
             if child.poll() is not None:
-                self.finish(name)
+                self.finish(name, defer_catalog_error=True)
+        if self.catalog_retry_at is not None and time.monotonic() >= self.catalog_retry_at:
+            try:
+                self.persist()
+            except OSError:
+                pass  # The live state remains available while the disk is unavailable.
 
     def start(self, name, argv):
         if not argv or not all(isinstance(arg, str) and '\0' not in arg for arg in argv):

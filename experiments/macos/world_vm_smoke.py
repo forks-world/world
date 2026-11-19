@@ -303,7 +303,36 @@ def main():
         call('explicit-recreation',workspace('setup','test','--recreate-missing'))
         call('recreated-runtime-empty',execute('test','!','-e','/workspace/persisted'))
         call('start-service-before-drain-failure', service('start', 'broken', '--', 'sleep', '60'))
+        call('start-exiting-service-before-catalog-failure', service(
+            'start', 'exiting', '--', 'sh', '-ec',
+            'while [ ! -e /workspace/exit-now ]; do sleep 0.05; done',
+        ))
         record('make-service-catalog-unwritable', [
+            'container', 'exec', vm['instance_id'], 'sh', '-ec',
+            'p=/var/lib/world/runtime/services/catalog.json; mv "$p" "$p.saved"; mkdir "$p"',
+        ])
+        call('exit-one-service-with-catalog-unwritable', execute('touch', 'exit-now'))
+        for _ in range(15):
+            services = json.loads(call('observe-services-with-catalog-failure', service('list')).stdout)
+            by_name = {record['name']: record for record in services}
+            if by_name['exiting']['state'] == 'exited':
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError('supervisor did not observe natural exit')
+        assert by_name['exiting']['catalog_persistence_pending'] is True
+        assert by_name['broken']['state'] == 'running'
+        record('restore-catalog-writability', [
+            'container', 'exec', vm['instance_id'], 'rmdir', '/var/lib/world/runtime/services/catalog.json',
+        ])
+        for _ in range(20):
+            status = json.loads(call('observe-catalog-recovery', service('show', 'exiting')).stdout)
+            if not status.get('catalog_persistence_pending'):
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError('supervisor did not persist recovered catalog')
+        record('make-catalog-unwritable-again', [
             'container', 'exec', vm['instance_id'], 'sh', '-ec',
             'p=/var/lib/world/runtime/services/catalog.json; mv "$p" "$p.saved"; mkdir "$p"',
         ])
