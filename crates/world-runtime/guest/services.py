@@ -299,6 +299,8 @@ class Services:
 
     def dispatch_action(self, req):
         action = req['action']
+        if action == 'publication-capabilities':
+            return {'port_protocol': 1}
         if action == 'operation-known':
             # Host uses this while serializing service writes and publication changes.
             self.operation_timestamp(req['operation_id'], int(time.time()))
