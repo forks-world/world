@@ -649,11 +649,21 @@ pub async fn teardown(state: &Path, vm: &Vm) -> Result<()> {
     {
         journal.phase = Phase::Stopping;
         save_lifecycle(state, vm, &journal)?;
-        let probe: serde_json::Value = serde_json::from_str(&guest(vm, &["probe"]).await?)?;
-        if probe["service_protocol"] == 1 {
-            let boot_id = probe["boot_id"].as_str().context("guest boot ID missing")?;
-            start_service_supervisor(vm, boot_id).await?;
-            guest_service(vm, boot_id, serde_json::json!({"action": "drain"})).await?;
+        let drain = async {
+            let probe: serde_json::Value = serde_json::from_str(&guest(vm, &["probe"]).await?)?;
+            if probe["service_protocol"] == 1 {
+                let boot_id = probe["boot_id"].as_str().context("guest boot ID missing")?;
+                start_service_supervisor(vm, boot_id).await?;
+                guest_service(vm, boot_id, serde_json::json!({"action": "drain"})).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        match timeout(Duration::from_secs(15), drain).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("world: guest service drain failed; stopping VM: {error:#}")
+            }
+            Err(_) => eprintln!("world: guest service drain timed out; stopping VM"),
         }
         output(
             &["stop", "--time", "2", &vm.instance_id],

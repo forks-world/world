@@ -311,13 +311,16 @@ class Services:
                 raise ValueError('invalid log stream')
             path = self.log_path(record, stream)
             data = bytearray()
+            total_size = 0
             for part in (path.with_suffix(f'.{stream}.old'), path):
                 if part.exists():
                     with part.open('rb') as log:
-                        log.seek(max(0, part.stat().st_size - 65536))
+                        size = os.fstat(log.fileno()).st_size
+                        total_size += size
+                        log.seek(max(0, size - 65536))
                         data.extend(log.read(65536))
             return {'run_id': record['run_id'], 'stream': stream,
-                    'truncated': record['logs_truncated'] or len(data) > 65536,
+                    'truncated': record['logs_truncated'] or total_size > 65536,
                     'base64': base64.b64encode(data[-65536:]).decode()}
         raise ValueError('unsupported service action')
 

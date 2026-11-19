@@ -209,6 +209,19 @@ def main():
         assert stopped['state'] == 'stopped'
         call('service-remove', service('remove', 'web'))
         assert json.loads(call('service-list-empty', service('list')).stdout) == []
+        call('start-unrotated-log', service(
+            'start', 'shortlog', '--', 'python3', '-c', "import os; os.write(1, b'x' * 70000)",
+        ))
+        for _ in range(20):
+            status = json.loads(call('unrotated-log-status', service('show', 'shortlog')).stdout)
+            if status['state'] == 'exited':
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError('unrotated log producer did not finish')
+        log = json.loads(call('unrotated-log-tail', service('logs', 'shortlog')).stdout)
+        assert log['truncated'] and base64.b64decode(log['base64']) == b'x' * 65536
+        call('remove-unrotated-log', service('remove', 'shortlog'))
         call('service-start-log-volume', service(
             'start', 'logger', '--', 'python3', '-c',
             "import os; os.write(1, b'x' * (2300 * 1024) + bytes(range(256)))",
@@ -289,7 +302,15 @@ def main():
         call('reject-implicit-recreation',workspace('setup','test'),expected=125)
         call('explicit-recreation',workspace('setup','test','--recreate-missing'))
         call('recreated-runtime-empty',execute('test','!','-e','/workspace/persisted'))
-        call('stop-recreated-runtime',workspace('teardown','test'))
+        call('start-service-before-drain-failure', service('start', 'broken', '--', 'sleep', '60'))
+        record('make-service-catalog-unwritable', [
+            'container', 'exec', vm['instance_id'], 'sh', '-ec',
+            'p=/var/lib/world/runtime/services/catalog.json; mv "$p" "$p.saved"; mkdir "$p"',
+        ])
+        stopped = call('stop-recreated-runtime', workspace('teardown', 'test'))
+        assert 'guest service drain failed; stopping VM' in stopped.stderr
+        assert json.loads(call('show-after-drain-failure', workspace('show', 'test')).stdout)['status'] == 'stopped'
+
         # A native entry in the same registry must survive deletion of the VM.
         call('create-native',workspace('create','native','--workdir',str(root)))
         call('delete-runtime',workspace('delete','test','--discard-runtime-data'))
