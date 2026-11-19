@@ -76,6 +76,13 @@ async def bridge(boot_id, name, run_id, port):
             if tcp is not None:
                 tcp.close()
 
+    async def close_streams():
+        pending = [task for _, _, task in streams.values()]
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        streams.clear()
+
     async def receive():
         while line := await reader.readline():
             if len(line) > BRIDGE_LINE:
@@ -83,6 +90,13 @@ async def bridge(boot_id, name, run_id, port):
             frame = json.loads(line)
             stream = frame['id']
             kind = frame['kind']
+            if kind == 'shutdown' and stream == 0:
+                # No later frame can start a new dial. Confirm only after
+                # removing all guest stream tasks.
+                await close_streams()
+                await send('closed')
+                await reader.read(1)
+                raise EOFError('host shut down publication')
             if kind == 'open':
                 if stream in streams or len(streams) >= BRIDGE_LIMIT:
                     await send('reset', stream)
@@ -116,8 +130,5 @@ async def bridge(boot_id, name, run_id, port):
             tasks.create_task(receive())
             tasks.create_task(monitor())
     finally:
-        pending = [task for _, _, task in streams.values()]
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        await close_streams()
         writer.close()

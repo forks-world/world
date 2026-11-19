@@ -581,23 +581,45 @@ pub async fn service(
             "--request-id requires a service write operation"
         );
     }
-    let mut result = guest_service(vm, &boot_id, request).await?;
-    if matches!(action.as_str(), "stop" | "restart" | "remove")
+    if matches!(action.as_str(), "start" | "stop" | "restart")
         && let Some(active) = crate::port_publish::control(&vm.owner, b"?").await?
         && service.as_deref() == Some(active.service.as_str())
     {
-        let current = guest_service(
+        // A retry returns its historical result. It must leave any publication
+        // created since that result untouched.
+        let cache = guest_service(
             vm,
             &boot_id,
-            serde_json::json!({"action":"show","name":active.service}),
+            serde_json::json!({
+                "action": "operation-known", "operation_id": request["operation_id"],
+            }),
         )
-        .await;
-        if !current
-            .is_ok_and(|status| status["state"] == "running" && status["run_id"] == active.run_id)
-        {
-            crate::port_publish::control(&vm.owner, b"q").await?;
+        .await?;
+        let known = cache["known"]
+            .as_bool()
+            .context("invalid operation cache response")?;
+        if !known {
+            let retains_run = if action == "start" {
+                let current = guest_service(
+                    vm,
+                    &boot_id,
+                    serde_json::json!({
+                        "action": "show", "name": active.service,
+                    }),
+                )
+                .await?;
+                current["state"] == "running" && current["run_id"] == active.run_id
+            } else {
+                false
+            };
+            if retains_run {
+                request["retain_run_id"] = active.run_id.into();
+            } else {
+                crate::port_publish::control(&vm.owner, b"q").await?;
+            }
         }
     }
+    let mut result = guest_service(vm, &boot_id, request).await?;
     if let Some(object) = result.as_object_mut() {
         object.insert(
             "observed_generation".into(),

@@ -218,6 +218,14 @@ def main():
         assert published['host_address'] == '127.0.0.1' and published['run_id'] == run['run_id']
         assert json.loads(call('publish-idempotent', service('publish', *port_args)).stdout) == published
         assert json.loads(call('service-ports', service('ports', 'web')).stdout) == [published]
+        repeat = json.loads(call('start-keeps-publication', service('start', *command)).stdout)
+        assert repeat['run_id'] == run['run_id']
+        assert json.loads(call('ports-after-repeat-start', service('ports', 'web')).stdout) == [published]
+        expired = call('expired-restart-keeps-publication', service(
+            'restart', 'web', '--request-id', '1-' + 'a' * 32,
+        ), expected=125)
+        assert 'expired' in expired.stderr
+        assert json.loads(call('ports-after-expired-request', service('ports', 'web')).stdout) == [published]
         url = f'http://127.0.0.1:{host_port}'
         with urllib.request.urlopen(f'{url}/persisted', timeout=5) as response:
             assert response.read() == b'saved'
@@ -241,16 +249,28 @@ def main():
         import base64
         assert b'GET /persisted' in base64.b64decode(log['base64'])
         call('service-refuse-remove-running', service('remove', 'web'), expected=125)
-        restarted = json.loads(call('service-restart', service('restart', 'web')).stdout)
+        with socket.create_connection(('127.0.0.1', host_port), timeout=5) as old_client:
+            old_client.sendall(b'GET / HTTP/1.1\r\n')
+            restarted = json.loads(call('service-restart', service('restart', 'web')).stdout)
+            try:
+                assert old_client.recv(1) == b''
+            except ConnectionResetError:
+                pass
         assert restarted['run_id'] != run['run_id']
         assert json.loads(call('old-publication-revoked', service('ports', 'web')).stdout) == []
         with socket.socket() as available:
             assert available.connect_ex(('127.0.0.1', host_port)) != 0
+        current_publication = json.loads(call(
+            'publish-new-service-run', service('publish', *port_args),
+        ).stdout)
+        assert current_publication['run_id'] == restarted['run_id']
         operation_id = restarted['operation_id']
         replayed = json.loads(call('service-restart-retry', service(
             'restart', 'web', '--request-id', operation_id,
         )).stdout)
         assert replayed['run_id'] == restarted['run_id']
+        assert json.loads(call('retry-keeps-new-publication', service('ports', 'web')).stdout) == [current_publication]
+
         operation = json.loads(call('service-operation', service('operation', operation_id)).stdout)
         assert operation['state'] == 'completed' and operation['result']['run_id'] == restarted['run_id']
         call('service-request-conflict', service('stop', 'web', '--request-id', operation_id),
