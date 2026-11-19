@@ -823,6 +823,26 @@ pub async fn exec(
 
 /// Copy a completed host snapshot into an empty guest workspace. The exclusive
 /// lifecycle lock prevents commands from racing extraction/publication.
+async fn require_no_active_services(vm: &Vm, boot_id: &str) -> Result<()> {
+    let services = guest_service(vm, boot_id, serde_json::json!({"action": "list"}))
+        .await
+        .context("cannot verify service state; run workspace setup first")?;
+    ensure!(
+        services
+            .as_array()
+            .context("invalid service state")?
+            .iter()
+            .all(|service| {
+                matches!(
+                    service["state"].as_str(),
+                    Some("stopped" | "exited" | "failed" | "interrupted")
+                )
+            }),
+        "workspace has active services; stop them before transferring files"
+    );
+    Ok(())
+}
+
 pub async fn import(
     state: &Path,
     vm: &Vm,
@@ -848,6 +868,9 @@ pub async fn import(
         probe["boot_id"].as_str() == Some(&boot_id),
         "VM restarted outside World; run workspace setup first"
     );
+    if probe["service_protocol"] == 1 {
+        require_no_active_services(vm, &boot_id).await?;
+    }
     let source = source.to_path_buf();
     let snapshot =
         tokio::task::spawn_blocking(move || crate::import_stream::snapshot(&source)).await??;

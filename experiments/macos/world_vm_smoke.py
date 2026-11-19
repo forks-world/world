@@ -125,6 +125,14 @@ def main():
         os.mkfifo(fifo)
         call('reject-special-file-import', workspace('import','test','--source',str(source)), expected=125)
         fifo.unlink()
+        call('start-service-before-import', service('start', 'importguard', '--', 'sleep', '60'))
+        blocked = call('active-service-import-refused', workspace(
+            'import', 'test', '--source', str(source),
+        ), expected=125)
+        assert 'workspace has active services' in blocked.stderr
+        call('verify-import-target-stayed-empty', execute('sh', '-ec', 'test -z "$(ls -A /workspace)"'))
+        call('stop-service-before-import', service('stop', 'importguard'))
+        call('remove-import-guard-service', service('remove', 'importguard'))
         call('import', workspace('import','test','--source',str(source)))
         import hashlib
         digest = hashlib.sha256(data).hexdigest()
