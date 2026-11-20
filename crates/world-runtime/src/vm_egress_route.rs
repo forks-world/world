@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 use tokio::net::TcpStream;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, PartialEq, Eq)]
 struct Route {
@@ -261,7 +262,12 @@ impl Pin {
     }
 }
 
-pub(crate) struct PinnedRoutes(HashMap<IpAddr, Pin>);
+pub(crate) struct PinnedRoutes {
+    pins: HashMap<IpAddr, Pin>,
+    revoked: CancellationToken,
+    #[cfg(test)]
+    fixture: Option<(SocketAddr, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+}
 
 impl PinnedRoutes {
     pub(crate) async fn prepare(routes: &mut HashMap<String, Vec<SocketAddr>>) -> Result<Self> {
@@ -325,13 +331,30 @@ impl PinnedRoutes {
                 }
             }
         }
-        Ok(Self(pins))
+        Ok(Self {
+            pins,
+            revoked: CancellationToken::new(),
+            #[cfg(test)]
+            fixture: None,
+        })
     }
 
-    async fn current(&self, address: SocketAddr) -> Result<&Pin> {
+    pub(crate) fn revocation(&self) -> &CancellationToken {
+        &self.revoked
+    }
+
+    async fn confirm_current(&self, address: SocketAddr) -> Result<u32> {
+        #[cfg(test)]
+        if let Some((affected, changed)) = &self.fixture {
+            anyhow::ensure!(
+                address != *affected || !changed.load(std::sync::atomic::Ordering::SeqCst),
+                "VM egress route changed"
+            );
+            return Ok(0);
+        }
         crate::vm_egress::require_public_destinations(&[address])?;
         let pin = self
-            .0
+            .pins
             .get(&address.ip())
             .ok_or_else(|| anyhow!("VM egress target has no pinned route"))?;
         let destination = address.ip().to_string();
@@ -347,27 +370,72 @@ impl PinnedRoutes {
             scoped.as_ref(),
             interface_index(&pin.route)?,
         )?;
-        Ok(pin)
+        Ok(pin.index)
+    }
+
+    async fn current(&self, address: SocketAddr) -> Result<u32> {
+        let result = tokio::select! {
+            biased;
+            _ = self.revoked.cancelled() => bail!("VM egress route authorization was revoked"),
+            result = self.confirm_current(address) => result,
+        };
+        if result.is_err() {
+            self.revoked.cancel();
+        }
+        let index = result?;
+        anyhow::ensure!(
+            !self.revoked.is_cancelled(),
+            "VM egress route authorization was revoked"
+        );
+        Ok(index)
+    }
+
+    fn bound_socket(&self, address: SocketAddr, index: u32) -> Result<tokio::net::TcpSocket> {
+        #[cfg(test)]
+        if self.fixture.is_some() {
+            return Ok(tokio::net::TcpSocket::new_v4()?);
+        }
+        bind_interface(address, index)
     }
 
     pub(crate) async fn connect(&self, address: SocketAddr) -> Result<Option<TcpStream>> {
-        let pin = self.current(address).await?;
-        let socket = bind_interface(address, pin.index)?;
-        let stream =
-            match tokio::time::timeout(Duration::from_secs(5), socket.connect(address)).await {
-                Ok(Ok(stream)) => stream,
-                _ => return Ok(None),
-            };
+        let index = self.current(address).await?;
+        let socket = self
+            .bound_socket(address, index)
+            .inspect_err(|_| self.revoked.cancel())?;
+        let connected = tokio::select! {
+            biased;
+            _ = self.revoked.cancelled() => bail!("VM egress route authorization was revoked"),
+            result = tokio::time::timeout(Duration::from_secs(5), socket.connect(address)) => result,
+        };
         // Confirm the route again before the proxy transfers application data.
         self.current(address).await?;
-        Ok(Some(stream))
+        Ok(connected.ok().and_then(Result::ok))
     }
 
     pub(crate) async fn wait_for_change(&self, address: SocketAddr) {
-        watch_route(Duration::from_secs(2), || async move {
-            self.current(address).await.is_ok()
-        })
-        .await;
+        tokio::select! {
+            biased;
+            _ = self.revoked.cancelled() => {},
+            _ = watch_route(Duration::from_secs(2), || async {
+                self.current(address).await.is_ok()
+            }) => {},
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        affected: SocketAddr,
+    ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let changed = std::sync::Arc::default();
+        (
+            Self {
+                pins: HashMap::new(),
+                revoked: CancellationToken::new(),
+                fixture: Some((affected, std::sync::Arc::clone(&changed))),
+            },
+            changed,
+        )
     }
 }
 

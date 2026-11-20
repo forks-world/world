@@ -31,6 +31,7 @@ pub struct Proxy {
     port: u16,
     credential: String,
     cancel: CancellationToken,
+    route_revocation: Option<CancellationToken>,
     accepts: Vec<JoinHandle<()>>,
     tasks: TaskTracker,
 }
@@ -69,6 +70,10 @@ impl Prepared {
             STANDARD.encode(format!("world:{}", self.credential))
         );
         let cancel = CancellationToken::new();
+        let route_revocation = self
+            .vm_routes
+            .as_ref()
+            .map(|routes| routes.revocation().clone());
         let tasks = TaskTracker::new();
         let service = Arc::new(Service {
             routes: self.routes,
@@ -100,6 +105,7 @@ impl Prepared {
             port,
             credential: self.credential,
             cancel,
+            route_revocation,
             accepts,
             tasks,
         })
@@ -107,6 +113,10 @@ impl Prepared {
 }
 
 impl Proxy {
+    pub(crate) fn route_revocation(&self) -> Option<CancellationToken> {
+        self.route_revocation.clone()
+    }
+
     pub async fn prepare(policy: &Policy) -> Result<Prepared> {
         Self::prepare_for(policy, false).await
     }
@@ -341,6 +351,13 @@ impl Service {
         let Some((selected, mut stream)) = upstream else {
             bail!("upstream unavailable")
         };
+        if self
+            .vm_routes
+            .as_ref()
+            .is_some_and(|routes| routes.revocation().is_cancelled())
+        {
+            return Ok(response(StatusCode::FORBIDDEN, "VM egress route denied"));
+        }
         if connect {
             let upgrade = hyper::upgrade::on(&mut req);
             let state = self.clone();
@@ -353,6 +370,7 @@ impl Service {
                     }
                 };
                 tokio::select! {
+                    biased;
                     _ = state.cancel.cancelled() => {},
                     _ = state.wait_for_route_change(selected) => {},
                     _ = transfer => {},
@@ -380,6 +398,7 @@ impl Service {
         let state = self.clone();
         self.tasks.spawn(async move {
             tokio::select! {
+                biased;
                 _ = state.cancel.cancelled() => {},
                 _ = state.wait_for_route_change(selected) => {},
                 _ = connection => {},
@@ -422,7 +441,8 @@ fn strip_hop_headers(headers: &mut header::HeaderMap) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     #[test]
     fn dns_addresses_require_ordinary_public_unicast() {
         for ip in [
@@ -514,6 +534,86 @@ mod tests {
         );
         assert_eq!(calls.get(), 2);
         assert_eq!(original.routes["public.example.com:443"], [public]);
+    }
+
+    #[tokio::test]
+    async fn route_revocation_closes_all_tunnels_and_rejects_new_connections() {
+        async fn upstream() -> (SocketAddr, JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (mut input, mut output) = stream.split();
+                tokio::io::copy(&mut input, &mut output).await.unwrap();
+            });
+            (address, task)
+        }
+
+        async fn tunnel(port: u16, target: &str, status: &str) -> BufReader<TcpStream> {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let auth = STANDARD.encode("world:test");
+            stream
+                .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: Basic {auth}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with(status), "{line}");
+            loop {
+                line.clear();
+                assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    return stream;
+                }
+            }
+        }
+
+        timeout(Duration::from_secs(8), async {
+            let (first, first_server) = upstream().await;
+            let (second, second_server) = upstream().await;
+            let (vm_routes, changed) = PinnedRoutes::fixture(first);
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let mut proxy = Prepared {
+                routes: HashMap::from([
+                    ("first.example.com:443".into(), vec![first]),
+                    ("second.example.com:443".into(), vec![second]),
+                ]),
+                vm_routes: Some(vm_routes),
+                credential: "test".into(),
+            }
+            .serve(port, vec![listener])
+            .unwrap();
+            let mut first_tunnel = tunnel(port, "first.example.com:443", "HTTP/1.1 200 ").await;
+            let mut second_tunnel = tunnel(port, "second.example.com:443", "HTTP/1.1 200 ").await;
+            for stream in [&mut first_tunnel, &mut second_tunnel] {
+                stream.write_all(b"ping").await.unwrap();
+                let mut echoed = [0; 4];
+                stream.read_exact(&mut echoed).await.unwrap();
+                assert_eq!(&echoed, b"ping");
+            }
+
+            // Only the first destination's route changes. The second must close as well.
+            changed.store(true, Ordering::SeqCst);
+            for stream in [&mut first_tunnel, &mut second_tunnel] {
+                match stream.read(&mut [0; 1]).await {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    result => panic!("tunnel remained open after revocation: {result:?}"),
+                }
+            }
+            assert!(proxy.route_revocation().unwrap().is_cancelled());
+            changed.store(false, Ordering::SeqCst);
+            for target in ["first.example.com:443", "second.example.com:443"] {
+                tunnel(port, target, "HTTP/1.1 403 ").await;
+            }
+            proxy.close().await;
+            first_server.await.unwrap();
+            second_server.await.unwrap();
+        })
+        .await
+        .expect("proxy did not revoke both tunnels and deny new connections");
     }
 
     #[tokio::test]

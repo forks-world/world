@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) struct Session {
     cancel: CancellationToken,
+    revoked: CancellationToken,
     task: JoinHandle<Result<()>>,
 }
 
@@ -34,6 +35,10 @@ impl Session {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let port = listener.local_addr()?.port();
         let mut proxy = prepared.serve(port, vec![listener])?;
+        let revoked = proxy
+            .route_revocation()
+            .context("VM egress route authorization missing")?;
+        let route_revocation = revoked.clone();
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -78,6 +83,7 @@ impl Session {
                 outcome = relay(output, outbound, port) => outcome,
                 outcome = write_frames => outcome,
                 _ = child.wait() => Err(anyhow::anyhow!("guest egress bridge exited")),
+                _ = route_revocation.cancelled() => Err(anyhow::anyhow!("VM egress route authorization was revoked")),
                 _ = shutdown.cancelled() => Ok(()),
             };
             if outcome.is_ok() {
@@ -94,7 +100,15 @@ impl Session {
             }
             outcome
         });
-        Ok(Self { cancel, task })
+        Ok(Self {
+            cancel,
+            revoked,
+            task,
+        })
+    }
+
+    pub(crate) fn route_revocation(&self) -> CancellationToken {
+        self.revoked.clone()
     }
 
     pub(crate) async fn finished(&mut self) -> Result<()> {

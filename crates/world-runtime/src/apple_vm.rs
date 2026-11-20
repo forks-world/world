@@ -1580,6 +1580,16 @@ pub async fn exec_with_egress(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
+    let route_revocation = session
+        .as_ref()
+        .map(crate::vm_egress_bridge::Session::route_revocation);
+    let revoked = async {
+        if let Some(revocation) = &route_revocation {
+            revocation.cancelled().await;
+        } else {
+            std::future::pending().await
+        }
+    };
     let bridge_exit = async {
         if let Some(session) = &mut session {
             session.finished().await
@@ -1589,6 +1599,7 @@ pub async fn exec_with_egress(
     };
     let (status, bridge_error) = tokio::select! {
         biased;
+        _ = revoked => (None, None),
         result = child.wait() => (Some(result?), None),
         result = bridge_exit => (None, Some(result)),
         _ = cancel.cancelled() => (None, None),
@@ -1611,6 +1622,9 @@ pub async fn exec_with_egress(
     }
     if let Some(session) = session {
         session.close().await;
+    }
+    if route_revocation.is_some_and(|revocation| revocation.is_cancelled()) {
+        bail!("policy_unavailable: VM egress route authorization was revoked");
     }
     if let Some(result) = bridge_error {
         result.context("policy_unavailable: egress bridge lost during execution")?;
