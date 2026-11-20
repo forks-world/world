@@ -170,6 +170,28 @@ enum Workspace {
     Show {
         workspace: String,
     },
+    /// Save a named checkpoint of a stopped forkfs-backed workspace.
+    Checkpoint {
+        workspace: String,
+        name: String,
+    },
+    /// Compare two named checkpoints in the forkfs repository.
+    Diff {
+        workspace: String,
+        before: String,
+        after: String,
+        /// Resume after the path in the previous page's next_after field.
+        #[arg(long, default_value = "")]
+        after_path: String,
+        #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u8).range(1..=64))]
+        limit: u8,
+    },
+    /// Create a storage branch from a checkpoint in the same repository.
+    Fork {
+        workspace: String,
+        revision: String,
+        branch: String,
+    },
     /// Copy a host directory into an empty Linux VM /workspace.
     Import {
         workspace: String,
@@ -385,6 +407,38 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                             )?)?
                         );
                     }
+                    Ok(0)
+                }
+                Workspace::Checkpoint { workspace, name } => {
+                    let vm = apple_vm::get(&state, &workspace)?
+                        .context("checkpoint requires a forkfs-backed workspace")?;
+                    let result = apple_vm::checkpoint(&state, &vm, &name).await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    Ok(0)
+                }
+                Workspace::Diff {
+                    workspace,
+                    before,
+                    after,
+                    after_path,
+                    limit,
+                } => {
+                    let vm = apple_vm::get(&state, &workspace)?
+                        .context("diff requires a forkfs-backed workspace")?;
+                    let result =
+                        apple_vm::diff(&state, &vm, &before, &after, &after_path, limit).await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    Ok(0)
+                }
+                Workspace::Fork {
+                    workspace,
+                    revision,
+                    branch,
+                } => {
+                    let vm = apple_vm::get(&state, &workspace)?
+                        .context("fork requires a forkfs-backed workspace")?;
+                    let result = apple_vm::fork(&state, &vm, &revision, &branch).await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
                     Ok(0)
                 }
                 Workspace::Import { workspace, source } => {

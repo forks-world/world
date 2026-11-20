@@ -103,6 +103,8 @@ def main():
         workspace('reject-wrong-repository', 'setup', exit_code=125,
                   diagnostic='forkfs repository identity mismatch')
         execute('reject-before-mount', 'true', exit_code=125, diagnostic='workspace is not ready')
+        workspace('reject-diff-on-wrong-repository', 'diff', 'base', 'base',
+                  exit_code=125, diagnostic='forkfs repository identity mismatch')
         rpc(endpoint, 'fs-write', '/wrong-store', b'lease released', '--world', 'work')
         stop_daemon()
         start_daemon(store)
@@ -125,6 +127,7 @@ def main():
         worker = json.loads(service(
             'service-start', 'start', '--', 'python3', '-c',
             'import os,time; from pathlib import Path; assert os.getuid()==1000; '
+            'Path("baseline.txt").write_text("updated in service"); '
             'Path("retained.txt").write_text("from service"); time.sleep(120)',
         ))
         assert worker['state'] == 'running'
@@ -135,7 +138,46 @@ def main():
                 '    if p.exists() and p.read_text()=="from service": break\n'
                 '    time.sleep(.1)\n'
                 'else: raise AssertionError("service write not visible")')
+        workspace('reject-checkpoint-with-active-service', 'checkpoint', 'saved',
+                  exit_code=125, diagnostic='checkpoint requires a stopped workspace')
+        assert 'saved' not in rpc(endpoint, 'fs-revisions').decode().splitlines()
+        workspace('fork-baseline', 'fork', 'base', 'sibling')
+        assert rpc(endpoint, 'fs-cat', '/baseline.txt', '--world', 'sibling') == b'forkfs baseline'
+        assert b'retained.txt' not in rpc(endpoint, 'fs-ls', '/', '--world', 'sibling').splitlines()
         workspace('drain-unmount-and-stop', 'teardown')
+
+        external = json.loads(rpc(endpoint, 'session-open', '15000'))['session']
+        try:
+            rpc(endpoint, 'fs-open', '/baseline.txt', 'rw', '--world', 'work', '--session', external)
+            workspace('reject-checkpoint-with-external-handle', 'checkpoint', 'saved',
+                      exit_code=125, diagnostic='checkpoint requires an exclusive forkfs lease')
+        finally:
+            rpc(endpoint, 'session-close', external)
+        checkpoint = json.loads(workspace('checkpoint-stopped-workspace', 'checkpoint', 'saved'))
+        workspace('reject-duplicate-checkpoint', 'checkpoint', 'saved',
+                  exit_code=125, diagnostic='revision name already exists')
+        changes, cursor = [], ''
+        while True:
+            page = json.loads(workspace('diff-page', 'diff', 'base', 'saved',
+                                        '--limit', '1', '--after-path', cursor))
+            assert page['after_revision_id'] == checkpoint['revision_id']
+            assert len(page['changes']) <= 1
+            changes.extend(page['changes'])
+            if page['eof']:
+                assert not page['next_after']
+                break
+            assert page['next_after'] > cursor
+            cursor = page['next_after']
+        assert {change['path']: change['change'] for change in changes if change['path'] != '/'} == {
+            '/baseline.txt': 'modified', '/retained.txt': 'added',
+        }
+        assert next(change for change in changes if change['path'] == '/baseline.txt')['content_changed']
+        workspace('fork-checkpoint', 'fork', 'saved', 'saved-copy')
+        assert rpc(endpoint, 'fs-cat', '/baseline.txt', '--world', 'saved-copy') == b'updated in service'
+        assert rpc(endpoint, 'fs-cat', '/retained.txt', '--world', 'saved-copy') == b'from service'
+        workspace('reject-duplicate-branch', 'fork', 'base', 'saved-copy',
+                  exit_code=125, diagnostic='World already exists')
+        assert rpc(endpoint, 'fs-cat', '/retained.txt', '--world', 'saved-copy') == b'from service'
         assert rpc(endpoint, 'fs-cat', '/retained.txt', '--world', 'work') == b'from service'
         rpc(endpoint, 'fs-write', '/after-unmount', b'lease released', '--world', 'work')
         record('foreign-write-after-unmount')

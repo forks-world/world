@@ -44,17 +44,21 @@ impl Binding {
             self.repository.len() == 32 && self.repository.bytes().all(|b| b.is_ascii_hexdigit()),
             "invalid forkfs repository ID"
         );
-        ensure!(
-            (1..=64).contains(&self.branch.len())
-                && self
-                    .branch
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-                && !matches!(self.branch.as_str(), "." | ".."),
-            "invalid forkfs branch name"
-        );
+        validate_name(&self.branch, "branch")?;
         Ok(())
     }
+}
+
+fn validate_name(name: &str, kind: &str) -> Result<()> {
+    ensure!(
+        (1..=64).contains(&name.len())
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            && !matches!(name, "." | ".."),
+        "invalid forkfs {kind} name"
+    );
+    Ok(())
 }
 
 struct Rpc<'a> {
@@ -84,6 +88,57 @@ impl<'a> Rpc<'a> {
             socket,
             identity: identity(socket)?,
         })
+    }
+
+    async fn bound(binding: &'a Binding) -> Result<Self> {
+        let rpc = Self::new(&binding.socket)?;
+        let status: serde_json::Value = serde_json::from_slice(&rpc.required(&[b"status"]).await?)?;
+        ensure!(
+            status["repository_id"].as_str() == Some(&binding.repository),
+            "forkfs repository identity mismatch"
+        );
+        Ok(rpc)
+    }
+
+    async fn open_session(&self) -> Result<String> {
+        let response: serde_json::Value = serde_json::from_slice(
+            &self
+                .required(&[b"session-open", LEASE_MS.as_bytes()])
+                .await?,
+        )?;
+        Ok(response["session"]
+            .as_str()
+            .context("forkfs session missing")?
+            .to_owned())
+    }
+
+    async fn mount_root(&self, binding: &Binding, session: &str) -> Result<serde_json::Value> {
+        let view: serde_json::Value = serde_json::from_slice(
+            &self
+                .required(&[
+                    b"inode-root",
+                    b"--world",
+                    binding.branch.as_bytes(),
+                    b"--session",
+                    session.as_bytes(),
+                ])
+                .await?,
+        )?;
+        ensure!(
+            view["repository"].as_str() == Some(&binding.repository),
+            "forkfs repository identity mismatch"
+        );
+        ensure!(
+            view["inode"]["directory"] == true,
+            "forkfs mount root must be a directory"
+        );
+        Ok(view["inode"].clone())
+    }
+
+    async fn close_session(&self, session: &str) -> Result<()> {
+        self.required(&[b"session-close", session.as_bytes()])
+            .await?;
+        Ok(())
     }
 
     async fn call(&self, fields: &[&[u8]]) -> Result<std::result::Result<Vec<u8>, Rejection>> {
@@ -129,14 +184,96 @@ impl<'a> Rpc<'a> {
     }
 
     async fn required(&self, fields: &[&[u8]]) -> Result<Vec<u8>> {
-        self.call(fields).await?.map_err(|error| {
-            anyhow::anyhow!(
-                "forkfs {} failed: {}",
-                String::from_utf8_lossy(fields[0]),
-                String::from_utf8_lossy(&error.detail),
-            )
-        })
+        let operation = String::from_utf8_lossy(fields[0]);
+        self.call(fields)
+            .await
+            .with_context(|| format!("could not confirm forkfs {operation}"))?
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "forkfs {operation} failed: {}",
+                    String::from_utf8_lossy(&error.detail),
+                )
+            })
     }
+}
+
+pub(crate) async fn checkpoint(binding: &Binding, name: &str) -> Result<serde_json::Value> {
+    validate_name(name, "checkpoint")?;
+    let rpc = Rpc::bound(binding).await?;
+    let session = rpc.open_session().await?;
+    let result = async {
+        rpc.mount_root(binding, &session)
+            .await
+            .context("checkpoint requires an exclusive forkfs lease with no open file handles")?;
+        let response = rpc
+            .required(&[
+                b"fs-snapshot",
+                name.as_bytes(),
+                b"--world",
+                binding.branch.as_bytes(),
+                b"--session",
+                session.as_bytes(),
+            ])
+            .await?;
+        let reply: serde_json::Value = serde_json::from_slice(&response)?;
+        let revision_id = reply["revision_id"]
+            .as_str()
+            .context("forkfs checkpoint revision missing")?;
+        Ok::<_, anyhow::Error>(serde_json::json!({
+            "checkpoint": name, "revision_id": revision_id, "branch": binding.branch,
+        }))
+    }
+    .await;
+    let closed = rpc.close_session(&session).await;
+    let result = result?;
+    closed.with_context(|| {
+        format!("checkpoint {name} committed, but forkfs lease release was not confirmed")
+    })?;
+    Ok(result)
+}
+
+pub(crate) async fn diff(
+    binding: &Binding,
+    before: &str,
+    after: &str,
+    cursor: &str,
+    limit: u8,
+) -> Result<serde_json::Value> {
+    validate_name(before, "before revision")?;
+    validate_name(after, "after revision")?;
+    ensure!((1..=64).contains(&limit), "diff page size must be 1..64");
+    ensure!(
+        cursor.is_empty()
+            || (cursor.starts_with('/') && cursor.len() <= 4096 && !cursor.contains('\0')),
+        "diff cursor must be an absolute forkfs path"
+    );
+    let rpc = Rpc::bound(binding).await?;
+    let reply = rpc
+        .required(&[
+            b"fs-diff",
+            before.as_bytes(),
+            after.as_bytes(),
+            cursor.as_bytes(),
+            limit.to_string().as_bytes(),
+        ])
+        .await?;
+    Ok(serde_json::from_slice(&reply)?)
+}
+
+pub(crate) async fn fork(
+    binding: &Binding,
+    revision: &str,
+    branch: &str,
+) -> Result<serde_json::Value> {
+    validate_name(revision, "revision")?;
+    validate_name(branch, "branch")?;
+    ensure!(branch != "main", "main is reserved");
+    let rpc = Rpc::bound(binding).await?;
+    rpc.required(&[b"fs-fork", revision.as_bytes(), branch.as_bytes()])
+        .await?;
+    Ok(serde_json::json!({
+        "branch": branch, "from": revision, "repository": binding.repository,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -362,50 +499,22 @@ pub(crate) async fn worker(
     let lock = worker_file(state, instance)?;
     lock.try_lock_exclusive()
         .context("a forkfs mount worker is already active")?;
-    let rpc = Rpc::new(&binding.socket)?;
-    let session: serde_json::Value = serde_json::from_slice(
-        &rpc.required(&[b"session-open", LEASE_MS.as_bytes()])
-            .await?,
-    )?;
+    let rpc = Rpc::bound(binding).await?;
+    let session = rpc.open_session().await?;
     let mut bridge = Bridge {
         rpc,
         binding,
-        session: session["session"]
-            .as_str()
-            .context("forkfs session missing")?
-            .into(),
+        session,
         healthy: true,
     };
     let result = async {
-        let view: serde_json::Value = serde_json::from_slice(
-            &bridge
-                .rpc
-                .required(&[
-                    b"inode-root",
-                    b"--world",
-                    binding.branch.as_bytes(),
-                    b"--session",
-                    bridge.session.as_bytes(),
-                ])
-                .await?,
-        )?;
-        ensure!(
-            view["repository"].as_str() == Some(&binding.repository),
-            "forkfs repository identity mismatch"
-        );
-        ensure!(
-            view["inode"]["directory"] == true,
-            "forkfs mount root must be a directory"
-        );
-        let root = serde_json::to_vec(&view["inode"])?;
+        let root = bridge.rpc.mount_root(binding, &bridge.session).await?;
+        let root = serde_json::to_vec(&root)?;
         let child = guest.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
         bridge.serve(child, &root, cancel).await
     }
     .await;
-    let closed = bridge
-        .rpc
-        .required(&[b"session-close", bridge.session.as_bytes()])
-        .await;
+    let closed = bridge.rpc.close_session(&bridge.session).await;
     result?;
     if bridge.healthy {
         closed?;

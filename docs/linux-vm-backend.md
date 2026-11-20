@@ -359,3 +359,27 @@ python3 experiments/macos/world_vm_forkfs_smoke.py /path/to/forkfsd
 ```
 
 2026-11-20 真机回归覆盖错误仓库 ID、空闲超过租约时限、exec 与服务共享文件、卸载后恢复其他写入、VM 重建和导出、存储失联时拒绝新任务，以及原 daemon 恢复后的重新挂载。下一阶段接入 World 的 checkpoint 协调停写、差异查询及 merge/discard 命令。
+
+### 阶段 3 文件级 fork、checkpoint 与 diff
+
+```sh
+world workspace teardown dev
+world workspace checkpoint dev before
+world workspace fork dev before feature-a
+world workspace fork dev before feature-b
+```
+
+`checkpoint` 要求 VM 已停止，或由 provider 确认实例不存在。World 持有 workspace 排他操作锁，同时向 forkfsd 取得该分支的独占租约。其他客户端仍挂载该分支或持有文件句柄时，checkpoint 会失败。成功返回 checkpoint 名称、revision ID 和分支名。
+
+`fork` 从同仓库的命名 checkpoint 创建新的可写存储分支。新分支可在创建新 workspace 时通过 `--forkfs-branch` 显式绑定，VM 资源也在创建时配置。同名分支和 checkpoint 都由 forkfsd 拒绝覆盖。
+
+完成修改并停掉对应 workspace 后，可以创建第二个 checkpoint，再比较两份不可变 revision。比较使用仓库范围内的 checkpoint 名称，返回 JSON 文件级变更和 revision ID。`eof` 为 false 时，把本页的 `next_after` 作为下一页的 `--after-path`，保持同一对 checkpoint。
+
+```sh
+world workspace checkpoint dev after
+world workspace diff dev before after --limit 32
+```
+
+Apple Silicon 验收复用 `world_vm_forkfs_smoke.py`，覆盖服务写入后创建 checkpoint、外部文件句柄阻止 checkpoint、分页读出修改文件与新增文件、从不同 checkpoint fork 得到相应内容，以及同名重试保留已有分支。
+
+阶段 3 的 merge 仍需 forkfs 提供单次原子发布，在应用三方合并结果时验证目标 head 并返回冲突。discard 仍需在线分支删除接口，在同一事务中验证预期分支 head、确认无挂载或文件句柄，再移除分支引用并保留命名 revision。当前上游的分支删除要求 forkfsd 停机并独占整个仓库。[forkfs 离线保留操作](https://github.com/forks-world/forkfs/blob/04cb8b020cd0982b6b00e5d24c8dd69ded9eac66/daemon/README.md#offline-retention)

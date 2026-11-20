@@ -1097,6 +1097,58 @@ pub async fn delete(state: &Path, vm: &Vm, discard_runtime_data: bool) -> Result
     Ok(())
 }
 
+pub async fn checkpoint(state: &Path, vm: &Vm, name: &str) -> Result<serde_json::Value> {
+    let _lock = operation_lock(state, vm, false)?;
+    check_registered(state, vm)?;
+    let binding = vm
+        .forkfs
+        .as_ref()
+        .context("checkpoint requires a forkfs-backed workspace")?;
+    check_provider().await?;
+    if let Some(instance) = inspect(vm).await? {
+        ensure!(
+            matches!(
+                instance["status"]["state"].as_str(),
+                Some("stopped" | "created")
+            ),
+            "checkpoint requires a stopped workspace; run workspace teardown first"
+        );
+    }
+    forkfs_mount::checkpoint(binding, name).await
+}
+
+pub async fn diff(
+    state: &Path,
+    vm: &Vm,
+    before: &str,
+    after: &str,
+    cursor: &str,
+    limit: u8,
+) -> Result<serde_json::Value> {
+    let _lock = operation_lock(state, vm, true)?;
+    check_registered(state, vm)?;
+    let binding = vm
+        .forkfs
+        .as_ref()
+        .context("diff requires a forkfs-backed workspace")?;
+    forkfs_mount::diff(binding, before, after, cursor, limit).await
+}
+
+pub async fn fork(
+    state: &Path,
+    vm: &Vm,
+    revision: &str,
+    branch: &str,
+) -> Result<serde_json::Value> {
+    let _lock = operation_lock(state, vm, true)?;
+    check_registered(state, vm)?;
+    let binding = vm
+        .forkfs
+        .as_ref()
+        .context("fork requires a forkfs-backed workspace")?;
+    forkfs_mount::fork(binding, revision, branch).await
+}
+
 pub async fn exec(
     state: &Path,
     vm: &Vm,
