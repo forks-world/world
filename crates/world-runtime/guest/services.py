@@ -19,6 +19,10 @@ MESSAGE_LIMIT = 128 * 1024
 def service_client(boot_id, args):
     payload = json.loads(args[0])
     payload['boot_id'] = boot_id
+    print(json.dumps(service_query(payload)))
+
+
+def service_query(payload):
     request = json.dumps(payload).encode() + b'\n'
     if len(request) > MESSAGE_LIMIT:
         raise ValueError('service request exceeds size limit')
@@ -32,7 +36,7 @@ def service_client(boot_id, args):
     result = json.loads(response)
     if 'error' in result:
         raise RuntimeError(result['error'])
-    print(json.dumps(result['result']))
+    return result['result']
 
 
 def service_daemon(boot_id):
@@ -220,22 +224,27 @@ class Services:
             path.unlink(missing_ok=True)
             path.with_suffix(f'.{stream}.old').unlink(missing_ok=True)
 
-    def operation(self, req):
-        operation_id = req.get('operation_id')
+    @staticmethod
+    def operation_timestamp(operation_id, now):
         match = OPERATION_ID.fullmatch(operation_id or '')
         if not match:
             raise ValueError('invalid service operation ID')
         issued_at = int(match[1])
-        now = int(time.time())
         if issued_at < now - OPERATION_TTL or issued_at > now + 60:
             raise ValueError('service operation ID expired or clock is out of sync')
+        return issued_at
+
+    def operation(self, req):
+        operation_id = req.get('operation_id')
+        now = int(time.time())
+        issued_at = self.operation_timestamp(operation_id, now)
         previous = self.operations.get(operation_id)
         if req['action'] == 'operation':
             if previous is None:
                 raise ValueError('unknown service operation')
             return self.operation_result(operation_id, previous)
         digest = hashlib.sha256(json.dumps(
-            {key: value for key, value in req.items() if key != 'boot_id'},
+            {key: value for key, value in req.items() if key not in ('boot_id', 'retain_run_id')},
             sort_keys=True,
         ).encode()).hexdigest()
         if previous is not None:
@@ -290,6 +299,12 @@ class Services:
 
     def dispatch_action(self, req):
         action = req['action']
+        if action == 'publication-capabilities':
+            return {'port_protocol': 1}
+        if action == 'operation-known':
+            # Host uses this while serializing service writes and publication changes.
+            self.operation_timestamp(req['operation_id'], int(time.time()))
+            return {'known': req['operation_id'] in self.operations}
         if action == 'list':
             return [self.public(record) for record in self.records.values()]
         if action == 'activate':
@@ -304,6 +319,11 @@ class Services:
         if not SERVICE_NAME.fullmatch(name):
             raise ValueError('invalid service name')
         if action == 'start':
+            expected = req.get('retain_run_id')
+            if expected is not None and (
+                name not in self.live or self.records[name]['run_id'] != expected
+            ):
+                raise ValueError('published run ended; inspect the service and retry with a new operation ID')
             return self.start(name, req['argv'])
         record = self.records.get(name)
         if record is None:

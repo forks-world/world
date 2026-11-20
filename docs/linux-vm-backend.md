@@ -19,8 +19,8 @@
 | --- | --- |
 | 网络安全策略 | provider NAT，**尚不阻止宿主/LAN/跨 guest 出站**；show 明确返回能力 false；不支持严格出口策略 |
 | 运行预算 | 每用户 setup 准入锁；除已运行的本 World 外，发现其他运行 container 即拒绝启动；不统计其他供应商 VM/machine，也未实现基于内存压力的准入 |
-| 数据与镜像 | guest 普通可写层，无宿主挂载；固定基础镜像加 root-owned helper；支持独立 import 命令；无 export、创建时 --import、自定义镜像、WorldFS、分支合并 |
-| 服务 | Linux VM 已支持命名服务、独立 cgroup、状态和有界日志，宿主 TCP 发布待实现。普通 exec 结束仍会清理后台子进程 |
+| 数据与镜像 | guest 普通可写层，无宿主挂载；固定基础镜像加 root-owned helper；支持独立 import 和 export 命令；无创建时 --import、自定义镜像、WorldFS、分支合并 |
+| 服务 | Linux VM 已支持命名服务、独立 cgroup、状态和有界日志，支持宿主 IPv4 loopback TCP 发布。普通 exec 结束仍会清理后台子进程 |
 | 生命周期 | setup/teardown 与 exec 用文件锁互斥；teardown 遇活跃执行返回 busy，不能自动批量取消；已落盘阶段和启动 generation；尚无完整 Execution 恢复日志 |
 | 协议 | 固定 helper 命令与独立 JSON 状态查询；不是完整 RPC/PTY/输出持久化协议；guest 控制进程故障后状态可能未知，需检查或停机 |
 | 安全级别 | 实验性 VM 执行边界，不是设计中的受管安全后端；未交付的出口策略不会被描述为有效 |
@@ -32,6 +32,16 @@
 宿主本地用户仍能直接用 container 管理自己的 VM，这属于受信任宿主权限范围。旧记录不做全库 schema 转换；完整注册表/host identity/运行代际迁移后续再实现。OS 不匹配、provider 不可用或版本不兼容时拒绝 exec，不回退到宿主。
 
 实际命令见 [README](../README.md#macos-上运行-linux-world实验性)。真实单 VM 回归用 `python3 experiments/macos/world_vm_smoke.py`：先 `cargo build --workspace` 并启动 container 服务；脚本以 512 MiB 工作负载限额启动一个 VM，在临时目录记录结果，退出时停止并删除自己的实例，保留服务与镜像缓存。覆盖同名冲突、执行前置状态、stdin/argv、非零状态、后代回收、超时/取消、共享 localhost、独立任务取消、busy teardown、导入及重启持久化；导入覆盖跨块二进制内容、执行权限、相对与悬空链接、截断流、路径越界、symlink 父目录、特殊文件和覆盖拒绝。该测试只启动一个 VM，不声称完成跨 VM 网络策略验收。
+
+### 导出项目文件
+
+```sh
+world workspace export dev --destination ./results
+```
+
+导出从已就绪 VM 的 `/workspace` 读取文件。目标目录必须尚不存在，父目录必须已存在。活跃的 `world exec` 或命名服务会让导出失败。导出期间 World 持有 Workspace 独占锁，直接通过 provider 启动的写入者也需要先停写。这是文件级复制，源变化检测为尽力检查。
+
+导出包含隐藏文件、空目录、普通权限和符号链接。它不跟随符号链接，拒绝特殊文件与非 UTF-8 名称，且不保留扩展属性、ACL、时间戳和硬链接关系。宿主验证完整文件流与 guest 退出状态后，才将暂存目录原子发布到目标。已存在的目录、文件或符号链接会保留原样，取消或校验失败不发布半成品。
 
 ### 实验性 guest 服务
 
@@ -45,7 +55,19 @@ world service stop dev web
 world service remove dev web
 ```
 
-服务使用 UID 1000 和独立 cgroup，工作目录为 `/workspace`，在发起命令退出后继续运行。日志查询返回所选流最新 64 KiB 的 base64，旧日志有大小上限。停止和 teardown 清理整个服务 cgroup。VM 再次启动时保留服务定义，不自动启动服务。写操作在发送前打印 operation ID，`world service operation dev <id>` 可查询 24 小时内的结果，`--request-id <id>` 可重试同一请求。宿主浏览器端口发布、日志 follow 和优雅停止待实现。
+服务使用 UID 1000 和独立 cgroup，工作目录为 `/workspace`，在发起命令退出后继续运行。日志查询返回所选流最新 64 KiB 的 base64，旧日志有大小上限。停止和 teardown 清理整个服务 cgroup。VM 再次启动时保留服务定义，不自动启动服务。写操作在发送前打印 operation ID，`world service operation dev <id>` 可查询 24 小时内的结果，`--request-id <id>` 可重试同一请求。日志 follow 和优雅停止待实现。
+
+### 发布 TCP 端口
+
+```sh
+world service publish dev web --name browser --host-port 13000 --target-port 3000
+world service ports dev web
+world service unpublish dev web --name browser
+```
+
+发布后可从 Mac 访问 `http://127.0.0.1:13000`。guest 服务可以继续只监听 `127.0.0.1:3000`。当前每个 World 支持一个发布，宿主端口为 1024～65535，只支持 IPv4 loopback TCP。端口被占用时命令失败。发布成功表示转发通道可用，应用就绪仍由应用决定。从旧版本升级时，运行中的监督器可能尚未更新。若提示监督器缺少发布能力，先停机再执行 setup。
+
+一个宿主 broker 和一条 guest 通道最多复用八个活跃连接，每条连接每方向最多有一块 8 KiB 的应用数据等待确认。撤销和停机会关闭监听与连接。发布绑定当前服务 run，服务改变或通道断开后需显式重新发布。broker 退出时释放监听端口，发布配置不跨 broker 重启恢复。
 
 ## 已实现的生命周期管理
 
@@ -217,8 +239,8 @@ fork 复制文件 revision、执行 OS、镜像和资源配置到新身份，不
 
 ```sh
 world service start dev web -- python3 -m http.server 8080 --bind 127.0.0.1
-world service publish dev web --host 127.0.0.1 --port 18080 --target-port 8080
-world service unpublish dev web
+world service publish dev web --name browser --host-port 18080 --target-port 8080
+world service unpublish dev web --name browser
 ```
 
 宿主 broker 监听明确的 loopback 端口，绑定 World ID 与 generation，经受限 guest 转发入口连接 guest localhost。不能只依赖 `container -p` 转发到 guest 网卡，因为仅监听 guest loopback 的服务未必可达。首版发布仅承诺 TCP，UDP 与 Unix socket 发布待单独适配；guest 内协议能力单独报告。
@@ -260,3 +282,20 @@ setup 先检查架构、系统/API 能力、provider 版本与服务、镜像/�
 [通道探针](../experiments/macos/vm_channel_probe.py)与 smoke 共用一次性 VM。1.7.1 上 detached exec 在启动 CLI 退出后仍可通过 guest loopback 访问。无 TTY 的交互通道完整往返 8 MiB 二进制数据，且在宿主关闭 stdin 后仍能读取 guest TCP 半关闭触发的应答。暂停读取宿主 stdout 时，探针发送了全部 8 MiB，未观察到写端停顿。阶段 2 的转发需独立做发送额度和队列限制，不能依赖 provider 在这个预算内产生背压。
 
 真实宿主重启仍待验收。本次用 provider 直接停止并重新启动实例复现了 guest boot ID 变化。资源记录仍以第 2 节已有探针为基线，本轮 smoke 未重测宿主物理内存或真实项目构建开销。
+
+### 阶段 2 开发预览验收
+
+在 Apple Silicon Mac 上先构建 CLI 并启动 Apple container 服务，再运行：
+
+```sh
+cargo build --workspace --locked
+python3 experiments/macos/world_vm_dev_preview.py
+```
+
+脚本使用 Flask 3.1.2 的官方示例 Flaskr 和 OpenCode 1.18.35。宿主需要 Git、Python 及 pip，以及对 GitHub、PyPI、npm 和 Alpine 包仓库的访问。脚本在宿主准备 Linux wheel 和 OpenCode 安装包，在一次性 guest 内安装依赖，并用 Alpine 签名包补齐 OpenCode 所需的运行库。所有项目命令与 Agent 都以 UID 1000 运行。默认使用 1 GiB 工作负载限额。
+
+验收覆盖导入、安装、24 项 Flaskr 测试、Agent 在 `/workspace` 读取及修改模板并再次跑测试、发布 Flaskr、从 Mac 读取包含修改的页面、停止服务和导出。脚本检查 guest 的修改出现在导出目录，宿主导入源中的模板仍保持原样。每步日志保存在脚本输出的 Evidence 目录，仅清理本次创建的 VM。
+
+OpenCode 使用 guest loopback 上的 [脚本化模型替身](../experiments/macos/preview_model.py)。实际执行的是 OpenCode 的文件与命令工具，验收无需模型账户或凭据。开发预览使用宿主下载、guest 安装的路径。直接在 guest 从公有仓库安装的稳定性与外部模型接入另行验证。
+
+2026-11-19 实测通过。环境为 macOS 27.2 (26B123)、Apple container 1.7.1、Apple Silicon 和 1 GiB guest 工作负载限额。OpenCode 的 `read`、`edit`、`bash` 三项工具均完成，命令工具输出 `/workspace` 和 `24 passed`。宿主 HTTP 响应和导出文件均包含改后的标题。此前从 guest 直接下载依赖能访问仓库并下载多个 wheel，但在 180 秒内未完成安装。
