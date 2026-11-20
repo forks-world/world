@@ -382,8 +382,6 @@ world workspace diff dev before after --limit 32
 
 Apple Silicon 验收复用 `world_vm_forkfs_smoke.py`，覆盖服务写入后创建 checkpoint、外部文件句柄阻止 checkpoint、分页读出修改文件与新增文件、从不同 checkpoint fork 得到相应内容，以及同名重试保留已有分支。
 
-阶段 3 的 merge 仍需 forkfs 提供单次原子发布，在应用三方合并结果时验证目标 head 并返回冲突。
-
 ### 阶段 3 在线 discard
 
 ```sh
@@ -400,5 +398,24 @@ world workspace discard dev --expect-token "$token"
 
 ```sh
 python3 experiments/macos/world_vm_forkfs_smoke.py /path/to/forkfsd \
+  --forkfsd-fault /path/to/forkfsd_leveldb_fault_test
+```
+
+### 阶段 3 三方文件合并
+
+```sh
+world workspace teardown target
+world workspace merge target base source-checkpoint
+world workspace merge target base source-checkpoint --expect-token "$token"
+```
+
+合并使用目标分支当前提交状态、共同基线和来源 checkpoint。基线必须位于目标分支与来源 checkpoint 的历史中。预览返回 `ready`、`conflict` 或 `unchanged`。仅在目标 VM 停止、且目标分支没有挂载、文件句柄或目录游标时才能确认发布。令牌覆盖仓库序号和目标 head，有任何提交后需要重新预览。
+
+不同文件的改动可以合并。同一 inode 的内容、元数据与扩展属性作为一个整体比较，竞争改动报告冲突。目录项有独立的冲突检查，发布前还会校验完整的目录结构和链接计数。forkfs 将结果及所需元数据在一次同步事务中发布。合并超出单批容量或准备时限会失败。发布后可以为目标创建新的 checkpoint，来源 checkpoint 仍可查询。
+
+Apple Silicon 端到端验收使用两台先后运行的 VM 从同一基线修改分支，确认合并后重新挂载的目标同时可见两边改动，并验证过期预览和活跃目标会被拒绝。随后丢弃来源分支，保留来源 checkpoint 和已合并的目标。
+
+```sh
+python3 experiments/macos/world_vm_forkfs_smoke.py /path/to/forkfsd --merge \
   --forkfsd-fault /path/to/forkfsd_leveldb_fault_test
 ```

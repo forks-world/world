@@ -276,6 +276,55 @@ pub(crate) async fn fork(
     }))
 }
 
+pub(crate) async fn merge(
+    binding: &Binding,
+    base: &str,
+    source: &str,
+    expected: Option<&str>,
+) -> Result<serde_json::Value> {
+    validate_name(base, "merge base")?;
+    validate_name(source, "merge source")?;
+    let rpc = Rpc::bound(binding).await?;
+    let operation: &[u8] = if expected.is_some() {
+        b"fs-merge"
+    } else {
+        b"fs-merge-plan"
+    };
+    let mut fields = vec![
+        operation,
+        binding.branch.as_bytes(),
+        base.as_bytes(),
+        source.as_bytes(),
+    ];
+    if let Some(token) = expected {
+        validate_confirmation_token(token, "merge")?;
+        fields.push(token.as_bytes());
+    }
+    let reply = rpc.required(&fields).await?;
+    let result: serde_json::Value = serde_json::from_slice(&reply)?;
+    let state = result["state"].as_str();
+    ensure!(
+        result["world"].as_str() == Some(&binding.branch)
+            && match expected {
+                Some(_) => matches!(state, Some("merged" | "unchanged" | "conflict")),
+                None => matches!(state, Some("ready" | "unchanged" | "conflict")),
+            },
+        "invalid forkfs merge reply"
+    );
+    Ok(result)
+}
+
+fn validate_confirmation_token(token: &str, operation: &str) -> Result<()> {
+    ensure!(
+        token.len() == 64
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "invalid forkfs {operation} token"
+    );
+    Ok(())
+}
+
 async fn read_discard_plan(rpc: &Rpc<'_>, branch: &str) -> Result<serde_json::Value> {
     let reply = rpc
         .required(&[b"fs-discard-plan", branch.as_bytes()])
@@ -307,13 +356,7 @@ pub(crate) enum DiscardOutcome {
 
 impl<'a> DiscardRequest<'a> {
     pub(crate) async fn prepare(binding: &'a Binding, token: &'a str, retry: bool) -> Result<Self> {
-        ensure!(
-            token.len() == 64
-                && token
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-            "invalid forkfs discard token"
-        );
+        validate_confirmation_token(token, "discard")?;
         let rpc = Rpc::bound(binding).await?;
         if !retry {
             let plan = read_discard_plan(&rpc, &binding.branch).await?;

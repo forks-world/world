@@ -192,6 +192,15 @@ enum Workspace {
         revision: String,
         branch: String,
     },
+    /// Preview a three-way merge, or apply it to a stopped forkfs workspace.
+    Merge {
+        workspace: String,
+        base: String,
+        source: String,
+        /// Apply the exact target and checkpoints identified by this token.
+        #[arg(long)]
+        expect_token: Option<String>,
+    },
     /// Preview a forkfs branch discard, or confirm it with the preview token.
     Discard {
         workspace: String,
@@ -447,6 +456,22 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                     let result = apple_vm::fork(&state, &vm, &revision, &branch).await?;
                     println!("{}", serde_json::to_string_pretty(&result)?);
                     Ok(0)
+                }
+                Workspace::Merge {
+                    workspace,
+                    base,
+                    source,
+                    expect_token,
+                } => {
+                    let vm = apple_vm::get(&state, &workspace)?
+                        .context("merge requires a forkfs-backed workspace")?;
+                    let result =
+                        apple_vm::merge(&state, &vm, &base, &source, expect_token.as_deref())
+                            .await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    Ok(i32::from(
+                        expect_token.is_some() && result["state"] == "conflict",
+                    ))
                 }
                 Workspace::Discard {
                     workspace,

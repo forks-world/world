@@ -16,6 +16,7 @@ from forkfs_guest_mount_probe import RpcError, rpc, run
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('forkfsd', type=Path)
+    parser.add_argument('--merge', action='store_true', help='exercise three-way merge in a second VM')
     parser.add_argument('--forkfsd-fault', type=Path, help='test online discard recovery with crash injection')
     parser.add_argument('--world', type=Path, default=Path('target/debug/world'))
     args = parser.parse_args()
@@ -222,6 +223,38 @@ def main():
         assert rpc(endpoint, 'fs-cat', '/retained.txt', '--world', 'work') == b'from service'
         record('deleting-runtime-preserves-forkfs-branch')
 
+        if args.merge:
+            name = 'merge-test'
+            vm = json.loads(workspace(
+                'bind-merge-target', 'create', '--os', 'linux', '--forkfs-socket', str(endpoint),
+                '--forkfs-repository', repository, '--forkfs-branch', 'sibling',
+            ))
+            workspace('start-merge-target', 'setup')
+            execute('edit-merge-target', 'python3', '-c',
+                    'from pathlib import Path; Path("target-only.txt").write_text("from sibling")')
+            plan = json.loads(workspace('preview-merge-running', 'merge', 'base', 'saved'))
+            assert plan['state'] == 'ready'
+            workspace('reject-merge-running', 'merge', 'base', 'saved', '--expect-token', plan['token'],
+                      exit_code=125, diagnostic='merge requires a stopped workspace')
+            workspace('stop-merge-target', 'teardown')
+            plan = json.loads(workspace('preview-merge', 'merge', 'base', 'saved'))
+            rpc(endpoint, 'fs-write', '/late-target.txt', b'after preview', '--world', 'sibling')
+            workspace('reject-stale-merge', 'merge', 'base', 'saved', '--expect-token', plan['token'],
+                      exit_code=125, diagnostic='merge plan is stale')
+            plan = json.loads(workspace('refresh-merge-preview', 'merge', 'base', 'saved'))
+            result = json.loads(workspace('apply-three-way-merge', 'merge', 'base', 'saved',
+                                          '--expect-token', plan['token']))
+            assert result['state'] == 'merged' and result['manifest_id'] == plan['manifest_id']
+            assert json.loads(workspace('merge-already-applied', 'merge', 'base', 'saved'))['state'] == 'unchanged'
+            workspace('mount-merged-branch', 'setup')
+            assert execute('read-merged-source-edit', 'cat', 'baseline.txt') == 'updated in service'
+            assert execute('read-merged-source-new-file', 'cat', 'retained.txt') == 'from service'
+            assert execute('read-merged-target-file', 'cat', 'target-only.txt') == 'from sibling'
+            assert execute('read-merged-late-target-file', 'cat', 'late-target.txt') == 'after preview'
+            workspace('stop-merged-branch', 'teardown')
+            workspace('delete-merge-runtime', 'delete', '--discard-runtime-data')
+            vm = None
+
         if fault:
             name = 'discard-test'
             workspace('bind-disposable-branch', 'create', '--os', 'linux',
@@ -274,6 +307,17 @@ def main():
             workspace('delete-confirmed-discard-registration', 'delete')
             assert rpc(endpoint, 'fs-cat', '/retained.txt', '--world', 'work') == b'from service'
             record('discard-preserves-named-revision-and-other-branch')
+        if args.merge:
+            name = 'old-source'
+            workspace('bind-source-for-discard', 'create', '--os', 'linux',
+                      '--forkfs-socket', str(endpoint), '--forkfs-repository', repository,
+                      '--forkfs-branch', 'work')
+            plan = json.loads(workspace('preview-source-discard', 'discard'))
+            workspace('discard-merged-source', 'discard', '--expect-token', plan['token'])
+            assert b'work' not in rpc(endpoint, 'fs-worlds').splitlines()
+            assert rpc(endpoint, 'fs-cat', '/retained.txt', '--revision', 'saved') == b'from service'
+            assert rpc(endpoint, 'fs-cat', '/retained.txt', '--world', 'sibling') == b'from service'
+            workspace('delete-source-registration', 'delete')
     finally:
         try:
             if vm is not None:
