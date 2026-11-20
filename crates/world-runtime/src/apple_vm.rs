@@ -1,5 +1,7 @@
 //! Experimental macOS-host / Linux-world backend. A VM is not an egress policy.
 //! Provider metadata is structured JSON; user argv never passes through a shell.
+use crate::forkfs_mount;
+pub use crate::forkfs_mount::Binding as ForkfsBinding;
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -44,6 +46,8 @@ pub struct Vm {
     pub image: String,
     pub cpus: u32,
     pub memory_mib: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forkfs: Option<ForkfsBinding>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -186,6 +190,9 @@ impl Vm {
                 && (256..=4096).contains(&self.memory_mib),
             "unsupported VM configuration"
         );
+        if let Some(binding) = &self.forkfs {
+            binding.validate()?;
+        }
         Ok(())
     }
 }
@@ -199,6 +206,16 @@ pub fn supported() -> Result<()> {
 }
 
 pub fn create(state: &Path, id: &str, cpus: u32, memory_mib: u32) -> Result<Vm> {
+    create_with_storage(state, id, cpus, memory_mib, None)
+}
+
+pub fn create_with_storage(
+    state: &Path,
+    id: &str,
+    cpus: u32,
+    memory_mib: u32,
+    forkfs: Option<ForkfsBinding>,
+) -> Result<Vm> {
     supported()?;
     ensure!(
         !id.is_empty() && id.len() <= 128 && !id.contains(['\0', '\r', '\n']),
@@ -216,6 +233,10 @@ pub fn create(state: &Path, id: &str, cpus: u32, memory_mib: u32) -> Result<Vm> 
                 vm.cpus == cpus && vm.memory_mib == memory_mib,
                 "workspace exists with different resources"
             );
+            ensure!(
+                vm.forkfs == forkfs,
+                "workspace exists with a different storage binding"
+            );
             return Ok(vm.clone());
         }
         bail!("workspace already uses a native backend; create a new workspace to change OS");
@@ -232,6 +253,7 @@ pub fn create(state: &Path, id: &str, cpus: u32, memory_mib: u32) -> Result<Vm> 
         image: IMAGE.into(),
         cpus,
         memory_mib,
+        forkfs,
     };
     vm.validate(id)?;
     // Preserve a pre-VM registry for inspection; never restore it automatically.
@@ -348,6 +370,68 @@ async fn guest(vm: &Vm, args: &[&str]) -> Result<String> {
     output(&argv, Duration::from_secs(15)).await
 }
 
+async fn forkfs_guest(vm: &Vm, boot_id: &str, mode: &str) -> Result<String> {
+    output(
+        &[
+            "exec",
+            "-e",
+            &format!("WORLD_EXPECTED_BOOT_ID={boot_id}"),
+            &vm.instance_id,
+            "python3",
+            "-I",
+            HELPER,
+            mode,
+        ],
+        Duration::from_secs(10),
+    )
+    .await
+}
+
+async fn require_storage(vm: &Vm, boot_id: &str) -> Result<()> {
+    if vm.forkfs.is_some() {
+        let result = forkfs_guest(vm, boot_id, "forkfs-check")
+            .await
+            .context("storage_unavailable: cannot verify forkfs /workspace; run workspace show")?;
+        ensure!(
+            result.trim() == "mounted",
+            "storage_unavailable: invalid forkfs mount response"
+        );
+    }
+    Ok(())
+}
+
+#[doc(hidden)]
+pub async fn forkfs_worker(
+    state: &Path,
+    workspace: &str,
+    boot_id: &str,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let vm = get(state, workspace)?.context("workspace missing for forkfs worker")?;
+    let binding = vm
+        .forkfs
+        .as_ref()
+        .context("workspace has no forkfs binding")?;
+    let mut guest = provider();
+    guest
+        .args([
+            "exec",
+            "-i",
+            "-e",
+            &format!("WORLD_EXPECTED_BOOT_ID={boot_id}"),
+            "-e",
+            &format!("WORLD_FORKFS_SOURCE=world-forkfs-{}", vm.owner),
+            &vm.instance_id,
+            "python3",
+            "-I",
+            "-u",
+            "-c",
+            forkfs_mount::GUEST,
+        ])
+        .stderr(Stdio::inherit());
+    forkfs_mount::worker(state, &vm.instance_id, binding, guest, cancel).await
+}
+
 async fn guest_service(
     vm: &Vm,
     boot_id: &str,
@@ -456,6 +540,7 @@ pub async fn publish(
             .is_some_and(|v| v["status"]["state"] == "running"),
         "workspace is not running"
     );
+    require_storage(vm, &boot_id).await?;
     let probe: serde_json::Value = serde_json::from_str(&guest(vm, &["probe"]).await?)?;
     ensure!(
         probe["port_protocol"] == 1,
@@ -518,6 +603,7 @@ pub async fn port_worker(
         publication.host_port >= 1024 && publication.target_port != 0,
         "invalid publication port"
     );
+    require_storage(&vm, &boot_id).await?;
     let bridge = provider()
         .args([
             "exec",
@@ -560,6 +646,9 @@ pub async fn service(
         .as_str()
         .context("missing service action")?
         .to_owned();
+    if matches!(action.as_str(), "start" | "restart") {
+        require_storage(vm, &boot_id).await?;
+    }
     let writes = matches!(action.as_str(), "start" | "stop" | "restart" | "remove");
     let _publication = writes
         .then(|| publication_operation_lock(state, vm))
@@ -689,7 +778,15 @@ pub async fn show(state: &Path, vm: &Vm) -> Result<serde_json::Value> {
         match value["status"]["state"].as_str() {
             Some("running") if journal.phase == Phase::Ready && journal.boot_id.is_some() => {
                 match guest(vm, &["boot-id"]).await {
-                    Ok(boot_id) if journal.boot_id.as_deref() == Some(boot_id.trim()) => "ready",
+                    Ok(boot_id) if journal.boot_id.as_deref() == Some(boot_id.trim()) => {
+                        match require_storage(vm, boot_id.trim()).await {
+                            Ok(()) => "ready",
+                            Err(cause) => {
+                                error = Some(format!("{cause:#}"));
+                                "storage_unavailable"
+                            }
+                        }
+                    }
                     Ok(_) => "unverified",
                     Err(cause) => {
                         error = Some(format!("cannot verify guest boot: {cause:#}"));
@@ -711,7 +808,7 @@ pub async fn show(state: &Path, vm: &Vm) -> Result<serde_json::Value> {
         .as_secs();
     Ok(
         serde_json::json!({"id":vm.id,"status":status,"lifecycle":journal,"observed_at_unix":observed_at,"configuration":vm,"observed":observed,"observation_error":error,"experimental":true,
-        "capabilities":{"host_directory_mounts":false,"file_import":true,"file_export":true,"egress_filtering":false,"host_lan_blocking":false,"worldfs":false,"pty":false,"parallel_exec":true,"guest_services":true,"host_tcp_publish":true},
+        "capabilities":{"host_directory_mounts":false,"file_import":vm.forkfs.is_none(),"file_export":true,"egress_filtering":false,"host_lan_blocking":false,"worldfs":vm.forkfs.is_some() && status == "ready","pty":false,"parallel_exec":true,"guest_services":true,"host_tcp_publish":true},
         "network_policy":"provider NAT, unrestricted egress; not a hostile-workload sandbox"}),
     )
 }
@@ -763,28 +860,36 @@ pub async fn setup(state: &Path, vm: &Vm, recreate_missing: bool) -> Result<()> 
             let label = format!("world.owner={}", vm.owner);
             // Fixed bootstrap, never interpolated user data. Installed through
             // argv, not stdin (stdin belongs to future workloads).
-            let bootstrap = "import os,pathlib,time; p=pathlib.Path('/opt/world'); p.mkdir(exist_ok=True); (p/'supervisor.py').write_text(__import__('sys').argv[1]); [(pathlib.Path(x).mkdir(parents=True,exist_ok=True),os.chown(x,1000,1000)) for x in ['/workspace','/home/world']]; time.sleep(2147483647)";
-            output(
-                &[
-                    "create",
-                    "--name",
-                    &vm.instance_id,
-                    "--cpus",
-                    &cpus,
-                    "--memory",
-                    &memory,
-                    "--label",
-                    &label,
-                    &vm.image,
-                    "python3",
-                    "-I",
-                    "-c",
-                    bootstrap,
-                    GUEST,
-                ],
-                Duration::from_secs(180),
-            )
-            .await?;
+            let bootstrap = "import os,pathlib,sys,time; p=pathlib.Path('/opt/world'); p.mkdir(exist_ok=True); (p/'supervisor.py').write_text(sys.argv[1]); pathlib.Path('/workspace').mkdir(exist_ok=True); pathlib.Path('/home/world').mkdir(exist_ok=True); os.chown('/home/world',1000,1000); os.chown('/workspace',1000,1000) if not sys.argv[2] else (p/'forkfs-source').write_text(sys.argv[2]); time.sleep(2147483647)";
+            let source = vm
+                .forkfs
+                .as_ref()
+                .map(|_| format!("world-forkfs-{}", vm.owner))
+                .unwrap_or_default();
+            let mut create = vec![
+                "create",
+                "--name",
+                &vm.instance_id,
+                "--cpus",
+                &cpus,
+                "--memory",
+                &memory,
+                "--label",
+                &label,
+            ];
+            if vm.forkfs.is_some() {
+                create.extend(["--cap-add", "SYS_ADMIN"]);
+            }
+            create.extend([
+                vm.image.as_str(),
+                "python3",
+                "-I",
+                "-c",
+                bootstrap,
+                GUEST,
+                &source,
+            ]);
+            output(&create, Duration::from_secs(180)).await?;
         }
         journal.generation = journal
             .generation
@@ -827,14 +932,33 @@ pub async fn setup(state: &Path, vm: &Vm, recreate_missing: bool) -> Result<()> 
                         .checked_add(1)
                         .context("VM generation overflow")?;
                 }
+                if vm.forkfs.is_some() {
+                    let mounted = forkfs_guest(vm, boot_id, "forkfs-mounted").await?;
+                    match mounted.trim() {
+                        "mounted" => (),
+                        "unmounted" => {
+                            ensure!(
+                                journal.phase != Phase::Ready
+                                    || journal.boot_id.as_deref() != Some(boot_id),
+                                "storage_unavailable: forkfs detached during this boot; run workspace teardown before setup"
+                            );
+                            forkfs_mount::wait_worker(state, &vm.instance_id).await?;
+                            forkfs_mount::launch(state, &vm.id, boot_id)
+                                .await
+                                .context("storage_unavailable: forkfs mount setup failed")?;
+                        }
+                        _ => bail!("storage_unavailable: invalid forkfs mount state"),
+                    }
+                    require_storage(vm, boot_id).await.context(
+                        "run workspace teardown before retrying an unhealthy forkfs mount",
+                    )?;
+                }
                 start_service_supervisor(vm, boot_id).await?;
                 guest_service(vm, boot_id, serde_json::json!({"action": "activate"})).await?;
                 journal.boot_id = Some(boot_id.to_owned());
                 journal.phase = Phase::Ready;
                 save_lifecycle(state, vm, &journal)?;
-                eprintln!(
-                    "world: experimental Linux VM ready; no host mounts; NAT egress is unrestricted"
-                );
+                eprintln!("world: experimental Linux VM ready; NAT egress is unrestricted");
                 return Ok(());
             }
             Err(e) => last = Some(e),
@@ -869,11 +993,27 @@ pub async fn teardown(state: &Path, vm: &Vm) -> Result<()> {
                 let boot_id = probe["boot_id"].as_str().context("guest boot ID missing")?;
                 start_service_supervisor(vm, boot_id).await?;
                 guest_service(vm, boot_id, serde_json::json!({"action": "drain"})).await?;
+                return Ok(Some(boot_id.to_owned()));
+            } else {
+                ensure!(
+                    vm.forkfs.is_none(),
+                    "cannot drain forkfs workspace without its supervisor"
+                );
             }
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, anyhow::Error>(None)
         };
         match timeout(Duration::from_secs(15), drain).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(Some(boot_id))) if vm.forkfs.is_some() => {
+                forkfs_guest(vm, &boot_id, "forkfs-unmount")
+                    .await
+                    .context("forkfs teardown could not confirm unmount")?;
+                forkfs_mount::wait_worker(state, &vm.instance_id).await?;
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) if vm.forkfs.is_some() => {
+                return Err(error).context("forkfs teardown could not confirm drain and unmount");
+            }
+            Err(_) if vm.forkfs.is_some() => bail!("forkfs teardown timed out before VM stop"),
             Ok(Err(error)) => {
                 eprintln!("world: guest service drain failed; stopping VM: {error:#}")
             }
@@ -891,6 +1031,9 @@ pub async fn teardown(state: &Path, vm: &Vm) -> Result<()> {
             "VM still running after stop"
         );
     }
+    if vm.forkfs.is_some() {
+        forkfs_mount::wait_worker(state, &vm.instance_id).await?;
+    }
     // Missing is observed by show, not hidden by a successful teardown.
     journal.phase = if journal.phase == Phase::Created {
         Phase::Created
@@ -902,7 +1045,7 @@ pub async fn teardown(state: &Path, vm: &Vm) -> Result<()> {
 }
 
 /// Removes the owned provider instance and its record. Guest writable-layer
-/// data needs explicit consent until forkfs storage is mounted separately.
+/// data needs explicit consent. A bound forkfs branch is left in its repository.
 pub async fn delete(state: &Path, vm: &Vm, discard_runtime_data: bool) -> Result<()> {
     let _lock = operation_lock(state, vm, false)?;
     check_registered(state, vm)?;
@@ -928,6 +1071,9 @@ pub async fn delete(state: &Path, vm: &Vm, discard_runtime_data: bool) -> Result
         );
     }
     crate::port_publish::control(&vm.owner, b"q").await?;
+    if vm.forkfs.is_some() {
+        forkfs_mount::wait_worker(state, &vm.instance_id).await?;
+    }
     let mut journal = lifecycle(state, vm)?;
     journal.phase = Phase::Deleting;
     save_lifecycle(state, vm, &journal)?;
@@ -979,6 +1125,7 @@ pub async fn exec(
         probe["boot_id"].as_str() == Some(&boot_id),
         "VM restarted outside World; run workspace setup first"
     );
+    require_storage(vm, &boot_id).await?;
     if cancel.is_cancelled() {
         return Ok(124);
     }
@@ -1032,6 +1179,13 @@ pub async fn exec(
             .as_i64()
             .context("missing guest exit code")?
             as i32),
+        Some("failed")
+            if result["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("storage_unavailable:")) =>
+        {
+            bail!("{}", result["error"].as_str().unwrap())
+        }
         _ => bail!("execution {token} status unknown; command may have run: {result}"),
     }
 }
@@ -1066,6 +1220,10 @@ pub async fn import(
 ) -> Result<serde_json::Value> {
     let _lock = operation_lock(state, vm, false)?;
     check_registered(state, vm)?;
+    ensure!(
+        vm.forkfs.is_none(),
+        "workspace import requires VM-local storage; seed the forkfs branch with forkfsd before mounting"
+    );
     let boot_id = require_ready(state, vm)?;
     check_provider().await?;
     ensure!(
@@ -1156,6 +1314,7 @@ pub async fn export(
         probe["boot_id"].as_str() == Some(&boot_id),
         "VM restarted outside World; run workspace setup first"
     );
+    require_storage(vm, &boot_id).await?;
     require_no_active_services(vm, &boot_id).await?;
     ensure!(!cancel.is_cancelled(), "export cancelled");
     let mut staging = crate::export_stream::Staging::new(destination)?;
@@ -1230,6 +1389,7 @@ mod tests {
             image: IMAGE.into(),
             cpus: 1,
             memory_mib: 256,
+            forkfs: None,
         };
         crate::silo::persist(
             state.path(),

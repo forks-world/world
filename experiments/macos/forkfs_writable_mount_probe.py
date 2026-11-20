@@ -8,13 +8,17 @@ import json
 from pathlib import Path
 import select
 import subprocess
+import sys
 import tempfile
 import threading
 import uuid
 
 from forkfs_guest_mount_probe import RpcError, rpc, run
-from forkfs_writable_guest import FRAME_SIZE, IO_SIZE
 from virtiofs_branch_probe import IMAGE
+
+GUEST = Path(__file__).resolve().parents[2] / 'crates/world-runtime/guest/forkfs.py'
+sys.path.insert(0, str(GUEST.parent))
+from forkfs import FRAME_SIZE, IO_SIZE
 
 OPERATIONS = {
     'inode-stat': 1, 'inode-lookup': 2, 'inode-open': 2, 'inode-create': 3,
@@ -160,7 +164,7 @@ def exercise(endpoint, evidence, branch, case, stop_backing=None):
         assert view['repository'] and view['inode']['directory']
         root = json.dumps(view['inode']).encode()
         ready = threading.Event()
-        guest = Path(__file__).with_name('forkfs_writable_guest.py').read_text()
+        guest = GUEST.read_text()
         with (evidence / f'{name}.stderr').open('wb') as errors:
             with subprocess.Popen(
                 ['container', 'exec', '-i', name, 'python3', '-u', '-c', guest],

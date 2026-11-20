@@ -17,6 +17,35 @@ import time
 
 ROOT = Path('/var/lib/world/executions')
 CGROUP = Path('/sys/fs/cgroup')
+FORKFS_SOURCE = Path('/opt/world/forkfs-source')
+
+
+def workspace_mount_id():
+    source = FORKFS_SOURCE.read_text()
+    mounts = [line.split(' - ', 1) for line in Path('/proc/self/mountinfo').read_text().splitlines()]
+    workspace = [(fields.split(), fs.split()) for fields, fs in mounts if fields.split()[4] == '/workspace']
+    if not workspace:
+        return None
+    if len(workspace) != 1 or workspace[0][1][:2] != ['fuse', source]:
+        raise ValueError('storage_unavailable: unexpected /workspace mount')
+    return workspace[0][0][0]
+
+
+def open_workspace():
+    fd = None
+    try:
+        mount = workspace_mount_id()
+        if mount is None:
+            raise ValueError('workspace is unmounted')
+        fd = os.open('/workspace', os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+        if f'mnt_id:\t{mount}' not in Path(f'/proc/self/fdinfo/{fd}').read_text().splitlines():
+            raise ValueError('workspace mount changed')
+        os.fstat(fd)
+        return fd
+    except (OSError, ValueError) as error:
+        if fd is not None:
+            os.close(fd)
+        raise ValueError(f'storage_unavailable: {error}') from error
 
 
 def write(path, value):
@@ -161,19 +190,30 @@ def drop_workload_privileges():
 
 
 def spawn_workload(argv, group, **streams):
+    workspace = open_workspace() if FORKFS_SOURCE.exists() else None
+
     def prepare():
+        if workspace is not None:
+            os.fchdir(workspace)
+            os.close(workspace)
         (group / 'cgroup.procs').write_text(str(os.getpid()))
         drop_workload_privileges()
 
-    return subprocess.Popen(argv, cwd='/workspace', preexec_fn=prepare,
-                            env={'PATH': '/usr/local/bin:/usr/bin:/bin',
-                                 'HOME': '/home/world', 'USER': 'world',
-                                 'LANG': 'C.UTF-8'}, **streams)
+    try:
+        return subprocess.Popen(argv, cwd='/workspace' if workspace is None else None,
+                                pass_fds=() if workspace is None else (workspace,), preexec_fn=prepare,
+                                env={'PATH': '/usr/local/bin:/usr/bin:/bin',
+                                     'HOME': '/home/world', 'USER': 'world',
+                                     'LANG': 'C.UTF-8'}, **streams)
+    finally:
+        if workspace is not None:
+            os.close(workspace)
 
 
 def main():
     mode = sys.argv[1]
-    if mode in ('boot-id', 'probe', 'run', 'import', 'export', 'port-bridge', 'service', 'service-daemon'):
+    if mode in ('boot-id', 'probe', 'run', 'import', 'export', 'port-bridge', 'service', 'service-daemon',
+                'forkfs-mounted', 'forkfs-check', 'forkfs-unmount'):
         boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
         expected = os.environ.get('WORLD_EXPECTED_BOOT_ID')
         if expected is not None and expected != boot_id:
@@ -181,7 +221,22 @@ def main():
         if mode == 'boot-id':
             print(boot_id)
             return 0
+    if mode == 'forkfs-mounted':
+        print('mounted' if workspace_mount_id() else 'unmounted')
+        return 0
+    if mode == 'forkfs-check':
+        os.close(open_workspace())
+        print('mounted')
+        return 0
+    if mode == 'forkfs-unmount':
+        if workspace_mount_id() is not None:
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.umount2(b'/workspace', 0) != 0:
+                raise OSError(ctypes.get_errno(), 'unmount forkfs')
+        return 0
     if mode == 'port-bridge':
+        if FORKFS_SOURCE.exists():
+            os.close(open_workspace())
         asyncio.run(bridge(boot_id, sys.argv[2], sys.argv[3], int(sys.argv[4])))
         return 0
     if mode == 'service-daemon':
@@ -191,9 +246,13 @@ def main():
         service_client(boot_id, sys.argv[2:])
         return 0
     if mode == 'export':
+        if FORKFS_SOURCE.exists():
+            os.close(open_workspace())
         export_workspace()
         return 0
     if mode == 'import':
+        if FORKFS_SOURCE.exists():
+            raise ValueError('import is unavailable for forkfs-backed workspaces')
         import_workspace()
         return 0
     if mode == 'probe':
