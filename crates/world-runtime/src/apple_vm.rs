@@ -1145,6 +1145,26 @@ pub async fn checkpoint(state: &Path, vm: &Vm, name: &str) -> Result<serde_json:
     forkfs_mount::checkpoint(binding, name).await
 }
 
+pub async fn merge(
+    state: &Path,
+    vm: &Vm,
+    base: &str,
+    source: &str,
+    expected: Option<&str>,
+) -> Result<serde_json::Value> {
+    let _lock = operation_lock(state, vm, expected.is_none())?;
+    check_registered(state, vm)?;
+    let binding = vm
+        .forkfs
+        .as_ref()
+        .context("merge requires a forkfs-backed workspace")?;
+    require_storage_retained(&lifecycle(state, vm)?)?;
+    if expected.is_some() {
+        require_stopped(vm, "merge").await?;
+    }
+    forkfs_mount::merge(binding, base, source, expected).await
+}
+
 pub async fn discard(state: &Path, vm: &Vm, expected: Option<&str>) -> Result<serde_json::Value> {
     let _lock = operation_lock(state, vm, false)?;
     check_registered(state, vm)?;
