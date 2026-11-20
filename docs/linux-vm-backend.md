@@ -299,3 +299,40 @@ python3 experiments/macos/world_vm_dev_preview.py
 OpenCode 使用 guest loopback 上的 [脚本化模型替身](../experiments/macos/preview_model.py)。实际执行的是 OpenCode 的文件与命令工具，验收无需模型账户或凭据。开发预览使用宿主下载、guest 安装的路径。直接在 guest 从公有仓库安装的稳定性与外部模型接入另行验证。
 
 2026-11-19 实测通过。环境为 macOS 27.2 (26B123)、Apple container 1.7.1、Apple Silicon 和 1 GiB guest 工作负载限额。OpenCode 的 `read`、`edit`、`bash` 三项工具均完成，命令工具输出 `/workspace` 和 `24 passed`。宿主 HTTP 响应和导出文件均包含改后的标题。此前从 guest 直接下载依赖能访问仓库并下载多个 wheel，但在 180 秒内未完成安装。
+
+### 阶段 3 分支挂载可行性
+
+2026-11-19 验证环境为 Apple Silicon、macOS 27.2 (26B123)、Apple container 1.7.1。每次只运行一台 512 MiB 工作负载限额 VM。forkfs 使用 [`2a55b415` 的 revision-backed daemon](https://github.com/forks-world/forkfs/tree/2a55b415baa6c4d25a67b7563f4ca7a2870ad712)。该版本提供同 UID 的 Unix socket RPC、World 和 revision 选择、`inode-root` 挂载租约及按 revision 的 diff。构建产物包含 daemon 和可选的 macOS FSKit 前端。Linux FUSE 客户端由 World 侧下一步实现，受管存储的认证和绑定仍按 World 架构设计接入。
+
+| 路线 | 实测结果 |
+| --- | --- |
+| Apple container VirtioFS | 以普通宿主目录代替分支。guest UID 1000 可以创建、重命名、删除文件，保留可执行位和符号链接，路径型 Unix socket 在 guest 内可用。重启和重建后数据保留，另一目录没有收到写入。测试卷发生大小写折叠，宿主 `flock` 没有阻止 guest 取得锁，宿主创建文件没有触发 guest inotify，guest 自己创建文件会触发。真实 forkfs FSKit 挂载叠加 VirtioFS 尚未验证。 |
+| guest FUSE | 默认 guest 能看到 `/dev/fuse`，但挂载返回 `EPERM`。在无宿主共享目录的测试 VM 中，带 `CAP_SYS_ADMIN` 的 bootstrap 能完成 FUSE 初始化。读取文件的应用使用 UID 1000，未持有该有效能力。 |
+| FUSE + forkfs RPC | host forkfsd 从同一 checkpoint 创建 A、B 两个分支。guest 在 `/workspace/proof.txt` 读到分别来自真实分支的二进制内容，重建 A 的 VM 后仍读到 A 的内容。guest 写入被拒绝，租约期间另一 RPC 写入被拒绝，卸载并释放租约后写入恢复。真实 forkfsd 停止后，guest 打开文件返回 `EIO`。 |
+
+复现：
+
+```sh
+python3 experiments/macos/virtiofs_branch_probe.py
+python3 experiments/macos/forkfs_guest_mount_probe.py /path/to/forkfsd
+```
+
+第二个探针只投影一个固定文件。宿主通过私有 Unix socket 调用 forkfsd，并利用一次 `container exec -i` 会话向 guest 传递该文件的内容。guest 不持有 daemon socket 或租约凭据。它真实经过 Linux FUSE 和 forkfs RPC，但没有实现可遍历、可写的通用挂载。forkfs 的 `forkfsd_rpc`、`forkfsd_inode_rpc` 和 `forkfs_mount_lifecycle` 测试也在同一 daemon 版本通过。
+
+优先沿 guest FUSE 路线推进 [#28](https://github.com/forks-world/world/issues/28)。下一步实现有明确读写权限的 inode 客户端和挂载管理入口。World 持久记录 Store/repository、分支和 VM 启动代际，setup 验证挂载身份及租约后才接受任务。停机顺序为停止写入者、flush、卸载、释放租约、停止 VM。失联需关闭执行入口，销毁运行时保留分支。随后再接入 checkpoint、分支差异与冲突处理。
+
+### 阶段 3 可写挂载原型
+
+2026-11-20 在同一组 macOS 27.2 (26B123)、Apple container 1.7.1 和 forkfsd 上，用 [可写挂载探针](../experiments/macos/forkfs_writable_mount_probe.py) 完成三次独立的 512 MiB VM 启动。每台 VM 只挂载一个分支，无宿主共享目录。挂载由带 `CAP_SYS_ADMIN` 的 bootstrap 初始化，测试应用以 UID 1000 运行，实测其有效能力不含 `CAP_SYS_ADMIN`。
+
+- 两个分支分别修改同一个基线文件并创建各自的新文件。分支 A 验证目录遍历、跨多次请求的二进制写入、偏移覆盖、截断、`fsync`、重命名、删除、chmod、符号链接，以及同目录下 `README` 与 `readme` 共存。
+- 每个分支卸载并释放租约后，宿主分别创建 checkpoint，并用 `fs-diff` 核对变更路径和基线文件的内容变更。forkfs 的 diff 以 checkpoint 名称查询，探针用返回的 revision ID 校验比较对象。
+- 分支 A 销毁 VM 后从原 forkfs 分支重新挂载，文件、内容和权限仍在，且看不到分支 B 的新文件。租约期间其他 RPC 写入返回 `EBUSY`，卸载并释放后恢复。停止 forkfsd 后，已打开句柄的读操作和新打开文件均返回 `EIO`。
+
+```sh
+python3 experiments/macos/forkfs_writable_mount_probe.py /path/to/forkfsd
+```
+
+探针通过单一 `container exec -i` 通道调用宿主 broker。broker 只接受固定的 inode、目录和文件句柄操作，分支和租约由宿主绑定。应用 I/O 使用 FUSE direct I/O，探针每次传输最多 4 KiB；目录按页从 forkfs 读取，在 guest 按打开句柄保存有界列表。探针租约在 RPC 活动时延长，适用于短时验收。环境、每次挂载结果及 checkpoint diff 写入脚本输出的 Evidence 目录。
+
+下一步把挂载就绪检查、租约保活和失联后的任务准入接入 World 生命周期，再验收 checkpoint 协调停写、merge 和 discard。当前原型还需验证完整的 POSIX 兼容性、长期负载和性能。
