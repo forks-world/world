@@ -276,6 +276,88 @@ pub(crate) async fn fork(
     }))
 }
 
+async fn read_discard_plan(rpc: &Rpc<'_>, branch: &str) -> Result<serde_json::Value> {
+    let reply = rpc
+        .required(&[b"fs-discard-plan", branch.as_bytes()])
+        .await?;
+    let plan: serde_json::Value = serde_json::from_slice(&reply)?;
+    ensure!(
+        plan["world"].as_str() == Some(branch),
+        "invalid forkfs discard plan"
+    );
+    Ok(plan)
+}
+
+pub(crate) async fn discard_plan(binding: &Binding) -> Result<serde_json::Value> {
+    let rpc = Rpc::bound(binding).await?;
+    read_discard_plan(&rpc, &binding.branch).await
+}
+
+pub(crate) struct DiscardRequest<'a> {
+    rpc: Rpc<'a>,
+    branch: &'a str,
+    token: &'a str,
+}
+
+pub(crate) enum DiscardOutcome {
+    Removed(serde_json::Value),
+    Absent,
+    Rejected(anyhow::Error),
+}
+
+impl<'a> DiscardRequest<'a> {
+    pub(crate) async fn prepare(binding: &'a Binding, token: &'a str, retry: bool) -> Result<Self> {
+        ensure!(
+            token.len() == 64
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "invalid forkfs discard token"
+        );
+        let rpc = Rpc::bound(binding).await?;
+        if !retry {
+            let plan = read_discard_plan(&rpc, &binding.branch).await?;
+            ensure!(
+                plan["token"].as_str() == Some(token),
+                "forkfs discard plan is stale"
+            );
+        }
+        Ok(Self {
+            rpc,
+            branch: &binding.branch,
+            token,
+        })
+    }
+
+    pub(crate) async fn commit(&self) -> Result<DiscardOutcome> {
+        match self
+            .rpc
+            .call(&[b"fs-discard", self.branch.as_bytes(), self.token.as_bytes()])
+            .await?
+        {
+            Ok(response) => {
+                let outcome: serde_json::Value = serde_json::from_slice(&response)?;
+                ensure!(
+                    outcome["world"].as_str() == Some(self.branch),
+                    "invalid forkfs discard reply"
+                );
+                Ok(DiscardOutcome::Removed(outcome))
+            }
+            Err(error) => {
+                let errno = error.code.saturating_sub(1) as libc::c_int;
+                let detail = String::from_utf8_lossy(&error.detail);
+                match errno {
+                    libc::ENOENT => Ok(DiscardOutcome::Absent),
+                    libc::ESTALE | libc::EBUSY | libc::EPERM => Ok(DiscardOutcome::Rejected(
+                        anyhow::anyhow!("forkfs discard failed: {detail}"),
+                    )),
+                    _ => bail!("could not confirm forkfs discard: {detail}"),
+                }
+            }
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {

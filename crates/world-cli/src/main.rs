@@ -192,6 +192,13 @@ enum Workspace {
         revision: String,
         branch: String,
     },
+    /// Preview a forkfs branch discard, or confirm it with the preview token.
+    Discard {
+        workspace: String,
+        /// Confirm removal of the exact branch state named by this token.
+        #[arg(long)]
+        expect_token: Option<String>,
+    },
     /// Copy a host directory into an empty Linux VM /workspace.
     Import {
         workspace: String,
@@ -438,6 +445,16 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                     let vm = apple_vm::get(&state, &workspace)?
                         .context("fork requires a forkfs-backed workspace")?;
                     let result = apple_vm::fork(&state, &vm, &revision, &branch).await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    Ok(0)
+                }
+                Workspace::Discard {
+                    workspace,
+                    expect_token,
+                } => {
+                    let vm = apple_vm::get(&state, &workspace)?
+                        .context("discard requires a forkfs-backed workspace")?;
+                    let result = apple_vm::discard(&state, &vm, expect_token.as_deref()).await?;
                     println!("{}", serde_json::to_string_pretty(&result)?);
                     Ok(0)
                 }

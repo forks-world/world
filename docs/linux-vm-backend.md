@@ -382,4 +382,23 @@ world workspace diff dev before after --limit 32
 
 Apple Silicon 验收复用 `world_vm_forkfs_smoke.py`，覆盖服务写入后创建 checkpoint、外部文件句柄阻止 checkpoint、分页读出修改文件与新增文件、从不同 checkpoint fork 得到相应内容，以及同名重试保留已有分支。
 
-阶段 3 的 merge 仍需 forkfs 提供单次原子发布，在应用三方合并结果时验证目标 head 并返回冲突。discard 仍需在线分支删除接口，在同一事务中验证预期分支 head、确认无挂载或文件句柄，再移除分支引用并保留命名 revision。当前上游的分支删除要求 forkfsd 停机并独占整个仓库。[forkfs 离线保留操作](https://github.com/forks-world/forkfs/blob/04cb8b020cd0982b6b00e5d24c8dd69ded9eac66/daemon/README.md#offline-retention)
+阶段 3 的 merge 仍需 forkfs 提供单次原子发布，在应用三方合并结果时验证目标 head 并返回冲突。
+
+### 阶段 3 在线 discard
+
+```sh
+world workspace teardown dev
+world workspace discard dev
+world workspace discard dev --expect-token "$token"
+```
+
+预览返回分支、manifest ID、base revision ID 和确认令牌。确认要求 VM 已停止，或 provider 确认实例不存在。forkfsd 会检查目标分支的挂载、文件句柄和目录游标，并在一次同步事务中验证令牌和删除分支 head/base。令牌包含整个仓库的提交序号，任何提交后都需重新预览。这个检查也能区分从同一个 revision 重建的同名分支。
+
+删除会丢弃未 checkpoint 的分支状态。命名 checkpoint、其历史和其他分支仍可访问。World 记录 `discarding` 后才发出删除请求。若连接在提交期间中断，可用原令牌重试。forkfsd 确认分支已不存在后，World 记录 `discarded`。如果同名分支已重建，原令牌不能删除它，原 workspace 也不能重新挂载它。可以用 `workspace delete` 单独清理本地登记及已停止的 VM。
+
+本功能需要包含 `fs-discard-plan` 和 `fs-discard` RPC 的 forkfsd。forkfs 仓库中的 `forkfsd_discard_rpc` 测试覆盖提交边界和句柄检查。以下真机 smoke 还使用 forkfs 的测试二进制，在同步提交前后分别强制中断 daemon，验证 World 的持久化状态和重试。
+
+```sh
+python3 experiments/macos/world_vm_forkfs_smoke.py /path/to/forkfsd \
+  --forkfsd-fault /path/to/forkfsd_leveldb_fault_test
+```

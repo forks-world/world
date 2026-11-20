@@ -3,6 +3,7 @@
 import argparse
 import errno
 import json
+import os
 from pathlib import Path
 import select
 import subprocess
@@ -15,10 +16,12 @@ from forkfs_guest_mount_probe import RpcError, rpc, run
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('forkfsd', type=Path)
+    parser.add_argument('--forkfsd-fault', type=Path, help='test online discard recovery with crash injection')
     parser.add_argument('--world', type=Path, default=Path('target/debug/world'))
     args = parser.parse_args()
     forkfsd = str(args.forkfsd.resolve(strict=True))
     world = str(args.world.resolve(strict=True))
+    fault = str(args.forkfsd_fault.resolve(strict=True)) if args.forkfsd_fault else None
     evidence = Path(tempfile.mkdtemp(prefix='world-forkfs-smoke-', dir='/tmp'))
     state, endpoint = evidence / 'state', evidence / 'rpc.sock'
     store, wrong_store = evidence / 'store', evidence / 'other-store'
@@ -53,12 +56,15 @@ def main():
     daemon = None
     vm = None
 
-    def start_daemon(database):
+    def start_daemon(database, *, crash=None):
         nonlocal daemon
+        env = dict(os.environ)
+        if crash:
+            env['FORKFS_TEST_CRASH'] = crash
         with (evidence / f'{database.name}.stderr').open('ab') as errors:
             daemon = subprocess.Popen(
-                [forkfsd, 'serve', str(database), '--socket', str(endpoint), '--rpc'],
-                stdout=subprocess.PIPE, stderr=errors,
+                [fault if crash else forkfsd, 'serve', str(database), '--socket', str(endpoint), '--rpc'],
+                stdout=subprocess.PIPE, stderr=errors, env=env,
             )
         assert select.select([daemon.stdout], [], [], 5)[0], 'forkfsd startup timeout'
         assert json.loads(daemon.stdout.readline())['state'] == 'leveldb'
@@ -71,6 +77,7 @@ def main():
             daemon.wait(timeout=10)
             daemon.stdout.close()
             daemon = None
+            endpoint.unlink(missing_ok=True)  # Fault injection can leave our private socket behind.
 
     def seed():
         rpc(endpoint, 'fs-init')
@@ -141,6 +148,10 @@ def main():
         workspace('reject-checkpoint-with-active-service', 'checkpoint', 'saved',
                   exit_code=125, diagnostic='checkpoint requires a stopped workspace')
         assert 'saved' not in rpc(endpoint, 'fs-revisions').decode().splitlines()
+        if fault:
+            plan = json.loads(workspace('preview-discard-mounted', 'discard'))
+            workspace('reject-discard-mounted', 'discard', '--expect-token', plan['token'],
+                      exit_code=125, diagnostic='discard requires a stopped workspace')
         workspace('fork-baseline', 'fork', 'base', 'sibling')
         assert rpc(endpoint, 'fs-cat', '/baseline.txt', '--world', 'sibling') == b'forkfs baseline'
         assert b'retained.txt' not in rpc(endpoint, 'fs-ls', '/', '--world', 'sibling').splitlines()
@@ -210,6 +221,59 @@ def main():
         vm = None
         assert rpc(endpoint, 'fs-cat', '/retained.txt', '--world', 'work') == b'from service'
         record('deleting-runtime-preserves-forkfs-branch')
+
+        if fault:
+            name = 'discard-test'
+            workspace('bind-disposable-branch', 'create', '--os', 'linux',
+                      '--forkfs-socket', str(endpoint), '--forkfs-repository', repository,
+                      '--forkfs-branch', 'saved-copy')
+            plan = json.loads(workspace('preview-discard', 'discard'))
+            rpc(endpoint, 'fs-write', '/file', b'uncheckpointed', '--world', 'saved-copy')
+            workspace('reject-stale-discard', 'discard', '--expect-token', plan['token'],
+                      exit_code=125, diagnostic='discard plan is stale')
+            plan = json.loads(workspace('preview-discard-again', 'discard'))
+            token = plan['token']
+            session = json.loads(rpc(endpoint, 'session-open', '15000'))['session']
+            try:
+                rpc(endpoint, 'fs-open', '/file', 'rw', '--world', 'saved-copy', '--session', session)
+                workspace('reject-discard-with-external-handle', 'discard', '--expect-token', token,
+                          exit_code=125, diagnostic='World has open file handles')
+                assert json.loads(workspace('show-discard-rejected', 'show'))['status'] == 'created'
+            finally:
+                rpc(endpoint, 'session-close', session)
+
+            for stage in ('leveldb_before_write', 'leveldb_after_write'):
+                stop_daemon()
+                start_daemon(store, crash=stage)
+                workspace(f'discard-crash-{stage}', 'discard', '--expect-token', token,
+                          exit_code=125, diagnostic='discard outcome unknown')
+                assert daemon.wait(timeout=5) == 86
+                stop_daemon()
+                start_daemon(store)
+                assert json.loads(workspace('show-discard-in-progress', 'show'))['status'] == 'discarding'
+                workspace('reject-setup-during-discard', 'setup', exit_code=125,
+                          diagnostic='workspace discard is pending or complete')
+                worlds = rpc(endpoint, 'fs-worlds').splitlines()
+                assert (b'saved-copy' in worlds) == (stage == 'leveldb_before_write')
+                assert rpc(endpoint, 'fs-cat', '/retained.txt', '--revision', 'saved') == b'from service'
+            result = json.loads(workspace('reconcile-discard', 'discard', '--expect-token', token))
+            assert result['state'] == 'discarded'
+            assert json.loads(workspace('show-discarded', 'show'))['status'] == 'discarded'
+            workspace('recreate-branch-name', 'fork', 'saved', 'saved-copy')
+            workspace('retry-discard-remains-idempotent', 'discard', '--expect-token', token)
+            workspace('reject-setup-after-name-reuse', 'setup', exit_code=125,
+                      diagnostic='workspace discard is pending or complete')
+            assert rpc(endpoint, 'fs-cat', '/retained.txt', '--world', 'saved-copy') == b'from service'
+            workspace('delete-discarded-registration', 'delete')
+            workspace('bind-recreated-branch', 'create', '--os', 'linux',
+                      '--forkfs-socket', str(endpoint), '--forkfs-repository', repository,
+                      '--forkfs-branch', 'saved-copy')
+            plan = json.loads(workspace('preview-recreated-branch', 'discard'))
+            result = json.loads(workspace('discard-confirmed', 'discard', '--expect-token', plan['token']))
+            assert result['state'] == 'discarded' and result['manifest_id'] == plan['manifest_id']
+            workspace('delete-confirmed-discard-registration', 'delete')
+            assert rpc(endpoint, 'fs-cat', '/retained.txt', '--world', 'work') == b'from service'
+            record('discard-preserves-named-revision-and-other-branch')
     finally:
         try:
             if vm is not None:

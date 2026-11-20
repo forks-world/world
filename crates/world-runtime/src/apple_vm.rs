@@ -83,6 +83,8 @@ enum Phase {
     Stopping,
     Stopped,
     Deleting,
+    Discarding,
+    Discarded,
     Legacy,
 }
 
@@ -94,6 +96,8 @@ struct Lifecycle {
     generation: u64,
     #[serde(default)]
     boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    discard_token: Option<String>,
 }
 
 fn lifecycle(state: &Path, vm: &Vm) -> Result<Lifecycle> {
@@ -109,6 +113,7 @@ fn lifecycle(state: &Path, vm: &Vm) -> Result<Lifecycle> {
             phase: Phase::Legacy,
             generation: 0,
             boot_id: None,
+            discard_token: None,
         }),
         Err(error) => Err(error.into()),
     }
@@ -126,6 +131,14 @@ fn check_registered(state: &Path, vm: &Vm) -> Result<()> {
     ensure!(
         get(state, &vm.id)?.is_some_and(|current| current.owner == vm.owner),
         "workspace was deleted or replaced; reload its configuration"
+    );
+    Ok(())
+}
+
+fn require_storage_retained(journal: &Lifecycle) -> Result<()> {
+    ensure!(
+        !matches!(journal.phase, Phase::Discarding | Phase::Discarded),
+        "workspace discard is pending or complete; use workspace show to inspect its status"
     );
     Ok(())
 }
@@ -225,8 +238,10 @@ pub fn create_with_storage(
     let mut records = records(state)?;
     if let Some(record) = records.get(id) {
         if let Record::Vm(vm) = record {
+            let journal = lifecycle(state, vm)?;
+            require_storage_retained(&journal)?;
             ensure!(
-                lifecycle(state, vm)?.phase != Phase::Deleting,
+                journal.phase != Phase::Deleting,
                 "workspace deletion is pending; retry workspace delete before reusing the name"
             );
             ensure!(
@@ -270,6 +285,7 @@ pub fn create_with_storage(
             phase: Phase::Created,
             generation: 0,
             boot_id: None,
+            discard_token: None,
         },
     )?;
     records.insert(id.into(), Record::Vm(vm.clone()));
@@ -770,7 +786,11 @@ pub async fn show(state: &Path, vm: &Vm) -> Result<serde_json::Value> {
         Err(error) => (None, Some(format!("{error:#}"))),
     };
     let mut error = error;
-    let status = if error.is_some() {
+    let status = if journal.phase == Phase::Discarded {
+        "discarded"
+    } else if journal.phase == Phase::Discarding {
+        "discarding"
+    } else if error.is_some() {
         "unknown"
     } else if journal.phase == Phase::Deleting {
         "deleting"
@@ -817,6 +837,7 @@ pub async fn setup(state: &Path, vm: &Vm, recreate_missing: bool) -> Result<()> 
     let _lock = operation_lock(state, vm, false)?;
     check_registered(state, vm)?;
     let mut journal = lifecycle(state, vm)?;
+    require_storage_retained(&journal)?;
     ensure!(
         journal.phase != Phase::Deleting,
         "workspace deletion is pending; retry workspace delete"
@@ -975,6 +996,7 @@ pub async fn teardown(state: &Path, vm: &Vm) -> Result<()> {
     let _lock = operation_lock(state, vm, false)?;
     check_registered(state, vm)?;
     let mut journal = lifecycle(state, vm)?;
+    require_storage_retained(&journal)?;
     ensure!(
         journal.phase != Phase::Deleting,
         "workspace deletion is pending; retry workspace delete"
@@ -1097,13 +1119,7 @@ pub async fn delete(state: &Path, vm: &Vm, discard_runtime_data: bool) -> Result
     Ok(())
 }
 
-pub async fn checkpoint(state: &Path, vm: &Vm, name: &str) -> Result<serde_json::Value> {
-    let _lock = operation_lock(state, vm, false)?;
-    check_registered(state, vm)?;
-    let binding = vm
-        .forkfs
-        .as_ref()
-        .context("checkpoint requires a forkfs-backed workspace")?;
+async fn require_stopped(vm: &Vm, operation: &str) -> Result<()> {
     check_provider().await?;
     if let Some(instance) = inspect(vm).await? {
         ensure!(
@@ -1111,10 +1127,80 @@ pub async fn checkpoint(state: &Path, vm: &Vm, name: &str) -> Result<serde_json:
                 instance["status"]["state"].as_str(),
                 Some("stopped" | "created")
             ),
-            "checkpoint requires a stopped workspace; run workspace teardown first"
+            "{operation} requires a stopped workspace; run workspace teardown first"
         );
     }
+    Ok(())
+}
+
+pub async fn checkpoint(state: &Path, vm: &Vm, name: &str) -> Result<serde_json::Value> {
+    let _lock = operation_lock(state, vm, false)?;
+    check_registered(state, vm)?;
+    let binding = vm
+        .forkfs
+        .as_ref()
+        .context("checkpoint requires a forkfs-backed workspace")?;
+    require_storage_retained(&lifecycle(state, vm)?)?;
+    require_stopped(vm, "checkpoint").await?;
     forkfs_mount::checkpoint(binding, name).await
+}
+
+pub async fn discard(state: &Path, vm: &Vm, expected: Option<&str>) -> Result<serde_json::Value> {
+    let _lock = operation_lock(state, vm, false)?;
+    check_registered(state, vm)?;
+    let binding = vm
+        .forkfs
+        .as_ref()
+        .context("discard requires a forkfs-backed workspace")?;
+    let mut journal = lifecycle(state, vm)?;
+    ensure!(
+        journal.phase != Phase::Deleting,
+        "workspace deletion is pending"
+    );
+    let Some(token) = expected else {
+        require_storage_retained(&journal)?;
+        return forkfs_mount::discard_plan(binding).await;
+    };
+    if let Some(recorded) = &journal.discard_token {
+        ensure!(
+            recorded == token,
+            "discard token differs from the recorded operation"
+        );
+    }
+    let discarded = || serde_json::json!({"state": "discarded", "world": binding.branch});
+    if journal.phase == Phase::Discarded {
+        return Ok(discarded());
+    }
+    let retry = journal.phase == Phase::Discarding;
+    require_stopped(vm, "discard").await?;
+    let request = forkfs_mount::DiscardRequest::prepare(binding, token, retry).await?;
+    let previous = journal.phase;
+    if !retry {
+        journal.phase = Phase::Discarding;
+        journal.discard_token = Some(token.to_owned());
+        save_lifecycle(state, vm, &journal)?;
+    }
+    let outcome = request.commit().await.context(
+        "discard outcome unknown; retry with the same token after checking the workspace",
+    )?;
+    let result = match outcome {
+        forkfs_mount::DiscardOutcome::Removed(mut result) => {
+            result["state"] = "discarded".into();
+            Ok(result)
+        }
+        forkfs_mount::DiscardOutcome::Absent => Ok(discarded()),
+        forkfs_mount::DiscardOutcome::Rejected(error) => Err(error),
+    };
+    if result.is_err() && !retry {
+        journal.phase = previous;
+        journal.discard_token = None;
+        save_lifecycle(state, vm, &journal)?;
+    }
+    let result = result?;
+    journal.phase = Phase::Discarded;
+    save_lifecycle(state, vm, &journal)
+        .context("forkfs branch is absent; retry to record discard")?;
+    Ok(result)
 }
 
 pub async fn diff(
