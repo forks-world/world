@@ -23,6 +23,12 @@ enum Commands {
         workspace: String,
         spec: String,
     },
+    #[command(name = "__forkfs-worker", hide = true)]
+    ForkfsWorker {
+        state: PathBuf,
+        workspace: String,
+        boot_id: String,
+    },
     Network {
         #[command(subcommand)]
         command: Network,
@@ -151,6 +157,15 @@ enum Workspace {
         /// VM workload memory limit, e.g. 256M, 512M or 1G.
         #[arg(long, value_parser = parse_memory)]
         memory: Option<u32>,
+        /// Host Unix socket of a running forkfsd daemon.
+        #[arg(long, requires_all = ["forkfs_repository", "forkfs_branch"])]
+        forkfs_socket: Option<PathBuf>,
+        /// Expected repository ID reported by forkfsd.
+        #[arg(long, requires = "forkfs_socket")]
+        forkfs_repository: Option<String>,
+        /// Existing mutable branch to lease for /workspace.
+        #[arg(long, requires = "forkfs_socket")]
+        forkfs_branch: Option<String>,
     },
     Show {
         workspace: String,
@@ -240,6 +255,23 @@ async fn run(cli: Cli) -> i32 {
 
 async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
     match cli.command {
+        Commands::ForkfsWorker {
+            state,
+            workspace,
+            boot_id,
+        } => {
+            if let Err(error) = apple_vm::forkfs_worker(&state, &workspace, &boot_id, cancel).await
+            {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stdout(),
+                    "{}",
+                    serde_json::json!({"error":format!("{error:#}")})
+                );
+                return Ok(125);
+            }
+            Ok(0)
+        }
         Commands::PortWorker {
             state,
             workspace,
@@ -302,7 +334,21 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                     os,
                     cpus,
                     memory,
+                    forkfs_socket,
+                    forkfs_repository,
+                    forkfs_branch,
                 } => {
+                    let forkfs = match (forkfs_socket, forkfs_repository, forkfs_branch) {
+                        (Some(socket), Some(repository), Some(branch)) => {
+                            Some(apple_vm::ForkfsBinding {
+                                socket: std::path::absolute(socket)?,
+                                repository,
+                                branch,
+                            })
+                        }
+                        (None, None, None) => None,
+                        _ => anyhow::bail!("forkfs requires socket, repository ID, and branch"),
+                    };
                     let requested = os.as_deref().unwrap_or(std::env::consts::OS);
                     let vm = requested == "linux" && std::env::consts::OS == "macos";
                     if vm {
@@ -310,11 +356,12 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                             workdir.is_none(),
                             "Linux VM uses /workspace; --workdir is only for native workspaces (use workspace import after setup)"
                         );
-                        let record = apple_vm::create(
+                        let record = apple_vm::create_with_storage(
                             &state,
                             &workspace,
                             cpus.unwrap_or(1),
                             memory.unwrap_or(512),
+                            forkfs,
                         )?;
                         println!("{}", serde_json::to_string_pretty(&record)?);
                     } else {
@@ -325,6 +372,10 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                         anyhow::ensure!(
                             cpus.is_none() && memory.is_none(),
                             "resource flags currently require the Linux VM backend"
+                        );
+                        anyhow::ensure!(
+                            forkfs.is_none(),
+                            "forkfs requires the macOS Linux VM backend"
                         );
                         let workdir = workdir.context("native workspace requires --workdir")?;
                         println!(

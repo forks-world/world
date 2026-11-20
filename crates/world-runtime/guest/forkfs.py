@@ -1,4 +1,4 @@
-"""Linux FUSE frontend for the disposable forkfs writable mount probe."""
+"""Linux FUSE frontend for the local forkfs-backed workspace."""
 
 import base64
 import ctypes
@@ -229,6 +229,10 @@ class Frontend:
 
 
 def serve():
+    source = os.environ.get('WORLD_FORKFS_SOURCE', 'world-forkfs-writable-probe')
+    expected = os.environ.get('WORLD_EXPECTED_BOOT_ID')
+    if expected and Path('/proc/sys/kernel/random/boot_id').read_text().strip() != expected:
+        raise ValueError('VM boot changed before forkfs mount')
     libc = ctypes.CDLL(None, use_errno=True)
     fd = os.open('/dev/fuse', os.O_RDWR | os.O_CLOEXEC)
     mounted = False
@@ -236,7 +240,7 @@ def serve():
         frontend = Frontend(Broker())
         Path(os.fsdecode(WORKSPACE)).mkdir(mode=0o755, exist_ok=True)
         options = f'fd={fd},rootmode=40000,user_id=0,group_id=0,allow_other,default_permissions'
-        if libc.mount(b'world-forkfs-writable-probe', WORKSPACE, b'fuse', MOUNT_FLAGS, options.encode()) != 0:
+        if libc.mount(source.encode(), WORKSPACE, b'fuse', MOUNT_FLAGS, options.encode()) != 0:
             raise OSError(ctypes.get_errno(), 'mount FUSE')
         mounted = True
         while True:
@@ -263,8 +267,12 @@ def serve():
             except OSError as exc:
                 result, error = b'', exc.errno or errno.EIO
             response = struct.pack('<IiQ', 16 + len(result), -error, unique) + result
-            if os.write(fd, response) != len(response):
-                raise OSError(errno.EIO, 'incomplete FUSE reply')
+            try:
+                if os.write(fd, response) != len(response):
+                    raise OSError(errno.EIO, 'incomplete FUSE reply')
+            except OSError as exc:
+                if exc.errno != errno.ENOENT:  # Kernel cancelled the request.
+                    raise
             if operation == 26:
                 print('ready', flush=True)
     finally:
