@@ -1,5 +1,6 @@
 pub mod apple_vm;
 mod export_stream;
+mod forkfs_mount;
 #[cfg(target_os = "linux")]
 mod forward;
 mod import_stream;
