@@ -157,6 +157,9 @@ enum Workspace {
         /// VM workload memory limit, e.g. 256M, 512M or 1G.
         #[arg(long, value_parser = parse_memory)]
         memory: Option<u32>,
+        /// Guest networking mode. Offline attaches no guest network interface.
+        #[arg(long, value_parser = ["nat", "offline"])]
+        network: Option<String>,
         /// Host Unix socket of a running forkfsd daemon.
         #[arg(long, requires_all = ["forkfs_repository", "forkfs_branch"])]
         forkfs_socket: Option<PathBuf>,
@@ -227,6 +230,9 @@ enum Workspace {
         /// Explicitly recreate an absent VM with an empty writable layer.
         #[arg(long)]
         recreate_missing: bool,
+        /// Allow multiple offline VMs within this total memory budget, e.g. 1G.
+        #[arg(long, value_parser = parse_vm_budget)]
+        vm_memory_budget: Option<u32>,
     },
     /// Linux: stop the workspace namespace holder started by setup.
     Teardown {
@@ -372,6 +378,7 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                     os,
                     cpus,
                     memory,
+                    network,
                     forkfs_socket,
                     forkfs_repository,
                     forkfs_branch,
@@ -394,12 +401,17 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                             workdir.is_none(),
                             "Linux VM uses /workspace; --workdir is only for native workspaces (use workspace import after setup)"
                         );
-                        let record = apple_vm::create_with_storage(
+                        let record = apple_vm::create_with_options(
                             &state,
                             &workspace,
                             cpus.unwrap_or(1),
                             memory.unwrap_or(512),
                             forkfs,
+                            if network.as_deref() == Some("offline") {
+                                apple_vm::Network::Offline
+                            } else {
+                                apple_vm::Network::Nat
+                            },
                         )?;
                         println!("{}", serde_json::to_string_pretty(&record)?);
                     } else {
@@ -414,6 +426,10 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                         anyhow::ensure!(
                             forkfs.is_none(),
                             "forkfs requires the macOS Linux VM backend"
+                        );
+                        anyhow::ensure!(
+                            network.is_none(),
+                            "--network requires a Linux VM workspace"
                         );
                         let workdir = workdir.context("native workspace requires --workdir")?;
                         println!(
@@ -521,13 +537,24 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                 Workspace::Setup {
                     workspace,
                     recreate_missing,
+                    vm_memory_budget,
                 } => {
                     if let Some(vm) = apple_vm::get(&state, &workspace)? {
-                        apple_vm::setup(&state, &vm, recreate_missing).await?;
+                        apple_vm::setup_with_budget(
+                            &state,
+                            &vm,
+                            recreate_missing,
+                            vm_memory_budget,
+                        )
+                        .await?;
                     } else {
                         anyhow::ensure!(
                             !recreate_missing,
                             "--recreate-missing requires a Linux VM workspace"
+                        );
+                        anyhow::ensure!(
+                            vm_memory_budget.is_none(),
+                            "--vm-memory-budget requires a Linux VM workspace"
                         );
                         silo::setup(&state, &silo::get(&state, &workspace)?)?;
                     }
@@ -658,6 +685,14 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
 }
 
 fn parse_memory(input: &str) -> Result<u32, String> {
+    let value = parse_vm_budget(input)?;
+    if !(256..=4096).contains(&value) {
+        return Err("memory must be between 256M and 4G".into());
+    }
+    Ok(value)
+}
+
+fn parse_vm_budget(input: &str) -> Result<u32, String> {
     let (number, multiplier) = if let Some(value) = input.strip_suffix('M') {
         (value, 1)
     } else if let Some(value) = input.strip_suffix('G') {
@@ -669,6 +704,6 @@ fn parse_memory(input: &str) -> Result<u32, String> {
         .parse::<u32>()
         .ok()
         .and_then(|v| v.checked_mul(multiplier))
-        .filter(|v| (256..=4096).contains(v))
-        .ok_or_else(|| "memory must be between 256M and 4G".into())
+        .filter(|v| *v > 0)
+        .ok_or_else(|| "memory must be a positive size".into())
 }

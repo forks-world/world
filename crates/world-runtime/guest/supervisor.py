@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -18,6 +19,16 @@ import time
 ROOT = Path('/var/lib/world/executions')
 CGROUP = Path('/sys/fs/cgroup')
 FORKFS_SOURCE = Path('/opt/world/forkfs-source')
+OFFLINE = Path('/opt/world/offline')
+
+
+def offline_network_ready():
+    return OFFLINE.exists() and [name for _, name in socket.if_nameindex()] == ['lo']
+
+
+def enforce_network():
+    if OFFLINE.exists() and not offline_network_ready():
+        raise ValueError('policy_unavailable: offline workspace has a non-loopback interface')
 
 
 def workspace_mount_id():
@@ -190,6 +201,7 @@ def drop_workload_privileges():
 
 
 def spawn_workload(argv, group, **streams):
+    enforce_network()
     workspace = open_workspace() if FORKFS_SOURCE.exists() else None
 
     def prepare():
@@ -221,6 +233,13 @@ def main():
         if mode == 'boot-id':
             print(boot_id)
             return 0
+    if mode == 'offline-check':
+        if not offline_network_ready():
+            raise ValueError('policy_unavailable: guest offline policy is unverified')
+        print('offline')
+        return 0
+    if mode in ('port-bridge', 'export', 'import'):
+        enforce_network()
     if mode == 'forkfs-mounted':
         print('mounted' if workspace_mount_id() else 'unmounted')
         return 0

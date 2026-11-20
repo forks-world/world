@@ -33,6 +33,27 @@ const GUEST: &str = concat!(
 );
 const HELPER: &str = "/opt/world/supervisor.py";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Network {
+    #[default]
+    Nat,
+    Offline,
+}
+
+impl Network {
+    fn is_nat(&self) -> bool {
+        *self == Self::Nat
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Nat => "provider NAT, unrestricted egress",
+            Self::Offline => "offline, guest loopback only",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Vm {
@@ -46,6 +67,8 @@ pub struct Vm {
     pub image: String,
     pub cpus: u32,
     pub memory_mib: u32,
+    #[serde(default, skip_serializing_if = "Network::is_nat")]
+    pub network: Network,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forkfs: Option<ForkfsBinding>,
 }
@@ -229,6 +252,17 @@ pub fn create_with_storage(
     memory_mib: u32,
     forkfs: Option<ForkfsBinding>,
 ) -> Result<Vm> {
+    create_with_options(state, id, cpus, memory_mib, forkfs, Network::default())
+}
+
+pub fn create_with_options(
+    state: &Path,
+    id: &str,
+    cpus: u32,
+    memory_mib: u32,
+    forkfs: Option<ForkfsBinding>,
+    network: Network,
+) -> Result<Vm> {
     supported()?;
     ensure!(
         !id.is_empty() && id.len() <= 128 && !id.contains(['\0', '\r', '\n']),
@@ -252,6 +286,10 @@ pub fn create_with_storage(
                 vm.forkfs == forkfs,
                 "workspace exists with a different storage binding"
             );
+            ensure!(
+                vm.network == network,
+                "workspace exists with a different network mode"
+            );
             return Ok(vm.clone());
         }
         bail!("workspace already uses a native backend; create a new workspace to change OS");
@@ -268,6 +306,7 @@ pub fn create_with_storage(
         image: IMAGE.into(),
         cpus,
         memory_mib,
+        network,
         forkfs,
     };
     vm.validate(id)?;
@@ -329,7 +368,7 @@ async fn output(args: &[&str], limit: Duration) -> Result<String> {
     String::from_utf8(output.stdout).context("provider returned non-UTF8 metadata")
 }
 
-async fn check_provider() -> Result<()> {
+async fn check_provider(vm: &Vm) -> Result<()> {
     supported()?;
     let version = output(&["--version"], Duration::from_secs(10))
         .await
@@ -344,21 +383,132 @@ async fn check_provider() -> Result<()> {
         version.trim(),
         PROVIDER_VERSIONS.join(", ")
     );
+    ensure!(
+        vm.network != Network::Offline || version.split_whitespace().any(|word| word == "1.7.1"),
+        "policy_unavailable: offline networking requires Apple container 1.7.1"
+    );
     output(&["system", "status"], Duration::from_secs(10))
         .await
         .context("start Apple container with: container system start")?;
     Ok(())
 }
 
-async fn inspect(vm: &Vm) -> Result<Option<serde_json::Value>> {
-    // A failed provider query is never interpreted as an absent VM.
-    let all: Vec<serde_json::Value> = serde_json::from_str(
+async fn instances() -> Result<Vec<serde_json::Value>> {
+    Ok(serde_json::from_str(
         &output(
             &["list", "--all", "--format", "json"],
             Duration::from_secs(15),
         )
         .await?,
-    )?;
+    )?)
+}
+
+fn offline_provider_config(entry: &serde_json::Value) -> bool {
+    let configuration = &entry["configuration"];
+    configuration["labels"]["world.network"] == "offline"
+        && ["networks", "publishedPorts", "publishedSockets"]
+            .iter()
+            .all(|key| configuration[key].as_array().is_some_and(Vec::is_empty))
+        && (entry["status"]["state"] != "running"
+            || entry["status"]["networks"]
+                .as_array()
+                .is_some_and(Vec::is_empty))
+}
+
+const MIB: u64 = 1024 * 1024;
+const VM_RESERVE_MIB: u64 = 256;
+
+fn check_admission_inventory(
+    inventory: &[serde_json::Value],
+    requested_mib: u32,
+    budget_mib: Option<u32>,
+) -> Result<()> {
+    let mut active = inventory.iter().filter(|entry| {
+        !matches!(
+            entry["status"]["state"].as_str(),
+            Some("stopped" | "created")
+        )
+    });
+    let Some(budget_mib) = budget_mib else {
+        ensure!(
+            active.next().is_none(),
+            "resource_exhausted: another container is active; single-VM admission requires an idle provider"
+        );
+        return Ok(());
+    };
+    let budget = u64::from(budget_mib) * MIB;
+    let mut reserved = (u64::from(requested_mib) + VM_RESERVE_MIB) * MIB;
+    for entry in active {
+        let owner = entry["configuration"]["labels"]["world.owner"].as_str();
+        ensure!(
+            entry["status"]["state"] == "running"
+                && owner.is_some_and(|id| hex_id(id) && entry["id"] == format!("world-{id}"))
+                && offline_provider_config(entry),
+            "resource_exhausted: multi-VM admission requires all active provider instances to be offline Worlds"
+        );
+        let memory = entry["configuration"]["resources"]["memoryInBytes"]
+            .as_u64()
+            .filter(|bytes| *bytes > 0)
+            .context("resource_exhausted: missing provider memory limit")?;
+        reserved = reserved
+            .checked_add(memory)
+            .and_then(|bytes| bytes.checked_add(VM_RESERVE_MIB * MIB))
+            .context("resource_exhausted: provider memory limits overflow")?;
+    }
+    ensure!(
+        reserved <= budget,
+        "resource_exhausted: VMs including reserves require {} MiB, budget is {} MiB",
+        reserved.div_ceil(MIB),
+        budget_mib
+    );
+    Ok(())
+}
+
+async fn check_host_budget(budget_mib: u32) -> Result<()> {
+    let result = timeout(
+        Duration::from_secs(3),
+        Command::new("/usr/sbin/sysctl")
+            .kill_on_drop(true)
+            .args(["-n", "hw.memsize"])
+            .output(),
+    )
+    .await??;
+    ensure!(
+        result.status.success(),
+        "resource_exhausted: cannot read host memory"
+    );
+    let physical = std::str::from_utf8(&result.stdout)?.trim().parse::<u64>()?;
+    let ceiling = physical / (4 * MIB);
+    ensure!(
+        u64::from(budget_mib) <= ceiling,
+        "resource_exhausted: VM budget exceeds this host's {} MiB ceiling",
+        ceiling
+    );
+    Ok(())
+}
+
+async fn inspect(vm: &Vm) -> Result<Option<serde_json::Value>> {
+    let entry = inspect_owned(vm).await?;
+    if vm.network == Network::Offline
+        && let Some(value) = &entry
+    {
+        ensure!(
+            offline_provider_config(value),
+            "policy_unavailable: provider did not confirm offline networking"
+        );
+        let resources = &value["configuration"]["resources"];
+        ensure!(
+            resources["memoryInBytes"].as_u64() == Some(u64::from(vm.memory_mib) * MIB)
+                && resources["cpus"].as_u64() == Some(u64::from(vm.cpus)),
+            "resource_exhausted: provider resources differ from the offline workspace registration"
+        );
+    }
+    Ok(entry)
+}
+
+async fn inspect_owned(vm: &Vm) -> Result<Option<serde_json::Value>> {
+    // A failed provider query is never interpreted as an absent VM.
+    let all = instances().await?;
     let found = all
         .iter()
         .any(|v| v["id"].as_str() == Some(&vm.instance_id));
@@ -384,6 +534,19 @@ async fn guest(vm: &Vm, args: &[&str]) -> Result<String> {
     let mut argv = vec!["exec", &vm.instance_id, "python3", "-I", HELPER];
     argv.extend_from_slice(args);
     output(&argv, Duration::from_secs(15)).await
+}
+
+async fn require_guest_network(vm: &Vm) -> Result<()> {
+    if vm.network == Network::Offline {
+        let result = guest(vm, &["offline-check"])
+            .await
+            .context("policy_unavailable: guest loopback-only check failed")?;
+        ensure!(
+            result.trim() == "offline",
+            "policy_unavailable: invalid guest offline response"
+        );
+    }
+    Ok(())
 }
 
 async fn forkfs_guest(vm: &Vm, boot_id: &str, mode: &str) -> Result<String> {
@@ -549,13 +712,14 @@ pub async fn publish(
     check_registered(state, vm)?;
     let _operation = publication_operation_lock(state, vm)?;
     let boot_id = require_ready(state, vm)?;
-    check_provider().await?;
+    check_provider(vm).await?;
     ensure!(
         inspect(vm)
             .await?
             .is_some_and(|v| v["status"]["state"] == "running"),
         "workspace is not running"
     );
+    require_guest_network(vm).await?;
     require_storage(vm, &boot_id).await?;
     let probe: serde_json::Value = serde_json::from_str(&guest(vm, &["probe"]).await?)?;
     ensure!(
@@ -608,7 +772,7 @@ pub async fn port_worker(
     let vm = get(state, workspace)?.context("publication requires a Linux VM workspace")?;
     let boot_id = require_ready(state, &vm)?;
     let publication: crate::port_publish::Publication = serde_json::from_str(spec)?;
-    check_provider().await?;
+    check_provider(&vm).await?;
     ensure!(
         inspect(&vm)
             .await?
@@ -619,6 +783,7 @@ pub async fn port_worker(
         publication.host_port >= 1024 && publication.target_port != 0,
         "invalid publication port"
     );
+    require_guest_network(&vm).await?;
     require_storage(&vm, &boot_id).await?;
     let bridge = provider()
         .args([
@@ -651,7 +816,7 @@ pub async fn service(
     let _lock = operation_lock(state, vm, true)?;
     check_registered(state, vm)?;
     let boot_id = require_ready(state, vm)?;
-    check_provider().await?;
+    check_provider(vm).await?;
     ensure!(
         inspect(vm)
             .await?
@@ -663,6 +828,7 @@ pub async fn service(
         .context("missing service action")?
         .to_owned();
     if matches!(action.as_str(), "start" | "restart") {
+        require_guest_network(vm).await?;
         require_storage(vm, &boot_id).await?;
     }
     let writes = matches!(action.as_str(), "start" | "stop" | "restart" | "remove");
@@ -777,7 +943,7 @@ async fn start_service_supervisor(vm: &Vm, boot_id: &str) -> Result<()> {
 pub async fn show(state: &Path, vm: &Vm) -> Result<serde_json::Value> {
     let journal = lifecycle(state, vm)?;
     let observation = async {
-        check_provider().await?;
+        check_provider(vm).await?;
         inspect(vm).await
     }
     .await;
@@ -799,11 +965,16 @@ pub async fn show(state: &Path, vm: &Vm) -> Result<serde_json::Value> {
             Some("running") if journal.phase == Phase::Ready && journal.boot_id.is_some() => {
                 match guest(vm, &["boot-id"]).await {
                     Ok(boot_id) if journal.boot_id.as_deref() == Some(boot_id.trim()) => {
-                        match require_storage(vm, boot_id.trim()).await {
-                            Ok(()) => "ready",
-                            Err(cause) => {
-                                error = Some(format!("{cause:#}"));
-                                "storage_unavailable"
+                        if let Err(cause) = require_guest_network(vm).await {
+                            error = Some(format!("{cause:#}"));
+                            "policy_unavailable"
+                        } else {
+                            match require_storage(vm, boot_id.trim()).await {
+                                Ok(()) => "ready",
+                                Err(cause) => {
+                                    error = Some(format!("{cause:#}"));
+                                    "storage_unavailable"
+                                }
                             }
                         }
                     }
@@ -828,12 +999,25 @@ pub async fn show(state: &Path, vm: &Vm) -> Result<serde_json::Value> {
         .as_secs();
     Ok(
         serde_json::json!({"id":vm.id,"status":status,"lifecycle":journal,"observed_at_unix":observed_at,"configuration":vm,"observed":observed,"observation_error":error,"experimental":true,
-        "capabilities":{"host_directory_mounts":false,"file_import":vm.forkfs.is_none(),"file_export":true,"egress_filtering":false,"host_lan_blocking":false,"worldfs":vm.forkfs.is_some() && status == "ready","pty":false,"parallel_exec":true,"guest_services":true,"host_tcp_publish":true},
-        "network_policy":"provider NAT, unrestricted egress; not a hostile-workload sandbox"}),
+        "capabilities":{"host_directory_mounts":false,"file_import":vm.forkfs.is_none(),"file_export":true,"egress_filtering":false,"host_lan_blocking":false,"offline_network":vm.network == Network::Offline && status == "ready","worldfs":vm.forkfs.is_some() && status == "ready","pty":false,"parallel_exec":true,"guest_services":true,"host_tcp_publish":true},
+        "network_policy":vm.network.description()}),
     )
 }
 
 pub async fn setup(state: &Path, vm: &Vm, recreate_missing: bool) -> Result<()> {
+    setup_with_budget(state, vm, recreate_missing, None).await
+}
+
+pub async fn setup_with_budget(
+    state: &Path,
+    vm: &Vm,
+    recreate_missing: bool,
+    budget_mib: Option<u32>,
+) -> Result<()> {
+    ensure!(
+        budget_mib.is_none() || vm.network == Network::Offline,
+        "multi-VM admission requires --network offline"
+    );
     let _lock = operation_lock(state, vm, false)?;
     check_registered(state, vm)?;
     let mut journal = lifecycle(state, vm)?;
@@ -856,19 +1040,25 @@ pub async fn setup(state: &Path, vm: &Vm, recreate_missing: bool) -> Result<()> 
     admission
         .try_lock_exclusive()
         .context("another VM setup is in progress")?;
-    check_provider().await?;
+    check_provider(vm).await?;
     let current = inspect(vm).await?;
     let running = current
         .as_ref()
         .is_some_and(|v| v["status"]["state"] == "running");
     if !running {
-        let all: Vec<serde_json::Value> = serde_json::from_str(
-            &output(&["list", "--format", "json"], Duration::from_secs(15)).await?,
-        )?;
-        ensure!(
-            all.is_empty(),
-            "another container is running; experimental low-memory mode permits only one VM at a time"
-        );
+        if let Some(entry) = &current {
+            ensure!(
+                matches!(
+                    entry["status"]["state"].as_str(),
+                    Some("stopped" | "created")
+                ),
+                "VM state is not safely stopped; inspect provider state before retry"
+            );
+        }
+        if let Some(budget) = budget_mib {
+            check_host_budget(budget).await?;
+        }
+        check_admission_inventory(&instances().await?, vm.memory_mib, budget_mib)?;
         if current.is_none() {
             ensure!(
                 journal.phase == Phase::Created || recreate_missing,
@@ -881,7 +1071,7 @@ pub async fn setup(state: &Path, vm: &Vm, recreate_missing: bool) -> Result<()> 
             let label = format!("world.owner={}", vm.owner);
             // Fixed bootstrap, never interpolated user data. Installed through
             // argv, not stdin (stdin belongs to future workloads).
-            let bootstrap = "import os,pathlib,sys,time; p=pathlib.Path('/opt/world'); p.mkdir(exist_ok=True); (p/'supervisor.py').write_text(sys.argv[1]); pathlib.Path('/workspace').mkdir(exist_ok=True); pathlib.Path('/home/world').mkdir(exist_ok=True); os.chown('/home/world',1000,1000); os.chown('/workspace',1000,1000) if not sys.argv[2] else (p/'forkfs-source').write_text(sys.argv[2]); time.sleep(2147483647)";
+            let bootstrap = "import os,pathlib,sys,time; p=pathlib.Path('/opt/world'); p.mkdir(exist_ok=True); (p/'supervisor.py').write_text(sys.argv[1]); pathlib.Path('/workspace').mkdir(exist_ok=True); pathlib.Path('/home/world').mkdir(exist_ok=True); os.chown('/home/world',1000,1000); os.chown('/workspace',1000,1000) if not sys.argv[2] else (p/'forkfs-source').write_text(sys.argv[2]); (p/'offline').touch() if sys.argv[3] == 'offline' else None; time.sleep(2147483647)";
             let source = vm
                 .forkfs
                 .as_ref()
@@ -901,6 +1091,18 @@ pub async fn setup(state: &Path, vm: &Vm, recreate_missing: bool) -> Result<()> 
             if vm.forkfs.is_some() {
                 create.extend(["--cap-add", "SYS_ADMIN"]);
             }
+            let network_mode = if vm.network == Network::Offline {
+                create.extend([
+                    "--network",
+                    "none",
+                    "--no-dns",
+                    "--label",
+                    "world.network=offline",
+                ]);
+                "offline"
+            } else {
+                "nat"
+            };
             create.extend([
                 vm.image.as_str(),
                 "python3",
@@ -909,8 +1111,14 @@ pub async fn setup(state: &Path, vm: &Vm, recreate_missing: bool) -> Result<()> 
                 bootstrap,
                 GUEST,
                 &source,
+                network_mode,
             ]);
             output(&create, Duration::from_secs(180)).await?;
+            if vm.network == Network::Offline {
+                inspect(vm)
+                    .await?
+                    .context("policy_unavailable: cannot verify created offline VM")?;
+            }
         }
         journal.generation = journal
             .generation
@@ -919,6 +1127,11 @@ pub async fn setup(state: &Path, vm: &Vm, recreate_missing: bool) -> Result<()> 
         journal.phase = Phase::Starting;
         save_lifecycle(state, vm, &journal)?;
         output(&["start", &vm.instance_id], Duration::from_secs(60)).await?;
+    }
+    if vm.network == Network::Offline {
+        inspect(vm)
+            .await?
+            .context("policy_unavailable: cannot verify running offline VM")?;
     }
     let install = "import os,pathlib,sys; p=pathlib.Path('/opt/world'); p.mkdir(exist_ok=True); t=p/'supervisor.py.update'; t.write_text(sys.argv[1]); os.chmod(t,0o644); os.replace(t,p/'supervisor.py')";
     output(
@@ -953,6 +1166,7 @@ pub async fn setup(state: &Path, vm: &Vm, recreate_missing: bool) -> Result<()> 
                         .checked_add(1)
                         .context("VM generation overflow")?;
                 }
+                require_guest_network(vm).await?;
                 if vm.forkfs.is_some() {
                     let mounted = forkfs_guest(vm, boot_id, "forkfs-mounted").await?;
                     match mounted.trim() {
@@ -979,7 +1193,10 @@ pub async fn setup(state: &Path, vm: &Vm, recreate_missing: bool) -> Result<()> 
                 journal.boot_id = Some(boot_id.to_owned());
                 journal.phase = Phase::Ready;
                 save_lifecycle(state, vm, &journal)?;
-                eprintln!("world: experimental Linux VM ready; NAT egress is unrestricted");
+                eprintln!(
+                    "world: experimental Linux VM ready ({})",
+                    vm.network.description()
+                );
                 return Ok(());
             }
             Err(e) => last = Some(e),
@@ -1002,8 +1219,8 @@ pub async fn teardown(state: &Path, vm: &Vm) -> Result<()> {
         "workspace deletion is pending; retry workspace delete"
     );
     crate::port_publish::control(&vm.owner, b"q").await?;
-    check_provider().await?;
-    if inspect(vm)
+    check_provider(vm).await?;
+    if inspect_owned(vm)
         .await?
         .is_some_and(|v| v["status"]["state"] == "running")
     {
@@ -1047,7 +1264,7 @@ pub async fn teardown(state: &Path, vm: &Vm) -> Result<()> {
         )
         .await?;
         ensure!(
-            !inspect(vm)
+            !inspect_owned(vm)
                 .await?
                 .is_some_and(|v| v["status"]["state"] == "running"),
             "VM still running after stop"
@@ -1071,8 +1288,8 @@ pub async fn teardown(state: &Path, vm: &Vm) -> Result<()> {
 pub async fn delete(state: &Path, vm: &Vm, discard_runtime_data: bool) -> Result<()> {
     let _lock = operation_lock(state, vm, false)?;
     check_registered(state, vm)?;
-    check_provider().await?;
-    let current = inspect(vm).await?;
+    check_provider(vm).await?;
+    let current = inspect_owned(vm).await?;
     if let Some(value) = &current {
         ensure!(
             matches!(
@@ -1103,7 +1320,7 @@ pub async fn delete(state: &Path, vm: &Vm, discard_runtime_data: bool) -> Result
         output(&["delete", &vm.instance_id], Duration::from_secs(30)).await?;
     }
     ensure!(
-        inspect(vm).await?.is_none(),
+        inspect_owned(vm).await?.is_none(),
         "VM still exists after delete; registration retained"
     );
     let _registry_lock = crate::silo::lock(state)?;
@@ -1120,8 +1337,8 @@ pub async fn delete(state: &Path, vm: &Vm, discard_runtime_data: bool) -> Result
 }
 
 async fn require_stopped(vm: &Vm, operation: &str) -> Result<()> {
-    check_provider().await?;
-    if let Some(instance) = inspect(vm).await? {
+    check_provider(vm).await?;
+    if let Some(instance) = inspect_owned(vm).await? {
         ensure!(
             matches!(
                 instance["status"]["state"].as_str(),
@@ -1270,7 +1487,7 @@ pub async fn exec(
     let _lock = operation_lock(state, vm, true)?;
     check_registered(state, vm)?;
     let boot_id = require_ready(state, vm)?;
-    check_provider().await?;
+    check_provider(vm).await?;
     ensure!(
         inspect(vm)
             .await?
@@ -1289,7 +1506,11 @@ pub async fn exec(
     }
     let token = random_id();
     let seconds = duration.as_secs_f64().to_string();
-    eprintln!("world: execution {token} (Linux VM; unrestricted NAT egress)");
+    require_guest_network(vm).await?;
+    eprintln!(
+        "world: execution {token} (Linux VM; {})",
+        vm.network.description()
+    );
     let mut child = provider()
         .args([
             "exec",
@@ -1383,13 +1604,14 @@ pub async fn import(
         "workspace import requires VM-local storage; seed the forkfs branch with forkfsd before mounting"
     );
     let boot_id = require_ready(state, vm)?;
-    check_provider().await?;
+    check_provider(vm).await?;
     ensure!(
         inspect(vm)
             .await?
             .is_some_and(|v| v["status"]["state"] == "running"),
         "workspace is not running; run world workspace setup first"
     );
+    require_guest_network(vm).await?;
     let probe: serde_json::Value = serde_json::from_str(&guest(vm, &["probe"]).await?)?;
     ensure!(
         probe["import_protocol"] == 1,
@@ -1456,13 +1678,14 @@ pub async fn export(
     let _lock = operation_lock(state, vm, false)?;
     check_registered(state, vm)?;
     let boot_id = require_ready(state, vm)?;
-    check_provider().await?;
+    check_provider(vm).await?;
     ensure!(
         inspect(vm)
             .await?
             .is_some_and(|v| v["status"]["state"] == "running"),
         "workspace is not running; run workspace setup first"
     );
+    require_guest_network(vm).await?;
     let probe: serde_json::Value = serde_json::from_str(&guest(vm, &["probe"]).await?)?;
     ensure!(
         probe["export_protocol"] == 1,
@@ -1533,6 +1756,34 @@ pub async fn export(
 mod tests {
     use super::*;
     #[test]
+    fn multi_vm_admission_counts_reserves_and_rejects_unverified_instances() {
+        let owner = "a".repeat(32);
+        let running = serde_json::json!({
+            "id": format!("world-{owner}"),
+            "configuration": {
+                "labels": {"world.owner": owner, "world.network": "offline"},
+                "networks": [], "publishedPorts": [], "publishedSockets": [],
+                "resources": {"memoryInBytes": 256 * MIB}
+            },
+            "status": {"state": "running", "networks": []}
+        });
+        let stopped = serde_json::json!({"status": {"state": "stopped"}});
+        assert!(check_admission_inventory(std::slice::from_ref(&stopped), 256, None).is_ok());
+        assert!(check_admission_inventory(std::slice::from_ref(&running), 256, None).is_err());
+        assert!(check_admission_inventory(&[running.clone(), stopped], 256, Some(1024)).is_ok());
+        assert!(
+            check_admission_inventory(std::slice::from_ref(&running), 256, Some(1023)).is_err()
+        );
+
+        let mut missing_memory = running.clone();
+        missing_memory["configuration"]["resources"] = serde_json::Value::Null;
+        assert!(check_admission_inventory(&[missing_memory], 256, Some(2048)).is_err());
+        let mut attached = running;
+        attached["status"]["networks"] = serde_json::json!([{"network": "default"}]);
+        assert!(check_admission_inventory(&[attached], 256, Some(2048)).is_err());
+    }
+
+    #[test]
     fn registry_rejects_future_schema_instead_of_falling_back() {
         let state = tempfile::tempdir().unwrap();
         let owner = "a".repeat(32);
@@ -1547,6 +1798,7 @@ mod tests {
             image: IMAGE.into(),
             cpus: 1,
             memory_mib: 256,
+            network: Network::Nat,
             forkfs: None,
         };
         crate::silo::persist(

@@ -17,8 +17,8 @@
 
 | 项目 | 当前行为 |
 | --- | --- |
-| 网络安全策略 | provider NAT，**尚不阻止宿主/LAN/跨 guest 出站**；show 明确返回能力 false；不支持严格出口策略 |
-| 运行预算 | 每用户 setup 准入锁；除已运行的本 World 外，发现其他运行 container 即拒绝启动；不统计其他供应商 VM/machine，也未实现基于内存压力的准入 |
+| 网络安全策略 | 默认 provider NAT。显式离线模式只启用 guest loopback。按目的地限制的互联网出口仍待实现 |
+| 运行预算 | 每用户 setup 准入锁。默认单 VM。离线 World 可显式指定总内存预算，准入会核对 provider 的活跃实例和配置内存 |
 | 数据与镜像 | guest 普通可写层，无宿主挂载；固定基础镜像加 root-owned helper；支持独立 import 和 export 命令；无创建时 --import、自定义镜像、WorldFS、分支合并 |
 | 服务 | Linux VM 已支持命名服务、独立 cgroup、状态和有界日志，支持宿主 IPv4 loopback TCP 发布。普通 exec 结束仍会清理后台子进程 |
 | 生命周期 | setup/teardown 与 exec 用文件锁互斥；teardown 遇活跃执行返回 busy，不能自动批量取消；已落盘阶段和启动 generation；尚无完整 Execution 恢复日志 |
@@ -419,3 +419,25 @@ Apple Silicon 端到端验收使用两台先后运行的 VM 从同一基线修�
 python3 experiments/macos/world_vm_forkfs_smoke.py /path/to/forkfsd --merge \
   --forkfsd-fault /path/to/forkfsd_leveldb_fault_test
 ```
+
+### 阶段 4 多 World 离线预览
+
+在已验证的 Apple container 1.7.1 上，新建 workspace 可选择离线模式。离线 VM 创建时使用 `--network none --no-dns`。World 在 setup、查询就绪状态和启动工作前检查 provider 的网络记录及 guest 接口。guest 只有 loopback 时才接受任务。显式发布仍通过 World 的宿主 loopback broker 接入指定 guest 服务。
+
+```sh
+world workspace create a --os linux --network offline --memory 256M
+world workspace create b --os linux --network offline --memory 256M
+world workspace setup a --vm-memory-budget 1G
+world workspace setup b --vm-memory-budget 1G
+```
+
+默认继续使用单 VM 准入。总预算最多为物理内存的四分之一，计入每台活跃 VM 的工作负载限额及 256 MiB 预留。准入锁覆盖同一用户的不同 state 目录。活跃实例必须全部为可验证的离线 World。资源或状态不明时拒绝新启动，现有 VM 照常运行。此预算使用 provider 配置额度，动态内存压力、其他供应商 VM 和实际工作负载上限仍待验收。
+
+```sh
+cargo build --workspace --locked
+python3 experiments/macos/world_vm_multi_smoke.py
+```
+
+在 8 GiB Apple Silicon Mac 上，两台 256 MiB VM 同时监听各自的 `127.0.0.1:8080`，宿主从不同 loopback 端口取回各自的文件。测试验证 IPv4、IPv6 和 DNS 目标均无路由，预算不足时第三台 VM 未启动，且停掉一台后另一台仍可执行和发布。撤去一次性 guest 的离线标记后，新 exec 和服务重启均被拒绝。另一次 256 MiB 离线 VM 实测通过 forkfs 作为 /workspace 的读写和卸载，guest 写入可从宿主 RPC 读回。证据目录记录了机器环境、命令结果及宿主内存压力采样。
+
+阶段 4 的受限联网仍待实现。联网模式需要验证 IPv4、IPv6、DNS 和重绑定策略，以及对宿主、局域网、其他 guest 的拒绝与对指定出口的放行。
