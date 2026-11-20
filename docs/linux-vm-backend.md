@@ -72,14 +72,14 @@ world service unpublish dev web --name browser
 ## 已实现的生命周期管理
 
 - `workspace list` 返回所有本地登记；原生记录标为 `unobserved`，不凭 loopback 地址推断进程存活。VM 的本地配置始终保留在查询结果中，provider/版本/归属校验失败返回 `unknown` 与 `observation_error`。
-- `workspace show` 的 VM 状态区分 `created`（尚未创建实例）、`ready`（实例运行，且 guest boot ID 与最近一次 setup 的记录一致）、`unverified`（实例存在，但本地阶段、guest boot ID 或 provider 状态尚未确认）、`stopped`、`missing`（此前已尝试创建/运行、现在确认不存在）和 `deleting`。ready 不是持续 guest 健康探测；exec 会再次握手。`lifecycle.phase` 返回最后持久化的操作阶段，`observed_at_unix` 是本次观测时间，generation 在每次尝试启动前递增。若 provider 已在 World 外重启 VM，setup 验证并登记新 boot ID 时递增；同一次启动上的幂等 setup 保持原代际。旧记录缺少 boot ID 时需先执行 setup。
+- `workspace show` 的 VM 状态区分 `created`（尚未创建实例）、`ready`（实例运行，且 guest boot ID 与最近一次 setup 的记录一致）、`unverified`（实例存在，但本地阶段、guest boot ID 或 provider 状态尚未确认）、`stopped`、`missing`（此前已尝试创建/运行、现在确认不存在）和 `deleting`。forkfs workspace 也会在查询时检查挂载，失败时报告 `storage_unavailable`。exec 每次启动前重新验证。`lifecycle.phase` 返回最后持久化的操作阶段，`observed_at_unix` 是本次观测时间，generation 在每次尝试启动前递增。若 provider 已在 World 外重启 VM，setup 验证并登记新 boot ID 时递增；同一次启动上的幂等 setup 保持原代际。旧记录缺少 boot ID 时需先执行 setup。
 - 阶段记录按 instance owner 单独原子持久化，包含 created/provisioning/starting/ready/stopping/stopped/deleting。中断操作保留阶段用于后续检查；缺日志的旧记录视为 legacy，存在的实例可通过 setup 重新验证，缺失的实例不会被默认为从未创建。
-- setup 发现旧运行时缺失或首次创建是否成功无法确认时拒绝隐式新建。只有 `--recreate-missing` 显式允许在确认实例不存在时创建空运行时；存在的实例始终复用，不能用该选项覆盖。此行为不提供旧文件恢复，forkfs 分支挂载由 #28 单独实现。
+- setup 发现旧运行时缺失或首次创建是否成功无法确认时拒绝隐式新建。只有 `--recreate-missing` 显式允许在确认实例不存在时创建空运行时；存在的实例始终复用，不能用该选项覆盖。VM 可写层文件随原实例丢失。已绑定 forkfs 的 workspace 会重新挂载原分支。
 - teardown 保留注册和数据，不触发 WorldFS discard。活跃 exec/import 与其锁互斥，返回 busy，调用者应先取消执行。provider 不可用时不改写已知阶段；停止结果未知时保留 stopping，重试前重新观测。
 - `workspace delete <name>` 要求没有活跃执行、provider 可查询，实例已 stopped/created，owner/image 匹配且 mounts 为空。有实例时必须指定 `--discard-runtime-data`，明确授权永久删除其可写层；尚未创建或确认丢失的实例可仅删除登记。原生 Workspace 暂不支持 delete。
 - 删除先落盘 deleting，再删除 provider 实例，确认不存在后原子移除登记；任何 provider 错误保留登记，重复 delete 可完成收尾。deleting 阶段拒绝 setup/exec/import/同名 create。小型 journal/锁文件保留为 tombstone，避免旧句柄复活。所有操作取得锁后重新检查登记 owner，防止删除后同名重建的竞争。
 
-运行时删除不调用 forkfs 分支删除。当前带挂载的实例直接拒绝删除，避免在 #28 挂载与卸载契约尚未落地时自动处理存储；该阶段后续扩展必须先释放挂载。尚未实现公共 Execution 查询/日志恢复、完整操作错误日志、跨 provider 恢复或自动 setup。
+带 provider 挂载的实例拒绝删除。forkfs workspace 删除前需结束挂载 worker，分支保留在仓库中。尚未实现公共 Execution 查询/日志恢复、完整操作错误日志、跨 provider 恢复或自动 setup。
 
 真实单 VM 回归追加验证：list、ready/stopped/created/missing/unknown 状态、幂等 setup 不推进 generation、重启推进 generation、删除运行 VM 拒绝、无数据删除确认拒绝、外部删除后的隐式重建拒绝与显式重建、删除 VM 保留同注册表原生记录，以及删除未创建实例的登记。单元测试覆盖 deleting 阶段防复活和同名替换后的旧句柄拒绝。
 
@@ -302,7 +302,7 @@ OpenCode 使用 guest loopback 上的 [脚本化模型替身](../experiments/mac
 
 ### 阶段 3 分支挂载可行性
 
-2026-11-19 验证环境为 Apple Silicon、macOS 27.2 (26B123)、Apple container 1.7.1。每次只运行一台 512 MiB 工作负载限额 VM。forkfs 使用 [`2a55b415` 的 revision-backed daemon](https://github.com/forks-world/forkfs/tree/2a55b415baa6c4d25a67b7563f4ca7a2870ad712)。该版本提供同 UID 的 Unix socket RPC、World 和 revision 选择、`inode-root` 挂载租约及按 revision 的 diff。构建产物包含 daemon 和可选的 macOS FSKit 前端。Linux FUSE 客户端由 World 侧下一步实现，受管存储的认证和绑定仍按 World 架构设计接入。
+2026-11-19 验证环境为 Apple Silicon、macOS 27.2 (26B123)、Apple container 1.7.1。每次只运行一台 512 MiB 工作负载限额 VM。forkfs 使用 [`2a55b415` 的 revision-backed daemon](https://github.com/forks-world/forkfs/tree/2a55b415baa6c4d25a67b7563f4ca7a2870ad712)。该版本提供同 UID 的 Unix socket RPC、World 和 revision 选择、`inode-root` 挂载租约及按 revision 的 diff。构建产物包含 daemon 和可选的 macOS FSKit 前端。后续小节记录 Linux FUSE 客户端及本地绑定的验收。受管存储的认证和绑定仍按 World 架构设计接入。
 
 | 路线 | 实测结果 |
 | --- | --- |
@@ -336,3 +336,69 @@ python3 experiments/macos/forkfs_writable_mount_probe.py /path/to/forkfsd
 探针通过单一 `container exec -i` 通道调用宿主 broker。broker 只接受固定的 inode、目录和文件句柄操作，分支和租约由宿主绑定。应用 I/O 使用 FUSE direct I/O，探针每次传输最多 4 KiB；目录按页从 forkfs 读取，在 guest 按打开句柄保存有界列表。探针租约在 RPC 活动时延长，适用于短时验收。环境、每次挂载结果及 checkpoint diff 写入脚本输出的 Evidence 目录。
 
 下一步把挂载就绪检查、租约保活和失联后的任务准入接入 World 生命周期，再验收 checkpoint 协调停写、merge 和 discard。当前原型还需验证完整的 POSIX 兼容性、长期负载和性能。
+
+### 阶段 3 接入本地 World 生命周期
+
+在 Apple Silicon Mac 上启动同 UID 的 forkfsd，准备已有的 LevelDB 分支。用 `forkfsd request "$socket" status` 查询 `repository_id`。新建 workspace 时显式绑定 socket、仓库 ID 和分支。
+
+```sh
+world workspace create dev --os linux \
+  --forkfs-socket "$socket" --forkfs-repository "$repository" --forkfs-branch work
+world workspace setup dev
+world exec dev -- ls -la
+world workspace teardown dev
+```
+
+`setup` 验证仓库 ID、独占租约、VM 启动代际和 guest 中的真实挂载后，才将 workspace 标记为 `ready`。宿主 worker 每 3 秒续签 15 秒租约。分支打开后由 UID 1000 的任务和服务共享。forkfs 绑定不支持 `workspace import`，请在挂载前通过 forkfsd 准备分支内容。内容可以通过 `workspace export` 导出到新的宿主目录。
+
+forkfsd 失联或 socket 被替换时，`workspace show` 报告 `storage_unavailable`。新 exec、服务启动或重启、端口发布及导出都会验证存储健康。guest 在创建工作进程时从已验证的挂载目录句柄进入 `/workspace`。故障恢复时先 teardown，待原仓库可用后再 setup。teardown 撤发布、停止 guest 服务、卸载并等待挂载 worker 结束，随后停止 VM。正常卸载释放租约，worker 意外退出时由 forkfsd 让租约到期。使用 `setup --recreate-missing` 重建已丢失的 VM 可重新挂载原分支。删除 workspace 记录及 VM 仅影响本地运行时。
+
+```sh
+cargo build --workspace --locked
+python3 experiments/macos/world_vm_forkfs_smoke.py /path/to/forkfsd
+```
+
+2026-11-20 真机回归覆盖错误仓库 ID、空闲超过租约时限、exec 与服务共享文件、卸载后恢复其他写入、VM 重建和导出、存储失联时拒绝新任务，以及原 daemon 恢复后的重新挂载。下一阶段接入 World 的 checkpoint 协调停写、差异查询及 merge/discard 命令。
+
+### 阶段 3 文件级 fork、checkpoint 与 diff
+
+```sh
+world workspace teardown dev
+world workspace checkpoint dev before
+world workspace fork dev before feature-a
+world workspace fork dev before feature-b
+```
+
+`checkpoint` 要求 VM 已停止，或由 provider 确认实例不存在。World 持有 workspace 排他操作锁，同时向 forkfsd 取得该分支的独占租约。其他客户端仍挂载该分支或持有文件句柄时，checkpoint 会失败。成功返回 checkpoint 名称、revision ID 和分支名。
+
+`fork` 从同仓库的命名 checkpoint 创建新的可写存储分支。新分支可在创建新 workspace 时通过 `--forkfs-branch` 显式绑定，VM 资源也在创建时配置。同名分支和 checkpoint 都由 forkfsd 拒绝覆盖。
+
+完成修改并停掉对应 workspace 后，可以创建第二个 checkpoint，再比较两份不可变 revision。比较使用仓库范围内的 checkpoint 名称，返回 JSON 文件级变更和 revision ID。`eof` 为 false 时，把本页的 `next_after` 作为下一页的 `--after-path`，保持同一对 checkpoint。
+
+```sh
+world workspace checkpoint dev after
+world workspace diff dev before after --limit 32
+```
+
+Apple Silicon 验收复用 `world_vm_forkfs_smoke.py`，覆盖服务写入后创建 checkpoint、外部文件句柄阻止 checkpoint、分页读出修改文件与新增文件、从不同 checkpoint fork 得到相应内容，以及同名重试保留已有分支。
+
+阶段 3 的 merge 仍需 forkfs 提供单次原子发布，在应用三方合并结果时验证目标 head 并返回冲突。
+
+### 阶段 3 在线 discard
+
+```sh
+world workspace teardown dev
+world workspace discard dev
+world workspace discard dev --expect-token "$token"
+```
+
+预览返回分支、manifest ID、base revision ID 和确认令牌。确认要求 VM 已停止，或 provider 确认实例不存在。forkfsd 会检查目标分支的挂载、文件句柄和目录游标，并在一次同步事务中验证令牌和删除分支 head/base。令牌包含整个仓库的提交序号，任何提交后都需重新预览。这个检查也能区分从同一个 revision 重建的同名分支。
+
+删除会丢弃未 checkpoint 的分支状态。命名 checkpoint、其历史和其他分支仍可访问。World 记录 `discarding` 后才发出删除请求。若连接在提交期间中断，可用原令牌重试。forkfsd 确认分支已不存在后，World 记录 `discarded`。如果同名分支已重建，原令牌不能删除它，原 workspace 也不能重新挂载它。可以用 `workspace delete` 单独清理本地登记及已停止的 VM。
+
+本功能需要包含 `fs-discard-plan` 和 `fs-discard` RPC 的 forkfsd。forkfs 仓库中的 `forkfsd_discard_rpc` 测试覆盖提交边界和句柄检查。以下真机 smoke 还使用 forkfs 的测试二进制，在同步提交前后分别强制中断 daemon，验证 World 的持久化状态和重试。
+
+```sh
+python3 experiments/macos/world_vm_forkfs_smoke.py /path/to/forkfsd \
+  --forkfsd-fault /path/to/forkfsd_leveldb_fault_test
+```

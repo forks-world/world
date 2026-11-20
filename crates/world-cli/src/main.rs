@@ -23,6 +23,12 @@ enum Commands {
         workspace: String,
         spec: String,
     },
+    #[command(name = "__forkfs-worker", hide = true)]
+    ForkfsWorker {
+        state: PathBuf,
+        workspace: String,
+        boot_id: String,
+    },
     Network {
         #[command(subcommand)]
         command: Network,
@@ -151,9 +157,47 @@ enum Workspace {
         /// VM workload memory limit, e.g. 256M, 512M or 1G.
         #[arg(long, value_parser = parse_memory)]
         memory: Option<u32>,
+        /// Host Unix socket of a running forkfsd daemon.
+        #[arg(long, requires_all = ["forkfs_repository", "forkfs_branch"])]
+        forkfs_socket: Option<PathBuf>,
+        /// Expected repository ID reported by forkfsd.
+        #[arg(long, requires = "forkfs_socket")]
+        forkfs_repository: Option<String>,
+        /// Existing mutable branch to lease for /workspace.
+        #[arg(long, requires = "forkfs_socket")]
+        forkfs_branch: Option<String>,
     },
     Show {
         workspace: String,
+    },
+    /// Save a named checkpoint of a stopped forkfs-backed workspace.
+    Checkpoint {
+        workspace: String,
+        name: String,
+    },
+    /// Compare two named checkpoints in the forkfs repository.
+    Diff {
+        workspace: String,
+        before: String,
+        after: String,
+        /// Resume after the path in the previous page's next_after field.
+        #[arg(long, default_value = "")]
+        after_path: String,
+        #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u8).range(1..=64))]
+        limit: u8,
+    },
+    /// Create a storage branch from a checkpoint in the same repository.
+    Fork {
+        workspace: String,
+        revision: String,
+        branch: String,
+    },
+    /// Preview a forkfs branch discard, or confirm it with the preview token.
+    Discard {
+        workspace: String,
+        /// Confirm removal of the exact branch state named by this token.
+        #[arg(long)]
+        expect_token: Option<String>,
     },
     /// Copy a host directory into an empty Linux VM /workspace.
     Import {
@@ -240,6 +284,23 @@ async fn run(cli: Cli) -> i32 {
 
 async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
     match cli.command {
+        Commands::ForkfsWorker {
+            state,
+            workspace,
+            boot_id,
+        } => {
+            if let Err(error) = apple_vm::forkfs_worker(&state, &workspace, &boot_id, cancel).await
+            {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stdout(),
+                    "{}",
+                    serde_json::json!({"error":format!("{error:#}")})
+                );
+                return Ok(125);
+            }
+            Ok(0)
+        }
         Commands::PortWorker {
             state,
             workspace,
@@ -302,7 +363,21 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                     os,
                     cpus,
                     memory,
+                    forkfs_socket,
+                    forkfs_repository,
+                    forkfs_branch,
                 } => {
+                    let forkfs = match (forkfs_socket, forkfs_repository, forkfs_branch) {
+                        (Some(socket), Some(repository), Some(branch)) => {
+                            Some(apple_vm::ForkfsBinding {
+                                socket: std::path::absolute(socket)?,
+                                repository,
+                                branch,
+                            })
+                        }
+                        (None, None, None) => None,
+                        _ => anyhow::bail!("forkfs requires socket, repository ID, and branch"),
+                    };
                     let requested = os.as_deref().unwrap_or(std::env::consts::OS);
                     let vm = requested == "linux" && std::env::consts::OS == "macos";
                     if vm {
@@ -310,11 +385,12 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                             workdir.is_none(),
                             "Linux VM uses /workspace; --workdir is only for native workspaces (use workspace import after setup)"
                         );
-                        let record = apple_vm::create(
+                        let record = apple_vm::create_with_storage(
                             &state,
                             &workspace,
                             cpus.unwrap_or(1),
                             memory.unwrap_or(512),
+                            forkfs,
                         )?;
                         println!("{}", serde_json::to_string_pretty(&record)?);
                     } else {
@@ -326,6 +402,10 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                             cpus.is_none() && memory.is_none(),
                             "resource flags currently require the Linux VM backend"
                         );
+                        anyhow::ensure!(
+                            forkfs.is_none(),
+                            "forkfs requires the macOS Linux VM backend"
+                        );
                         let workdir = workdir.context("native workspace requires --workdir")?;
                         println!(
                             "{}",
@@ -334,6 +414,48 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
                             )?)?
                         );
                     }
+                    Ok(0)
+                }
+                Workspace::Checkpoint { workspace, name } => {
+                    let vm = apple_vm::get(&state, &workspace)?
+                        .context("checkpoint requires a forkfs-backed workspace")?;
+                    let result = apple_vm::checkpoint(&state, &vm, &name).await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    Ok(0)
+                }
+                Workspace::Diff {
+                    workspace,
+                    before,
+                    after,
+                    after_path,
+                    limit,
+                } => {
+                    let vm = apple_vm::get(&state, &workspace)?
+                        .context("diff requires a forkfs-backed workspace")?;
+                    let result =
+                        apple_vm::diff(&state, &vm, &before, &after, &after_path, limit).await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    Ok(0)
+                }
+                Workspace::Fork {
+                    workspace,
+                    revision,
+                    branch,
+                } => {
+                    let vm = apple_vm::get(&state, &workspace)?
+                        .context("fork requires a forkfs-backed workspace")?;
+                    let result = apple_vm::fork(&state, &vm, &revision, &branch).await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    Ok(0)
+                }
+                Workspace::Discard {
+                    workspace,
+                    expect_token,
+                } => {
+                    let vm = apple_vm::get(&state, &workspace)?
+                        .context("discard requires a forkfs-backed workspace")?;
+                    let result = apple_vm::discard(&state, &vm, expect_token.as_deref()).await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
                     Ok(0)
                 }
                 Workspace::Import { workspace, source } => {
