@@ -10,7 +10,7 @@ import time
 from world_vm_egress_probe import GUEST_DIRECT
 
 WORKLOAD = r"""
-import base64, concurrent.futures, http.client, os, socket, ssl, threading
+import base64, concurrent.futures, http.client, os, socket, ssl, threading, time
 from urllib.parse import urlsplit
 
 assert [name for _, name in socket.if_nameindex()] == ['lo']
@@ -21,12 +21,16 @@ auth = base64.b64encode(f'{proxy.username}:{proxy.password}'.encode()).decode()
 headers = {'Proxy-Authorization': 'Basic ' + auth}
 ready = threading.Barrier(4)
 
-def fetch(_):
-    ready.wait(timeout=5)
+def fetch(index):
+    if index >= 0:
+        ready.wait(timeout=5)
     connection = http.client.HTTPSConnection(proxy.hostname, proxy.port, timeout=8,
                                              context=ssl.create_default_context())
     try:
         connection.set_tunnel('example.com', 443, headers)
+        if index < 0:
+            connection.connect()
+            time.sleep(2.5)  # Keep a real tunnel open across the route recheck.
         connection.request('GET', '/')
         response = connection.getresponse()
         assert response.status == 200 and b'Example Domain' in response.read(64 * 1024)
@@ -38,6 +42,8 @@ with socket.create_connection((proxy.hostname, proxy.port), timeout=3):
     # An idle stream must not prevent the four independent TLS handshakes.
     with concurrent.futures.ThreadPoolExecutor(4) as pool:
         assert list(pool.map(fetch, range(4))) == [200] * 4
+
+assert fetch(-1) == 200
 
 for target in ('example.org:443', 'example.com:80', '127.0.0.1:443', '[fd00::1]:443'):
     connection = http.client.HTTPConnection(proxy.hostname, proxy.port, timeout=5)
@@ -94,6 +100,16 @@ def main():
             invocation('touch', '/workspace/invalid-policy-ran', policy=blocked),
             code=125, diagnostic='policy_unavailable')
         run('check-no-execution-on-rejection', invocation('test', '!', '-e', 'invalid-policy-ran'))
+        v6_default = subprocess.run(['/sbin/route', '-n', 'get', '-inet6', 'default'],
+                                    text=True, capture_output=True, timeout=5)
+        if not v6_default.stdout.strip() and 'not in table' in v6_default.stderr:
+            v6_policy = evidence / 'ipv6-only.json'
+            v6_policy.write_text(json.dumps({
+                'network_id': 'v6-no-default',
+                'allow': [{'host': '2606:4700:4700::1111', 'port': 443}],
+            }))
+            run('reject-ipv6-only-without-default', invocation('true', policy=v6_policy),
+                code=125, diagnostic='no usable default route')
         run('exec-parallel-https', invocation('python3', '-c', WORKLOAD, policy=allowed))
         run('exec-client-uses-standard-proxy-env', invocation('python3', '-c',
             'import urllib.request; assert urllib.request.urlopen("https://example.com/", timeout=8).status == 200',

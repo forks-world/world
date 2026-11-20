@@ -13,3 +13,4 @@ pub mod run;
 pub mod silo;
 mod vm_egress;
 mod vm_egress_bridge;
+mod vm_egress_route;

@@ -1,4 +1,7 @@
-use crate::policy::{Policy, authority, canonical_host};
+use crate::{
+    policy::{Policy, authority, canonical_host},
+    vm_egress_route::PinnedRoutes,
+};
 use anyhow::{Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
@@ -34,7 +37,7 @@ pub struct Proxy {
 
 struct Service {
     routes: HashMap<String, Vec<SocketAddr>>,
-    vm_egress: bool,
+    vm_routes: Option<PinnedRoutes>,
     authorization: String,
     cancel: CancellationToken,
     tasks: TaskTracker,
@@ -44,7 +47,7 @@ struct Service {
 /// e.g. inside a workload network namespace.
 pub struct Prepared {
     routes: HashMap<String, Vec<SocketAddr>>,
-    vm_egress: bool,
+    vm_routes: Option<PinnedRoutes>,
     credential: String,
 }
 
@@ -69,7 +72,7 @@ impl Prepared {
         let tasks = TaskTracker::new();
         let service = Arc::new(Service {
             routes: self.routes,
-            vm_egress: self.vm_egress,
+            vm_routes: self.vm_routes,
             authorization,
             cancel: cancel.clone(),
             tasks: tasks.clone(),
@@ -110,7 +113,9 @@ impl Proxy {
 
     /// Prepares routes for the experimental offline VM proxy transport.
     pub async fn prepare_vm_egress(policy: &Policy) -> Result<Prepared> {
-        Self::prepare_for(policy, true).await
+        let mut prepared = Self::prepare_for(policy, true).await?;
+        prepared.vm_routes = Some(PinnedRoutes::prepare(&mut prepared.routes).await?);
+        Ok(prepared)
     }
 
     async fn prepare_for(policy: &Policy, vm_egress: bool) -> Result<Prepared> {
@@ -171,7 +176,7 @@ impl Proxy {
             .collect::<String>();
         Ok(Prepared {
             routes,
-            vm_egress,
+            vm_routes: None,
             credential,
         })
     }
@@ -286,6 +291,14 @@ impl Service {
             Err(_) => response(StatusCode::BAD_GATEWAY, "upstream unavailable"),
         })
     }
+    async fn wait_for_route_change(&self, address: SocketAddr) {
+        if let Some(routes) = &self.vm_routes {
+            routes.wait_for_change(address).await;
+        } else {
+            std::future::pending().await
+        }
+    }
+
     async fn forward(self: Arc<Self>, mut req: Request<Incoming>) -> Result<Response<Body>> {
         let connect = req.method() == hyper::Method::CONNECT;
         let Some(auth) = req.uri().authority() else {
@@ -307,24 +320,25 @@ impl Service {
                 "destination denied by Network policy",
             ));
         };
-        // Keep the original DNS answers pinned, but recheck host interfaces
-        // in case one of those addresses has since become an on-link target.
-        if self.vm_egress && crate::vm_egress::require_public_destinations(addresses).is_err() {
-            return Ok(response(
-                StatusCode::FORBIDDEN,
-                "VM egress destination denied",
-            ));
-        }
-        let mut stream = None;
+        let mut upstream = None;
         for address in addresses {
-            if let Ok(Ok(connected)) =
-                timeout(Duration::from_secs(5), TcpStream::connect(address)).await
-            {
-                stream = Some(connected);
+            let connected = if let Some(routes) = &self.vm_routes {
+                match routes.connect(*address).await {
+                    Ok(connected) => connected,
+                    Err(_) => return Ok(response(StatusCode::FORBIDDEN, "VM egress route denied")),
+                }
+            } else {
+                timeout(Duration::from_secs(5), TcpStream::connect(address))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+            };
+            if let Some(connected) = connected {
+                upstream = Some((*address, connected));
                 break;
             }
         }
-        let Some(mut stream) = stream else {
+        let Some((selected, mut stream)) = upstream else {
             bail!("upstream unavailable")
         };
         if connect {
@@ -338,7 +352,11 @@ impl Service {
                                 .await;
                     }
                 };
-                tokio::select! {_=state.cancel.cancelled()=>{},_=transfer=>{}}
+                tokio::select! {
+                    _ = state.cancel.cancelled() => {},
+                    _ = state.wait_for_route_change(selected) => {},
+                    _ = transfer => {},
+                }
             });
             return Ok(response(StatusCode::OK, ""));
         }
@@ -359,9 +377,13 @@ impl Service {
         );
         let (mut sender, connection) =
             hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
-        let cancel = self.cancel.clone();
+        let state = self.clone();
         self.tasks.spawn(async move {
-            tokio::select! {_=cancel.cancelled()=>{},_=connection=>{}}
+            tokio::select! {
+                _ = state.cancel.cancelled() => {},
+                _ = state.wait_for_route_change(selected) => {},
+                _ = connection => {},
+            }
         });
         let mut res = timeout(Duration::from_secs(30), sender.send_request(req)).await??;
         strip_hop_headers(res.headers_mut());

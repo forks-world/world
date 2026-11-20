@@ -469,7 +469,7 @@ world exec dev --egress-policy examples/network-web.json -- python3 -c \
 
 策略作用于单次 `world exec`。执行前验证 VM 仍处于离线网络、确认当前 boot ID、准备 host/port 代理策略，并建立有界通道。guest 的 root 控制套接字确认代理就绪后才启动工作负载。支持 HTTP 代理的客户端可以使用 `HTTP_PROXY` 和 `HTTPS_PROXY`。每次执行最多复用八条 TCP 流，收发方逐块确认并支持半关闭。进程结束时关闭代理及 guest relay。运行中发现出口通道失联会取消执行，VM 继续处于离线模式。
 
-普通 exec 和常驻服务继续使用 workspace 自身的离线网络。同一 VM 中使用相同 UID 的任务属于同一信任域。代理依托受信任的宿主路由，已经拒绝私网、特殊用途地址和宿主直连子网。通过网关或 VPN 可达的全局地址仍需额外验证。
+普通 exec 和常驻服务继续使用 workspace 自身的离线网络。同一 VM 中使用相同 UID 的任务属于同一信任域。代理拒绝私网、特殊用途地址和宿主直连子网。macOS 路由校验见下节。
 
 ```sh
 cargo build --workspace --locked
@@ -477,3 +477,11 @@ python3 experiments/macos/world_vm_egress_exec_smoke.py
 ```
 
 Apple Silicon 真机回归覆盖四条并行 HTTPS 流与一条空闲流、未授权目标拒绝、无代理时的 IPv4/IPv6/DNS 拒绝、策略准备失败时阻止命令启动、退出清理控制套接字、relay 失联取消并回收工作负载，以及 VM 外部重启后拒绝旧代际。
+
+### 阶段 4 宿主出口路由校验
+
+准备策略时，World 记录每个可用地址族的 macOS 默认网关、硬件网卡和网卡索引。目标的普通与按接口查询必须都匹配该默认路由。代理另外检查路由表并拒绝覆盖目标的更具体前缀，即使前缀沿用同一个网关。macOS 为已连接套接字生成的主机路由缓存可以使用，前提是路由表中没有覆盖目标的真实前缀。没有默认路由的地址族会从本次执行的候选地址中移除。若目标无剩余候选，策略准备失败。[Apple route(8)](https://github.com/apple-oss-distributions/network_cmds/blob/main/route.tproj/route.8)
+
+TCP socket 绑定已验证的接口。连接前后都核对宿主默认路由、目标路由和网卡身份，校验失败时代理拒绝传输应用数据。存续中的 HTTP 与 CONNECT 流每两秒发起一次复核，检测到变化便关闭。路由采样与内核发包之间仍有时间窗口。默认网关后的转发属于受信宿主网络，Mac 只能检查自己的路由表。
+
+Apple Silicon 真机通过了执行级多流 HTTPS、跨复核周期的长连接和单流出口回归。测试机没有可用的 IPv6 默认出口，显式 IPv6-only 策略在启动命令前被拒绝。自动化 fixture 覆盖了 IPv4 和 IPv6 的全局地址被 VPN 或静态前缀接管、缓存掩盖父路由、网关与网卡身份改变，以及存续流的轮询发现变化。验收未修改宿主路由表。具有真实全局地址分流的 VPN 和可用公网 IPv6 出口仍需真机复测。
