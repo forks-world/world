@@ -23,7 +23,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const CHUNK: usize = 8192;
-const STREAMS: usize = 8;
+pub(crate) const STREAMS: usize = 8;
 const LINE: u64 = 12_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -148,15 +148,15 @@ pub(crate) async fn launch(
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Frame {
-    kind: String,
-    id: u64,
+pub(crate) struct Frame {
+    pub(crate) kind: String,
+    pub(crate) id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<String>,
+    pub(crate) data: Option<String>,
 }
 
 impl Frame {
-    fn new(kind: &str, id: u64) -> Self {
+    pub(crate) fn new(kind: &str, id: u64) -> Self {
         Self {
             kind: kind.into(),
             id,
@@ -165,7 +165,7 @@ impl Frame {
     }
 }
 
-async fn read_frame(reader: &mut (impl AsyncBufRead + Unpin)) -> Result<Frame> {
+pub(crate) async fn read_frame(reader: &mut (impl AsyncBufRead + Unpin)) -> Result<Frame> {
     let mut line = Vec::new();
     let length = reader.take(LINE + 1).read_until(b'\n', &mut line).await?;
     ensure!(
@@ -339,7 +339,7 @@ async fn connection_task(
     tcp: TcpStream,
     id: u64,
     mut frames: mpsc::Receiver<Frame>,
-    mut credit: mpsc::Receiver<()>,
+    credit: mpsc::Receiver<()>,
     outbound: &mpsc::Sender<Frame>,
 ) -> Result<()> {
     outbound.send(Frame::new("open", id)).await?;
@@ -350,6 +350,16 @@ async fn connection_task(
         response.kind == "opened",
         "guest service refused connection"
     );
+    relay_stream(tcp, id, frames, credit, outbound).await
+}
+
+pub(crate) async fn relay_stream(
+    tcp: TcpStream,
+    id: u64,
+    mut frames: mpsc::Receiver<Frame>,
+    mut credit: mpsc::Receiver<()>,
+    outbound: &mpsc::Sender<Frame>,
+) -> Result<()> {
     let (mut rx, mut tx) = tcp.into_split();
     let download = async {
         while let Some(frame) = frames.recv().await {
@@ -358,7 +368,7 @@ async fn connection_task(
                     let data = STANDARD.decode(frame.data.context("missing stream data")?)?;
                     ensure!(
                         !data.is_empty() && data.len() <= CHUNK,
-                        "invalid publication chunk"
+                        "invalid bridge chunk"
                     );
                     tx.write_all(&data).await?;
                     outbound.send(Frame::new("ack", id)).await?;
@@ -367,10 +377,10 @@ async fn connection_task(
                     tx.shutdown().await?;
                     return Ok(());
                 }
-                _ => bail!("guest closed publication stream"),
+                _ => bail!("bridge peer closed stream"),
             }
         }
-        bail!("publication stream lost");
+        bail!("bridge stream lost");
     };
     let upload = async {
         let mut buffer = [0; CHUNK];
@@ -386,7 +396,7 @@ async fn connection_task(
             credit
                 .recv()
                 .await
-                .context("publication credit channel closed")?;
+                .context("bridge credit channel closed")?;
         }
     };
     tokio::try_join!(download, upload)?;

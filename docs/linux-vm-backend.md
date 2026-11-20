@@ -456,4 +456,24 @@ python3 experiments/macos/world_vm_egress_probe.py
 
 Apple Silicon 实测仅授权 `example.com:443` 时，guest 经 CONNECT 获得 HTTPS 200，TLS 证书验证通过。其他域名和端口、宿主 loopback、provider 网关、私网 IPv6、IPv4 映射地址和本地发现域名均被拒绝。直接 IPv4、IPv6 和 DNS 连接没有路由。宿主代理退出后，guest 连接关闭。
 
-当前验收范围是一条探针连接。接入 World 的长期工作负载前，还需完成每 VM 的多流通道、进程与 boot ID 绑定、出口失联后的任务准入，以及通过网关或 VPN 可达的全局地址验证。已有按域名与端口放行的能力仍以 HTTP 代理协议为入口。
+该探针以单条连接验证传输。多流执行接入记录见下节。
+
+### 阶段 4 执行级受限出口
+
+```sh
+world workspace create dev --os linux --network offline
+world workspace setup dev
+world exec dev --egress-policy examples/network-web.json -- python3 -c \
+  'import urllib.request; print(urllib.request.urlopen("https://example.com/").status)'
+```
+
+策略作用于单次 `world exec`。执行前验证 VM 仍处于离线网络、确认当前 boot ID、准备 host/port 代理策略，并建立有界通道。guest 的 root 控制套接字确认代理就绪后才启动工作负载。支持 HTTP 代理的客户端可以使用 `HTTP_PROXY` 和 `HTTPS_PROXY`。每次执行最多复用八条 TCP 流，收发方逐块确认并支持半关闭。进程结束时关闭代理及 guest relay。运行中发现出口通道失联会取消执行，VM 继续处于离线模式。
+
+普通 exec 和常驻服务继续使用 workspace 自身的离线网络。同一 VM 中使用相同 UID 的任务属于同一信任域。代理依托受信任的宿主路由，已经拒绝私网、特殊用途地址和宿主直连子网。通过网关或 VPN 可达的全局地址仍需额外验证。
+
+```sh
+cargo build --workspace --locked
+python3 experiments/macos/world_vm_egress_exec_smoke.py
+```
+
+Apple Silicon 真机回归覆盖四条并行 HTTPS 流与一条空闲流、未授权目标拒绝、无代理时的 IPv4/IPv6/DNS 拒绝、策略准备失败时阻止命令启动、退出清理控制套接字、relay 失联取消并回收工作负载，以及 VM 外部重启后拒绝旧代际。
