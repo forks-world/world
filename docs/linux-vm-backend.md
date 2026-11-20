@@ -440,4 +440,20 @@ python3 experiments/macos/world_vm_multi_smoke.py
 
 在 8 GiB Apple Silicon Mac 上，两台 256 MiB VM 同时监听各自的 `127.0.0.1:8080`，宿主从不同 loopback 端口取回各自的文件。测试验证 IPv4、IPv6 和 DNS 目标均无路由，预算不足时第三台 VM 未启动，且停掉一台后另一台仍可执行和发布。撤去一次性 guest 的离线标记后，新 exec 和服务重启均被拒绝。另一次 256 MiB 离线 VM 实测通过 forkfs 作为 /workspace 的读写和卸载，guest 写入可从宿主 RPC 读回。证据目录记录了机器环境、命令结果及宿主内存压力采样。
 
-阶段 4 的受限联网仍待实现。联网模式需要验证 IPv4、IPv6、DNS 和重绑定策略，以及对宿主、局域网、其他 guest 的拒绝与对指定出口的放行。
+阶段 4 的受限联网从下述代理通道实验开始。
+
+### 阶段 4 受限出口通道实验
+
+探针使用 Apple container 1.7.1 运行普通离线 World。guest 继续只有 loopback。每个测试连接通过单独的 `container exec -i` 双向字节流接入宿主的 World HTTP 代理。宿主代理只监听临时 loopback 端口，需要凭据，并用固定的域名与端口 allowlist 处理请求。凭据通过管道提供，探针结果仅记录状态和校验结果。
+
+VM 专用代理准备路径对域名使用绝对名称解析，仅解析策略列出的名字。准备时固定已通过校验的 DNS 答案，连接时使用该数字地址并重新检查宿主接口。私网和特殊用途 IPv4/IPv6、宿主接口地址及其直连子网不可授权。任一 DNS 答案不符合策略时，该策略准备失败。单元测试模拟同一公共域名随后返回 loopback 地址，验证旧代理保持原地址，新代理拒绝更新。普通原生代理沿用既有授权规则。
+
+```sh
+cargo build --workspace --locked
+cargo build -p world-runtime --example vm_egress_proxy --locked
+python3 experiments/macos/world_vm_egress_probe.py
+```
+
+Apple Silicon 实测仅授权 `example.com:443` 时，guest 经 CONNECT 获得 HTTPS 200，TLS 证书验证通过。其他域名和端口、宿主 loopback、provider 网关、私网 IPv6、IPv4 映射地址和本地发现域名均被拒绝。直接 IPv4、IPv6 和 DNS 连接没有路由。宿主代理退出后，guest 连接关闭。
+
+当前验收范围是一条探针连接。接入 World 的长期工作负载前，还需完成每 VM 的多流通道、进程与 boot ID 绑定、出口失联后的任务准入，以及通过网关或 VPN 可达的全局地址验证。已有按域名与端口放行的能力仍以 HTTP 代理协议为入口。

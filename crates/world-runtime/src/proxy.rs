@@ -34,6 +34,7 @@ pub struct Proxy {
 
 struct Service {
     routes: HashMap<String, Vec<SocketAddr>>,
+    vm_egress: bool,
     authorization: String,
     cancel: CancellationToken,
     tasks: TaskTracker,
@@ -43,6 +44,7 @@ struct Service {
 /// e.g. inside a workload network namespace.
 pub struct Prepared {
     routes: HashMap<String, Vec<SocketAddr>>,
+    vm_egress: bool,
     credential: String,
 }
 
@@ -67,6 +69,7 @@ impl Prepared {
         let tasks = TaskTracker::new();
         let service = Arc::new(Service {
             routes: self.routes,
+            vm_egress: self.vm_egress,
             authorization,
             cancel: cancel.clone(),
             tasks: tasks.clone(),
@@ -102,6 +105,37 @@ impl Prepared {
 
 impl Proxy {
     pub async fn prepare(policy: &Policy) -> Result<Prepared> {
+        Self::prepare_for(policy, false).await
+    }
+
+    /// Prepares routes for the experimental offline VM proxy transport.
+    pub async fn prepare_vm_egress(policy: &Policy) -> Result<Prepared> {
+        Self::prepare_for(policy, true).await
+    }
+
+    async fn prepare_for(policy: &Policy, vm_egress: bool) -> Result<Prepared> {
+        Self::prepare_with(
+            policy,
+            vm_egress,
+            |name: String, port: u16| async move {
+                Ok(timeout(
+                    Duration::from_secs(5),
+                    tokio::net::lookup_host((name.as_str(), port)),
+                )
+                .await??
+                .collect())
+            },
+            crate::vm_egress::require_public_destinations,
+        )
+        .await
+    }
+
+    async fn prepare_with(
+        policy: &Policy,
+        vm_egress: bool,
+        resolve: impl AsyncFn(String, u16) -> Result<Vec<SocketAddr>>,
+        validate_vm_addresses: impl Fn(&[SocketAddr]) -> Result<()>,
+    ) -> Result<Prepared> {
         policy.validate()?;
         let mut routes = HashMap::new();
         for endpoint in &policy.allow {
@@ -109,19 +143,24 @@ impl Proxy {
             let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
                 vec![SocketAddr::new(ip, endpoint.port)]
             } else {
-                let addresses: Vec<_> = timeout(
-                    Duration::from_secs(5),
-                    tokio::net::lookup_host((host.as_str(), endpoint.port)),
-                )
-                .await??
-                .collect();
-                if addresses.is_empty() || addresses.iter().any(|addr| !public_ip(addr.ip())) {
+                let name = if vm_egress {
+                    crate::vm_egress::dns_name(&host)?
+                } else {
+                    host.clone()
+                };
+                let addresses = resolve(name, endpoint.port).await?;
+                if !vm_egress
+                    && (addresses.is_empty() || addresses.iter().any(|addr| !public_ip(addr.ip())))
+                {
                     bail!(
                         "host {host} resolves to non-public address; authorize a literal IP explicitly"
                     );
                 }
                 addresses
             };
+            if vm_egress {
+                validate_vm_addresses(&addresses)?;
+            }
             routes.insert(authority(&host, endpoint.port), addresses);
         }
         let mut secret = [0u8; 32];
@@ -130,7 +169,11 @@ impl Proxy {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
-        Ok(Prepared { routes, credential })
+        Ok(Prepared {
+            routes,
+            vm_egress,
+            credential,
+        })
     }
     pub async fn start(policy: &Policy) -> Result<Self> {
         let prepared = Self::prepare(policy).await?;
@@ -165,7 +208,7 @@ impl Drop for Proxy {
 // IANA IPv4/IPv6 special-purpose registries, checked 2026-09-24:
 // https://www.iana.org/assignments/iana-ipv4-special-registry/
 // https://www.iana.org/assignments/iana-ipv6-special-registry/
-fn public_ip(ip: IpAddr) -> bool {
+pub(crate) fn public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => {
             let n = u32::from(v);
@@ -264,6 +307,14 @@ impl Service {
                 "destination denied by Network policy",
             ));
         };
+        // Keep the original DNS answers pinned, but recheck host interfaces
+        // in case one of those addresses has since become an on-link target.
+        if self.vm_egress && crate::vm_egress::require_public_destinations(addresses).is_err() {
+            return Ok(response(
+                StatusCode::FORBIDDEN,
+                "VM egress destination denied",
+            ));
+        }
         let mut stream = None;
         for address in addresses {
             if let Ok(Ok(connected)) =
@@ -411,6 +462,38 @@ mod tests {
             assert!(public_ip(ip.parse().unwrap()), "rejected {ip}");
         }
     }
+    #[tokio::test]
+    async fn vm_dns_answers_are_pinned_and_rebinding_fails_a_new_preparation() {
+        use std::cell::Cell;
+        let policy = Policy {
+            network_id: "vm".into(),
+            allow: vec![crate::policy::Endpoint {
+                host: "public.example.com".into(),
+                port: 443,
+            }],
+        };
+        let calls = Cell::new(0);
+        let public: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let blocked: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let resolver = async |host: String, port: u16| {
+            assert_eq!((host.as_str(), port), ("public.example.com.", 443));
+            let count = calls.get();
+            calls.set(count + 1);
+            Ok(vec![if count == 0 { public } else { blocked }])
+        };
+        let validate = crate::vm_egress::require_public_ip_only_for_test;
+        let original = Proxy::prepare_with(&policy, true, &resolver, validate)
+            .await
+            .unwrap();
+        assert!(
+            Proxy::prepare_with(&policy, true, &resolver, validate)
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(original.routes["public.example.com:443"], [public]);
+    }
+
     #[tokio::test]
     async fn proxy_auth_policy_and_revocation() {
         let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -11,3 +11,4 @@ mod port_publish;
 pub mod proxy;
 pub mod run;
 pub mod silo;
+mod vm_egress;
