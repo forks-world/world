@@ -200,7 +200,7 @@ def drop_workload_privileges():
         raise OSError(ctypes.get_errno(), 'prctl')
 
 
-def spawn_workload(argv, group, **streams):
+def spawn_workload(argv, group, proxy=None, **streams):
     enforce_network()
     workspace = open_workspace() if FORKFS_SOURCE.exists() else None
 
@@ -211,12 +211,16 @@ def spawn_workload(argv, group, **streams):
         (group / 'cgroup.procs').write_text(str(os.getpid()))
         drop_workload_privileges()
 
+    env = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': '/home/world', 'USER': 'world',
+           'LANG': 'C.UTF-8'}
+    if proxy is not None:
+        for name in ('HTTP_PROXY', 'HTTPS_PROXY'):
+            env[name] = env[name.lower()] = proxy
+        env['NO_PROXY'] = env['no_proxy'] = 'localhost,127.0.0.1,::1'
     try:
         return subprocess.Popen(argv, cwd='/workspace' if workspace is None else None,
-                                pass_fds=() if workspace is None else (workspace,), preexec_fn=prepare,
-                                env={'PATH': '/usr/local/bin:/usr/bin:/bin',
-                                     'HOME': '/home/world', 'USER': 'world',
-                                     'LANG': 'C.UTF-8'}, **streams)
+                                pass_fds=() if workspace is None else (workspace,),
+                                preexec_fn=prepare, env=env, **streams)
     finally:
         if workspace is not None:
             os.close(workspace)
@@ -225,7 +229,7 @@ def spawn_workload(argv, group, **streams):
 def main():
     mode = sys.argv[1]
     if mode in ('boot-id', 'probe', 'run', 'import', 'export', 'port-bridge', 'service', 'service-daemon',
-                'forkfs-mounted', 'forkfs-check', 'forkfs-unmount'):
+                'forkfs-mounted', 'forkfs-check', 'forkfs-unmount', 'egress-bridge'):
         boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
         expected = os.environ.get('WORLD_EXPECTED_BOOT_ID')
         if expected is not None and expected != boot_id:
@@ -253,6 +257,9 @@ def main():
             if libc.umount2(b'/workspace', 0) != 0:
                 raise OSError(ctypes.get_errno(), 'unmount forkfs')
         return 0
+    if mode == 'egress-bridge':
+        asyncio.run(egress_bridge(boot_id, sys.argv[2]))
+        return 0
     if mode == 'port-bridge':
         if FORKFS_SOURCE.exists():
             os.close(open_workspace())
@@ -279,7 +286,7 @@ def main():
         p.mkdir(exist_ok=True)
         assert (p / 'cgroup.kill').exists()
         p.rmdir()
-        print(json.dumps({'protocol': 1, 'uid': os.getuid(), 'cgroup_kill': True, 'import_protocol': 1, 'export_protocol': 1, 'port_protocol': 1, 'boot_id': boot_id, 'service_protocol': 1}))
+        print(json.dumps({'protocol': 1, 'uid': os.getuid(), 'cgroup_kill': True, 'import_protocol': 1, 'export_protocol': 1, 'port_protocol': 1, 'egress_protocol': 1, 'boot_id': boot_id, 'service_protocol': 1}))
         return 0
     token = sys.argv[2]
     if not re.fullmatch('[0-9a-f]{32}', token):
@@ -313,7 +320,8 @@ def main():
         if not argv:
             raise ValueError('empty argv')
 
-        child = spawn_workload(argv, group)
+        proxy = execution_proxy(boot_id, token) if os.environ.get('WORLD_EXEC_EGRESS') == '1' else None
+        child = spawn_workload(argv, group, proxy=proxy)
         write(result, {'state': 'running'})
         deadline = time.monotonic() + seconds
         while child.poll() is None:

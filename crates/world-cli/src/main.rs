@@ -57,6 +57,9 @@ enum Commands {
         state_dir: Option<PathBuf>,
         #[arg(long,default_value="5m",value_parser=humantime::parse_duration)]
         timeout: Duration,
+        /// Use a host/port policy proxy for this offline Linux VM execution.
+        #[arg(long)]
+        egress_policy: Option<PathBuf>,
         #[arg(last = true, required = true)]
         command: Vec<OsString>,
     },
@@ -671,12 +674,21 @@ async fn execute(cli: Cli, cancel: CancellationToken) -> Result<i32> {
             workspace,
             state_dir,
             timeout,
+            egress_policy,
             command,
         } => {
             let state = state_dir.map(Ok).unwrap_or_else(silo::default_state_dir)?;
             if let Some(vm) = apple_vm::get(&state, &workspace)? {
-                apple_vm::exec(&state, &vm, command, timeout, cancel).await
+                let policy = egress_policy
+                    .map(|path| Policy::read(std::fs::File::open(path)?))
+                    .transpose()?;
+                apple_vm::exec_with_egress(&state, &vm, command, timeout, cancel, policy.as_ref())
+                    .await
             } else {
+                anyhow::ensure!(
+                    egress_policy.is_none(),
+                    "--egress-policy requires an offline Linux VM"
+                );
                 let world = silo::get(&state, &workspace)?;
                 silo::exec(&state, world, command, timeout, cancel).await
             }

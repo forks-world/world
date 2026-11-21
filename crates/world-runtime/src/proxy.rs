@@ -1,4 +1,7 @@
-use crate::policy::{Policy, authority, canonical_host};
+use crate::{
+    policy::{Policy, authority, canonical_host},
+    vm_egress_route::PinnedRoutes,
+};
 use anyhow::{Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
@@ -28,12 +31,14 @@ pub struct Proxy {
     port: u16,
     credential: String,
     cancel: CancellationToken,
+    route_revocation: Option<CancellationToken>,
     accepts: Vec<JoinHandle<()>>,
     tasks: TaskTracker,
 }
 
 struct Service {
     routes: HashMap<String, Vec<SocketAddr>>,
+    vm_routes: Option<PinnedRoutes>,
     authorization: String,
     cancel: CancellationToken,
     tasks: TaskTracker,
@@ -43,6 +48,7 @@ struct Service {
 /// e.g. inside a workload network namespace.
 pub struct Prepared {
     routes: HashMap<String, Vec<SocketAddr>>,
+    vm_routes: Option<PinnedRoutes>,
     credential: String,
 }
 
@@ -64,9 +70,14 @@ impl Prepared {
             STANDARD.encode(format!("world:{}", self.credential))
         );
         let cancel = CancellationToken::new();
+        let route_revocation = self
+            .vm_routes
+            .as_ref()
+            .map(|routes| routes.revocation().clone());
         let tasks = TaskTracker::new();
         let service = Arc::new(Service {
             routes: self.routes,
+            vm_routes: self.vm_routes,
             authorization,
             cancel: cancel.clone(),
             tasks: tasks.clone(),
@@ -94,6 +105,7 @@ impl Prepared {
             port,
             credential: self.credential,
             cancel,
+            route_revocation,
             accepts,
             tasks,
         })
@@ -101,7 +113,44 @@ impl Prepared {
 }
 
 impl Proxy {
+    pub(crate) fn route_revocation(&self) -> Option<CancellationToken> {
+        self.route_revocation.clone()
+    }
+
     pub async fn prepare(policy: &Policy) -> Result<Prepared> {
+        Self::prepare_for(policy, false).await
+    }
+
+    /// Prepares routes for the experimental offline VM proxy transport.
+    pub async fn prepare_vm_egress(policy: &Policy) -> Result<Prepared> {
+        let mut prepared = Self::prepare_for(policy, true).await?;
+        prepared.vm_routes = Some(PinnedRoutes::prepare(&mut prepared.routes).await?);
+        Ok(prepared)
+    }
+
+    async fn prepare_for(policy: &Policy, vm_egress: bool) -> Result<Prepared> {
+        Self::prepare_with(
+            policy,
+            vm_egress,
+            |name: String, port: u16| async move {
+                Ok(timeout(
+                    Duration::from_secs(5),
+                    tokio::net::lookup_host((name.as_str(), port)),
+                )
+                .await??
+                .collect())
+            },
+            crate::vm_egress::require_public_destinations,
+        )
+        .await
+    }
+
+    async fn prepare_with(
+        policy: &Policy,
+        vm_egress: bool,
+        resolve: impl AsyncFn(String, u16) -> Result<Vec<SocketAddr>>,
+        validate_vm_addresses: impl Fn(&[SocketAddr]) -> Result<()>,
+    ) -> Result<Prepared> {
         policy.validate()?;
         let mut routes = HashMap::new();
         for endpoint in &policy.allow {
@@ -109,19 +158,24 @@ impl Proxy {
             let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
                 vec![SocketAddr::new(ip, endpoint.port)]
             } else {
-                let addresses: Vec<_> = timeout(
-                    Duration::from_secs(5),
-                    tokio::net::lookup_host((host.as_str(), endpoint.port)),
-                )
-                .await??
-                .collect();
-                if addresses.is_empty() || addresses.iter().any(|addr| !public_ip(addr.ip())) {
+                let name = if vm_egress {
+                    crate::vm_egress::dns_name(&host)?
+                } else {
+                    host.clone()
+                };
+                let addresses = resolve(name, endpoint.port).await?;
+                if !vm_egress
+                    && (addresses.is_empty() || addresses.iter().any(|addr| !public_ip(addr.ip())))
+                {
                     bail!(
                         "host {host} resolves to non-public address; authorize a literal IP explicitly"
                     );
                 }
                 addresses
             };
+            if vm_egress {
+                validate_vm_addresses(&addresses)?;
+            }
             routes.insert(authority(&host, endpoint.port), addresses);
         }
         let mut secret = [0u8; 32];
@@ -130,7 +184,11 @@ impl Proxy {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
-        Ok(Prepared { routes, credential })
+        Ok(Prepared {
+            routes,
+            vm_routes: None,
+            credential,
+        })
     }
     pub async fn start(policy: &Policy) -> Result<Self> {
         let prepared = Self::prepare(policy).await?;
@@ -165,7 +223,7 @@ impl Drop for Proxy {
 // IANA IPv4/IPv6 special-purpose registries, checked 2026-09-24:
 // https://www.iana.org/assignments/iana-ipv4-special-registry/
 // https://www.iana.org/assignments/iana-ipv6-special-registry/
-fn public_ip(ip: IpAddr) -> bool {
+pub(crate) fn public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => {
             let n = u32::from(v);
@@ -243,6 +301,14 @@ impl Service {
             Err(_) => response(StatusCode::BAD_GATEWAY, "upstream unavailable"),
         })
     }
+    async fn wait_for_route_change(&self, address: SocketAddr) {
+        if let Some(routes) = &self.vm_routes {
+            routes.wait_for_change(address).await;
+        } else {
+            std::future::pending().await
+        }
+    }
+
     async fn forward(self: Arc<Self>, mut req: Request<Incoming>) -> Result<Response<Body>> {
         let connect = req.method() == hyper::Method::CONNECT;
         let Some(auth) = req.uri().authority() else {
@@ -264,18 +330,34 @@ impl Service {
                 "destination denied by Network policy",
             ));
         };
-        let mut stream = None;
+        let mut upstream = None;
         for address in addresses {
-            if let Ok(Ok(connected)) =
-                timeout(Duration::from_secs(5), TcpStream::connect(address)).await
-            {
-                stream = Some(connected);
+            let connected = if let Some(routes) = &self.vm_routes {
+                match routes.connect(*address).await {
+                    Ok(connected) => connected,
+                    Err(_) => return Ok(response(StatusCode::FORBIDDEN, "VM egress route denied")),
+                }
+            } else {
+                timeout(Duration::from_secs(5), TcpStream::connect(address))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+            };
+            if let Some(connected) = connected {
+                upstream = Some((*address, connected));
                 break;
             }
         }
-        let Some(mut stream) = stream else {
+        let Some((selected, mut stream)) = upstream else {
             bail!("upstream unavailable")
         };
+        if self
+            .vm_routes
+            .as_ref()
+            .is_some_and(|routes| routes.revocation().is_cancelled())
+        {
+            return Ok(response(StatusCode::FORBIDDEN, "VM egress route denied"));
+        }
         if connect {
             let upgrade = hyper::upgrade::on(&mut req);
             let state = self.clone();
@@ -287,7 +369,12 @@ impl Service {
                                 .await;
                     }
                 };
-                tokio::select! {_=state.cancel.cancelled()=>{},_=transfer=>{}}
+                tokio::select! {
+                    biased;
+                    _ = state.cancel.cancelled() => {},
+                    _ = state.wait_for_route_change(selected) => {},
+                    _ = transfer => {},
+                }
             });
             return Ok(response(StatusCode::OK, ""));
         }
@@ -308,9 +395,14 @@ impl Service {
         );
         let (mut sender, connection) =
             hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
-        let cancel = self.cancel.clone();
+        let state = self.clone();
         self.tasks.spawn(async move {
-            tokio::select! {_=cancel.cancelled()=>{},_=connection=>{}}
+            tokio::select! {
+                biased;
+                _ = state.cancel.cancelled() => {},
+                _ = state.wait_for_route_change(selected) => {},
+                _ = connection => {},
+            }
         });
         let mut res = timeout(Duration::from_secs(30), sender.send_request(req)).await??;
         strip_hop_headers(res.headers_mut());
@@ -349,7 +441,8 @@ fn strip_hop_headers(headers: &mut header::HeaderMap) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     #[test]
     fn dns_addresses_require_ordinary_public_unicast() {
         for ip in [
@@ -411,6 +504,118 @@ mod tests {
             assert!(public_ip(ip.parse().unwrap()), "rejected {ip}");
         }
     }
+    #[tokio::test]
+    async fn vm_dns_answers_are_pinned_and_rebinding_fails_a_new_preparation() {
+        use std::cell::Cell;
+        let policy = Policy {
+            network_id: "vm".into(),
+            allow: vec![crate::policy::Endpoint {
+                host: "public.example.com".into(),
+                port: 443,
+            }],
+        };
+        let calls = Cell::new(0);
+        let public: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let blocked: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let resolver = async |host: String, port: u16| {
+            assert_eq!((host.as_str(), port), ("public.example.com.", 443));
+            let count = calls.get();
+            calls.set(count + 1);
+            Ok(vec![if count == 0 { public } else { blocked }])
+        };
+        let validate = crate::vm_egress::require_public_ip_only_for_test;
+        let original = Proxy::prepare_with(&policy, true, &resolver, validate)
+            .await
+            .unwrap();
+        assert!(
+            Proxy::prepare_with(&policy, true, &resolver, validate)
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(original.routes["public.example.com:443"], [public]);
+    }
+
+    #[tokio::test]
+    async fn route_revocation_closes_all_tunnels_and_rejects_new_connections() {
+        async fn upstream() -> (SocketAddr, JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (mut input, mut output) = stream.split();
+                tokio::io::copy(&mut input, &mut output).await.unwrap();
+            });
+            (address, task)
+        }
+
+        async fn tunnel(port: u16, target: &str, status: &str) -> BufReader<TcpStream> {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let auth = STANDARD.encode("world:test");
+            stream
+                .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: Basic {auth}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with(status), "{line}");
+            loop {
+                line.clear();
+                assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    return stream;
+                }
+            }
+        }
+
+        timeout(Duration::from_secs(8), async {
+            let (first, first_server) = upstream().await;
+            let (second, second_server) = upstream().await;
+            let (vm_routes, changed) = PinnedRoutes::fixture(first);
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let mut proxy = Prepared {
+                routes: HashMap::from([
+                    ("first.example.com:443".into(), vec![first]),
+                    ("second.example.com:443".into(), vec![second]),
+                ]),
+                vm_routes: Some(vm_routes),
+                credential: "test".into(),
+            }
+            .serve(port, vec![listener])
+            .unwrap();
+            let mut first_tunnel = tunnel(port, "first.example.com:443", "HTTP/1.1 200 ").await;
+            let mut second_tunnel = tunnel(port, "second.example.com:443", "HTTP/1.1 200 ").await;
+            for stream in [&mut first_tunnel, &mut second_tunnel] {
+                stream.write_all(b"ping").await.unwrap();
+                let mut echoed = [0; 4];
+                stream.read_exact(&mut echoed).await.unwrap();
+                assert_eq!(&echoed, b"ping");
+            }
+
+            // Only the first destination's route changes. The second must close as well.
+            changed.store(true, Ordering::SeqCst);
+            for stream in [&mut first_tunnel, &mut second_tunnel] {
+                match stream.read(&mut [0; 1]).await {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    result => panic!("tunnel remained open after revocation: {result:?}"),
+                }
+            }
+            assert!(proxy.route_revocation().unwrap().is_cancelled());
+            changed.store(false, Ordering::SeqCst);
+            for target in ["first.example.com:443", "second.example.com:443"] {
+                tunnel(port, target, "HTTP/1.1 403 ").await;
+            }
+            proxy.close().await;
+            first_server.await.unwrap();
+            second_server.await.unwrap();
+        })
+        .await
+        .expect("proxy did not revoke both tunnels and deny new connections");
+    }
+
     #[tokio::test]
     async fn proxy_auth_policy_and_revocation() {
         let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();

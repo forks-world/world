@@ -29,6 +29,8 @@ const GUEST: &str = concat!(
     "\n",
     include_str!("../guest/port_bridge.py"),
     "\n",
+    include_str!("../guest/egress_bridge.py"),
+    "\n",
     include_str!("../guest/services.py")
 );
 const HELPER: &str = "/opt/world/supervisor.py";
@@ -1479,6 +1481,21 @@ pub async fn exec(
     duration: Duration,
     cancel: CancellationToken,
 ) -> Result<i32> {
+    exec_with_egress(state, vm, command, duration, cancel, None).await
+}
+
+pub async fn exec_with_egress(
+    state: &Path,
+    vm: &Vm,
+    command: Vec<OsString>,
+    duration: Duration,
+    cancel: CancellationToken,
+    policy: Option<&crate::policy::Policy>,
+) -> Result<i32> {
+    ensure!(
+        policy.is_none() || vm.network == Network::Offline,
+        "policy_unavailable: --egress-policy requires an offline Linux VM"
+    );
     crate::run::validate_command(&command, duration)?;
     ensure!(
         duration.as_secs_f64() <= 86400.0,
@@ -1507,16 +1524,49 @@ pub async fn exec(
     let token = random_id();
     let seconds = duration.as_secs_f64().to_string();
     require_guest_network(vm).await?;
-    eprintln!(
-        "world: execution {token} (Linux VM; {})",
-        vm.network.description()
-    );
-    let mut child = provider()
-        .args([
+    let mut session = if let Some(policy) = policy {
+        ensure!(
+            probe["egress_protocol"] == 1,
+            "policy_unavailable: guest egress protocol is missing; run workspace setup"
+        );
+        let mut bridge = provider();
+        bridge.args([
             "exec",
             "-i",
             "-e",
             &format!("WORLD_EXPECTED_BOOT_ID={boot_id}"),
+            &vm.instance_id,
+            "python3",
+            "-I",
+            "-u",
+            HELPER,
+            "egress-bridge",
+            &token,
+        ]);
+        let start = crate::vm_egress_bridge::Session::start(policy, bridge, &boot_id);
+        Some(tokio::select! {
+            result = start => result.context("policy_unavailable: cannot start egress bridge")?,
+            _ = cancel.cancelled() => return Ok(124),
+        })
+    } else {
+        None
+    };
+    eprintln!(
+        "world: execution {token} (Linux VM; {})",
+        vm.network.description()
+    );
+    let mut command_runner = provider();
+    command_runner.args([
+        "exec",
+        "-i",
+        "-e",
+        &format!("WORLD_EXPECTED_BOOT_ID={boot_id}"),
+    ]);
+    if policy.is_some() {
+        command_runner.args(["-e", "WORLD_EXEC_EGRESS=1"]);
+    }
+    let mut child = command_runner
+        .args([
             &vm.instance_id,
             "python3",
             "-I",
@@ -1530,11 +1580,34 @@ pub async fn exec(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
-    let status = tokio::select! {
-        result = child.wait() => Some(result?),
-        _ = cancel.cancelled() => None,
-        _ = sleep(duration + Duration::from_secs(10)) => None,
+    let route_revocation = session
+        .as_ref()
+        .map(crate::vm_egress_bridge::Session::route_revocation);
+    let revoked = async {
+        if let Some(revocation) = &route_revocation {
+            revocation.cancelled().await;
+        } else {
+            std::future::pending().await
+        }
     };
+    let bridge_exit = async {
+        if let Some(session) = &mut session {
+            session.finished().await
+        } else {
+            std::future::pending().await
+        }
+    };
+    let (status, bridge_error) = tokio::select! {
+        biased;
+        _ = revoked => (None, None),
+        result = child.wait() => (Some(result?), None),
+        result = bridge_exit => (None, Some(result)),
+        _ = cancel.cancelled() => (None, None),
+        _ = sleep(duration + Duration::from_secs(10)) => (None, None),
+    };
+    if bridge_error.is_some() {
+        session.take();
+    }
     if status.is_none() {
         guest(vm, &["cancel", &token]).await.context("guest cancellation not confirmed; execution may still be running until its guest deadline")?;
         match timeout(Duration::from_secs(10), child.wait()).await {
@@ -1546,6 +1619,16 @@ pub async fn exec(
                 bail!("execution status unknown after cancellation; VM preserved");
             }
         }
+    }
+    if let Some(session) = session {
+        session.close().await;
+    }
+    if route_revocation.is_some_and(|revocation| revocation.is_cancelled()) {
+        bail!("policy_unavailable: VM egress route authorization was revoked");
+    }
+    if let Some(result) = bridge_error {
+        result.context("policy_unavailable: egress bridge lost during execution")?;
+        bail!("policy_unavailable: egress bridge closed during execution");
     }
     let result: serde_json::Value =
         serde_json::from_str(&guest(vm, &["status", &token]).await.with_context(|| {
@@ -1559,9 +1642,10 @@ pub async fn exec(
             .context("missing guest exit code")?
             as i32),
         Some("failed")
-            if result["error"]
-                .as_str()
-                .is_some_and(|error| error.starts_with("storage_unavailable:")) =>
+            if result["error"].as_str().is_some_and(|error| {
+                error.starts_with("storage_unavailable:")
+                    || error.starts_with("policy_unavailable:")
+            }) =>
         {
             bail!("{}", result["error"].as_str().unwrap())
         }
