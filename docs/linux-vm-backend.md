@@ -487,3 +487,14 @@ TCP socket 绑定已验证的接口。连接前后都核对宿主默认路由、
 Apple Silicon 真机通过了执行级多流 HTTPS、跨复核周期的长连接和单流出口回归。测试机没有可用的 IPv6 默认出口，显式 IPv6-only 策略在启动命令前被拒绝。自动化 fixture 覆盖了 IPv4 和 IPv6 的全局地址被 VPN 或静态前缀接管、缓存掩盖父路由、网关与网卡身份改变，以及存续流的轮询发现变化。验收未修改宿主路由表。具有真实全局地址分流的 VPN 和可用公网 IPv6 出口仍需真机复测。
 
 代理集成测试通过真实 TCP 建立到两个目标的 CONNECT，模拟其中一个目标的路由变化，验证两个隧道都关闭，且路由恢复后旧会话仍对两个目标返回 403。
+
+### 阶段 4 双 World 出口隔离
+
+```sh
+cargo build --workspace --locked
+python3 experiments/macos/world_vm_multi_smoke.py --policy-egress
+```
+
+在 8 GiB Apple Silicon Mac、macOS 27.2 和 Apple container 1.7.1 上，两台 256 MiB 离线 VM 同时持有 TLS 隧道，策略分别只授权 `example.com:443` 和 `www.example.com:443`。两台 VM 都完成了证书验证，访问对方授权的域名时各自收到 403。
+
+停止第一台 VM 中本次执行专用的 relay 后，第一条执行以 `policy_unavailable` 退出，工作负载已回收。第二条执行在原有隧道上取得 HTTPS 200，也能新建隧道。两台 VM 的 loopback 发布仍各自返回原有内容。测试只对一次性 VM 中的 relay 注入故障。

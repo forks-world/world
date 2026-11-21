@@ -9,6 +9,22 @@ import time
 
 from world_vm_egress_probe import GUEST_DIRECT
 
+STOP_BRIDGE = r"""
+import os, signal, sys
+from pathlib import Path
+
+matches = []
+for path in Path("/proc").glob("[0-9]*/cmdline"):
+    try:
+        args = path.read_bytes().split(bytes(1))
+    except FileNotFoundError:
+        continue
+    if args[-3:-1] == [b"egress-bridge", sys.argv[1].encode()]:
+        matches.append(int(path.parent.name))
+assert len(matches) == 1, matches
+os.kill(matches[0], signal.SIGTERM)
+"""
+
 WORKLOAD = r"""
 import base64, concurrent.futures, http.client, os, socket, ssl, threading, time
 from urllib.parse import urlsplit
@@ -139,16 +155,7 @@ def main():
                 announced = execution.stderr.readline()
                 token = re.search(r'execution ([0-9a-f]{32})', announced).group(1)
                 run('stop-owned-egress-bridge',
-                    ['container', 'exec', instance, 'python3', '-c',
-                     'import os, signal, sys; from pathlib import Path\n'
-                     'matches = []\n'
-                     'for path in Path("/proc").glob("[0-9]*/cmdline"):\n'
-                     '    try: args = path.read_bytes().split(bytes(1))\n'
-                     '    except FileNotFoundError: continue\n'
-                     '    if args[-3:-1] == [b"egress-bridge", sys.argv[1].encode()]:\n'
-                     '        matches.append(int(path.parent.name))\n'
-                     'assert len(matches) == 1, matches\n'
-                     'os.kill(matches[0], signal.SIGTERM)', token])
+                    ['container', 'exec', instance, 'python3', '-c', STOP_BRIDGE, token])
                 stdout, stderr = execution.communicate(timeout=20)
                 record('cancel-exec-on-egress-loss',
                        subprocess.CompletedProcess(execution.args, execution.returncode, stdout, announced + stderr),
