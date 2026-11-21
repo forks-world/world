@@ -1,6 +1,7 @@
 """Real VM regression for world exec's execution-scoped egress policy."""
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -95,8 +96,8 @@ def main():
             assert diagnostic in outcome.stderr, outcome.stderr
         return outcome.stdout
 
-    def run(label, args, **expected):
-        return record(label, subprocess.run(args, text=True, capture_output=True, timeout=90),
+    def run(label, args, *, env=None, **expected):
+        return record(label, subprocess.run(args, text=True, capture_output=True, timeout=90, env=env),
                       **expected)
 
     def workspace(label, action, *flags, **expected):
@@ -112,6 +113,36 @@ def main():
         instance = json.loads(workspace('create-offline', 'create', '--os', 'linux',
                                        '--network', 'offline', '--memory', '256M'))['instance_id']
         workspace('start', 'setup')
+        ready = json.loads(workspace('ready-before-provider-mismatch', 'show'))
+        assert ready['status'] == 'ready'
+        shim = evidence / 'provider-shim'
+        shim.mkdir()
+        guard = shim / 'container'
+        guard.write_text(r"""#!/bin/sh
+if [ "$#" -eq 4 ] && [ "$1" = system ] && [ "$2" = status ] &&
+   [ "$3" = --format ] && [ "$4" = json ]; then
+    printf '%s\n' '{"status":"running","client":{"version":"1.7.1"},"server":{"version":"1.6.1"}}'
+    exit 0
+fi
+printf '%s\n' "$*" >> "$WORLD_TEST_PROVIDER_UNEXPECTED"
+exit 70
+""")
+        guard.chmod(0o700)
+        unexpected = evidence / 'unexpected-provider-commands'
+        env = dict(os.environ, PATH=str(shim), WORLD_TEST_PROVIDER_UNEXPECTED=str(unexpected))
+        unknown = json.loads(workspace('show-with-provider-mismatch', 'show', env=env))
+        assert unknown['status'] == 'unknown' and 'version_mismatch:' in unknown['observation_error']
+        assert unknown['lifecycle'] == ready['lifecycle']
+        workspace('setup-with-provider-mismatch', 'setup', env=env, code=125,
+                  diagnostic='version_mismatch:')
+        run('reject-egress-with-provider-mismatch',
+            invocation('touch', '/workspace/provider-mismatch-ran', policy=allowed),
+            env=env, code=125, diagnostic='version_mismatch:')
+        assert not unexpected.exists(), unexpected.read_text()
+        recovered = json.loads(workspace('provider-compatible-again', 'show'))
+        assert recovered['status'] == 'ready' and recovered['lifecycle'] == ready['lifecycle']
+        run('check-provider-mismatch-prevented-spawn',
+            invocation('test', '!', '-e', 'provider-mismatch-ran'))
         run('reject-private-policy-before-spawn',
             invocation('touch', '/workspace/invalid-policy-ran', policy=blocked),
             code=125, diagnostic='policy_unavailable')
