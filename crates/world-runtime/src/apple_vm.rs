@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 const IMAGE: &str = "docker.io/library/python@sha256:bf12ecc0bea3f171d55145dd02c78b5eeb09f30ee2ac9cc2b4c9e4e8f5e30741";
 const PROVIDER_VERSIONS: &[&str] = &["1.6.1", "1.7.1"];
+const OFFLINE_PROVIDER_VERSION: &str = "1.7.1";
 const GUEST: &str = concat!(
     include_str!("../guest/supervisor.py"),
     "\n",
@@ -238,7 +239,7 @@ impl Vm {
 pub fn supported() -> Result<()> {
     ensure!(
         cfg!(all(target_os = "macos", target_arch = "aarch64")),
-        "Linux VM backend requires an Apple Silicon macOS host"
+        "unsupported_platform: Linux VM backend requires an Apple Silicon macOS host"
     );
     Ok(())
 }
@@ -370,29 +371,54 @@ async fn output(args: &[&str], limit: Duration) -> Result<String> {
     String::from_utf8(output.stdout).context("provider returned non-UTF8 metadata")
 }
 
-async fn check_provider(vm: &Vm) -> Result<()> {
-    supported()?;
-    let version = output(&["--version"], Duration::from_secs(10))
-        .await
-        .context(
-            "cannot query Apple container version; check that container is installed and on PATH",
-        )?;
+fn verify_provider_status(json: &str, network: Network) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Component {
+        version: String,
+    }
+
+    #[derive(Deserialize)]
+    struct Status {
+        status: String,
+        client: Option<Component>,
+        server: Option<Component>,
+    }
+
+    let status: Status = serde_json::from_str(json)
+        .context("runtime_unavailable: invalid Apple container status")?;
     ensure!(
-        version
-            .split_whitespace()
-            .any(|s| PROVIDER_VERSIONS.contains(&s)),
-        "unsupported Apple container version: {}; supported versions: {}",
-        version.trim(),
+        status.status == "running",
+        "runtime_unavailable: Apple container service is unavailable; run container system start"
+    );
+    let (Some(client), Some(server)) = (status.client, status.server) else {
+        bail!("runtime_unavailable: Apple container did not report both component versions");
+    };
+    ensure!(
+        PROVIDER_VERSIONS.contains(&client.version.as_str()) && client.version == server.version,
+        "version_mismatch: Apple container CLI {:?} and API server {:?} must run the same supported version ({})",
+        client.version,
+        server.version,
         PROVIDER_VERSIONS.join(", ")
     );
     ensure!(
-        vm.network != Network::Offline || version.split_whitespace().any(|word| word == "1.7.1"),
-        "policy_unavailable: offline networking requires Apple container 1.7.1"
+        network != Network::Offline || client.version == OFFLINE_PROVIDER_VERSION,
+        "policy_unavailable: offline networking requires Apple container {OFFLINE_PROVIDER_VERSION}"
     );
-    output(&["system", "status"], Duration::from_secs(10))
-        .await
-        .context("start Apple container with: container system start")?;
     Ok(())
+}
+
+async fn check_provider(vm: &Vm) -> Result<()> {
+    supported()?;
+    let status = output(&["system", "status", "--format", "json"], Duration::from_secs(10))
+        .await
+        .map_err(|error| {
+            if error.downcast_ref::<std::io::Error>().is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
+                error.context("runtime_missing: install Apple container and make it available on PATH")
+            } else {
+                error.context("runtime_unavailable: cannot query Apple container service; run container system start")
+            }
+        })?;
+    verify_provider_status(&status, vm.network)
 }
 
 async fn instances() -> Result<Vec<serde_json::Value>> {
@@ -1839,6 +1865,52 @@ pub async fn export(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_compatibility_checks_both_components_and_network_mode() {
+        for (client, server, network, expected_error) in [
+            ("1.6.1", "1.6.1", Network::Nat, ""),
+            ("1.7.1", "1.7.1", Network::Nat, ""),
+            ("1.7.1", "1.7.1", Network::Offline, ""),
+            ("1.6.1", "1.6.1", Network::Offline, "policy_unavailable"),
+            ("1.7.1", "1.6.1", Network::Offline, "version_mismatch"),
+            ("1.6.1", "1.7.1", Network::Nat, "version_mismatch"),
+            ("1.7.1", "1.7.2", Network::Offline, "version_mismatch"),
+            ("1.7.2", "1.7.2", Network::Nat, "version_mismatch"),
+            (
+                "1.7.1-rc.1",
+                "1.7.1-rc.1",
+                Network::Offline,
+                "version_mismatch",
+            ),
+        ] {
+            let status = serde_json::json!({
+                "status": "running",
+                "client": { "version": client },
+                "server": { "version": server },
+            });
+            let outcome = verify_provider_status(&status.to_string(), network);
+            if expected_error.is_empty() {
+                outcome.unwrap();
+            } else {
+                assert!(outcome.unwrap_err().to_string().starts_with(expected_error));
+            }
+        }
+    }
+
+    #[test]
+    fn provider_compatibility_requires_a_live_service_and_verifiable_metadata() {
+        for status in [
+            "status running",
+            r#"{"status":"not running"}"#,
+            r#"{"status":"running","client":{"version":"1.7.1"}}"#,
+            r#"{"status":"running","client":{"version":"1.7.1"},"server":{"version":null}}"#,
+        ] {
+            let error = verify_provider_status(status, Network::Offline).unwrap_err();
+            assert!(error.to_string().starts_with("runtime_unavailable:"));
+        }
+    }
+
     #[test]
     fn multi_vm_admission_counts_reserves_and_rejects_unverified_instances() {
         let owner = "a".repeat(32);

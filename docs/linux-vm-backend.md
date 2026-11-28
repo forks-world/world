@@ -498,3 +498,17 @@ python3 experiments/macos/world_vm_multi_smoke.py --policy-egress
 在 8 GiB Apple Silicon Mac、macOS 27.2 和 Apple container 1.7.1 上，两台 256 MiB 离线 VM 同时持有 TLS 隧道，策略分别只授权 `example.com:443` 和 `www.example.com:443`。两台 VM 都完成了证书验证，访问对方授权的域名时各自收到 403。
 
 停止第一台 VM 中本次执行专用的 relay 后，第一条执行以 `policy_unavailable` 退出，工作负载已回收。第二条执行在原有隧道上取得 HTTPS 200，也能新建隧道。两台 VM 的 loopback 发布仍各自返回原有内容。测试只对一次性 VM 中的 relay 注入故障。
+
+### 阶段 4 Apple container 版本兼容
+
+World 通过 `container system status --format json` 检查服务状态和 CLI、API 服务各自的版本。[Apple container 1.6.1 命令参考](https://github.com/apple/container/blob/1.6.1/docs/command-reference.md#container-system-status)
+
+| CLI 和 API 服务版本 | NAT | Offline 与执行级出口 |
+| --- | --- | --- |
+| 两者均为 1.6.1 | 支持 | `policy_unavailable` |
+| 两者均为 1.7.1 | 支持 | 支持 |
+| 版本不一致、未验证版本或预发布版本 | `version_mismatch` | `version_mismatch` |
+
+服务未就绪或版本信息无法读取时返回 `runtime_unavailable`，CLI 缺失时返回 `runtime_missing`。观测失败时 `workspace show` 保留登记和启动代际，并报告 `unknown`。
+
+`world_vm_egress_exec_smoke.py` 在真实的 1.7.1 离线 VM 上，用仅作用于单次命令的替身模拟 1.7.1 CLI 搭配 1.6.1 API 服务。查询保留原有生命周期，setup 和受限 exec 在发出后续 provider 调用前拒绝。恢复真实 provider 后，同一代际仍可运行。1.6.1 组合由兼容矩阵测试覆盖。
